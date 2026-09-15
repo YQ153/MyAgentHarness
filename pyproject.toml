@@ -1,0 +1,16 @@
+[project]
+name = "myagentharness"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "deepagents>=0.7.14",
+    "langgraph>=1.2.11",
+    "langchain>=1.4.0",
+    "langchain-deepseek>=1.1.0",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.53.0",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "aiosqlite>=0.22.1",
+]

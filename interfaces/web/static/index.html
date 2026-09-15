@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>通用 Agent</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <span>通用 Agent</span>
+      </div>
+      <div class="controls">
+        <select id="model-select" title="切换模型"></select>
+      </div>
+    </header>
+
+    <div class="body">
+      <!-- 会话清单：数据来自 GET /api/threads，点击可切回该会话的历史 -->
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <span class="sidebar-title">会话</span>
+          <button id="new-thread" type="button">新会话</button>
+        </div>
+        <div id="thread-list" class="thread-list"></div>
+      </aside>
+
+      <main id="messages" class="messages"></main>
+    </div>
+
+    <footer class="composer">
+      <textarea
+        id="input"
+        rows="1"
+        placeholder="输入任务，Enter 发送，Shift+Enter 换行"
+        autocomplete="off"
+      ></textarea>
+      <button id="send" type="button">发送</button>
+    </footer>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
