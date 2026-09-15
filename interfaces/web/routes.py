@@ -9,80 +9,105 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from application.agent_service import AgentService
+from application.dto import ModelInfo
+from application.errors import ThreadBusyError
+from application.events import AgentEvent
+from application.model_catalog import ModelCatalog
+from application.run_service import RunService
+from application.thread_service import ThreadService
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
     HistoryMessage,
-    ModelInfo,
     ResumeRequest,
     ThreadListResponse,
     ThreadResponse,
 )
+from interfaces.web.sse import SSE_HEADERS, encode_sse
+from runtime.thread_store import normalize_thread_id
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
-_SSE_HEADERS: dict[str, str] = {
-    # WHY no-transform 与 X-Accel-Buffering：反向代理默认会缓冲响应，
-    # 会让流式输出退化成一次性返回，这两个头是关掉缓冲的标准做法。
-    "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-}
+
+# ------------------------------------------------------------------ 依赖注入
 
 
-def get_service(request: Request) -> AgentService:
-    """从应用状态取出会话服务单例。
+def get_threads(request: Request) -> ThreadService:
+    """取出会话服务单例。
 
     WHY 单例：图与 checkpointer 都是有状态的重量对象，每个请求新建会导致
     连接池耗尽，也会让同一 thread 在并发请求中读到不一致的状态。
     """
-    service = getattr(request.app.state, "service", None)
+    return _require_state(request, "threads", "会话服务")
+
+
+def get_runs(request: Request) -> RunService:
+    """取出运行服务单例。"""
+    return _require_state(request, "runs", "运行服务")
+
+
+def get_catalog(request: Request) -> ModelCatalog:
+    """取出模型目录单例。"""
+    return _require_state(request, "catalog", "模型目录")
+
+
+def _require_state(request: Request, attr: str, label: str) -> Any:
+    """从应用状态取服务，缺失时返回 500。"""
+    service = getattr(request.app.state, attr, None)
     if service is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="会话服务未初始化",
+            detail=f"{label}未初始化",
         )
     return service
 
 
 def _validate_thread_id(thread_id: str) -> str:
-    if not thread_id or not thread_id.strip():
+    """校验路径参数中的会话 ID。
+
+    WHY 复用存储层的 ``normalize_thread_id``：会话 ID 的合法性规则只有一份定义，
+    路由层只负责把 ``ValueError`` 翻译成 400，不再自己维护一套判断。
+    """
+    try:
+        return normalize_thread_id(thread_id)
+    except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="thread_id 不能为空",
-        )
-    return thread_id.strip()
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+# ------------------------------------------------------------------ 路由
 
 
 @router.get("/models", response_model=list[ModelInfo])
-async def list_models(service: AgentService = Depends(get_service)) -> list[dict[str, str]]:
+async def list_models(catalog: ModelCatalog = Depends(get_catalog)) -> list[ModelInfo]:
     """列出可切换的模型。"""
-    return service.models()
+    return catalog.list_models()
 
 
 @router.post("/threads", response_model=ThreadResponse)
-async def create_thread(service: AgentService = Depends(get_service)) -> ThreadResponse:
+async def create_thread(threads: ThreadService = Depends(get_threads)) -> ThreadResponse:
     """申请一个新的会话 ID。
 
     WHY 不是 201 Created：此刻并没有创建任何资源——会话要等首条消息被接受
     （``/runs``）才真正诞生并在数据库中留下记录，返回 200 才是诚实的语义。
     """
-    return ThreadResponse(thread_id=service.new_thread())
+    return ThreadResponse(thread_id=threads.new_thread_id())
 
 
 @router.get("/threads", response_model=ThreadListResponse)
 async def list_threads(
     limit: int = Query(default=50, ge=1, le=200, description="返回条数"),
     offset: int = Query(default=0, ge=0, description="跳过的条数"),
-    service: AgentService = Depends(get_service),
+    threads: ThreadService = Depends(get_threads),
 ) -> ThreadListResponse:
     """列出会话清单，最近活动的在前。
 
@@ -91,85 +116,100 @@ async def list_threads(
     ``/threads/summary`` 之类的静态子路径时被参数路由抢先匹配。
     """
     try:
-        payload = await service.list_threads(limit=limit, offset=offset)
+        result = await threads.list_threads(limit=limit, offset=offset)
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         ) from exc
 
-    return ThreadListResponse(**payload)
+    return ThreadListResponse(items=result.items, total=result.total)
 
 
 @router.get("/threads/{thread_id}", response_model=list[HistoryMessage])
 async def get_history(
     thread_id: str,
-    service: AgentService = Depends(get_service),
-) -> list[dict[str, Any]]:
+    threads: ThreadService = Depends(get_threads),
+) -> list[HistoryMessage]:
     """读取会话历史，用于刷新页面后恢复上下文。"""
-    _validate_thread_id(thread_id)
-    return await service.history(thread_id)
+    normalized = _validate_thread_id(thread_id)
+    try:
+        return await threads.history(normalized)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("读取会话历史失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
 
 
 @router.delete("/threads/{thread_id}", response_model=DeleteResponse)
 async def delete_thread(
     thread_id: str,
-    service: AgentService = Depends(get_service),
+    threads: ThreadService = Depends(get_threads),
 ) -> DeleteResponse:
     """删除会话。"""
-    _validate_thread_id(thread_id)
-    deleted = await service.delete_thread(thread_id)
-    return DeleteResponse(thread_id=thread_id, deleted=deleted)
-
-
-def _ensure_ready(service: AgentService, model_name: str | None) -> None:
-    """在开启 SSE 之前完成模型与图的构造。
-
-    WHY 放在这里而不是依赖 StreamingResponse 内部的异常：流式响应一旦开始，
-    状态码就无法再改，错误只能以「连接断开」的形式暴露给前端。
-    """
+    normalized = _validate_thread_id(thread_id)
     try:
-        service.ensure_ready(model_name)
-    except KeyError as exc:
+        result = await threads.delete_thread(normalized)
+    except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"未知模型：{exc}",
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-    except Exception as exc:
-        logger.exception("Agent 就绪检查失败")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Agent 初始化失败：{exc}",
-        ) from exc
+
+    return DeleteResponse(
+        thread_id=result.thread_id,
+        deleted=result.deleted,
+        outcome=result.outcome,
+        detail=result.detail,
+    )
 
 
 @router.post("/threads/{thread_id}/runs")
 async def run_agent(
     thread_id: str,
     body: ChatRequest,
-    service: AgentService = Depends(get_service),
+    runs: RunService = Depends(get_runs),
 ) -> StreamingResponse:
-    """发起一轮对话，以 SSE 流式返回事件。"""
-    _validate_thread_id(thread_id)
-    _ensure_ready(service, body.model)
+    """发起一轮对话，以 SSE 流式返回事件。
 
-    async def generate() -> Any:
-        async for event in service.stream(
-            thread_id,
-            body.content,
-            model_name=body.model,
-        ):
-            yield event.encode()
+    WHY 不再需要单独的就绪检查：``RunService.stream`` 是普通协程，参数校验与
+    模型初始化都在 ``await`` 时同步完成，因此错误能在响应开始之前被映射成
+    正常的状态码，不必再为一个 SSE 的传输限制而在服务层额外开一个 API。
+    """
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        events = await runs.stream(normalized, body.content, model_name=body.model)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except ThreadBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("Agent 初始化失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent 初始化失败：{exc}",
+        ) from exc
 
     return StreamingResponse(
-        generate(),
+        _encode_stream(events),
         media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        headers=SSE_HEADERS,
     )
 
 
@@ -177,24 +217,44 @@ async def run_agent(
 async def resume_agent(
     thread_id: str,
     body: ResumeRequest,
-    service: AgentService = Depends(get_service),
+    runs: RunService = Depends(get_runs),
 ) -> StreamingResponse:
     """人工审批后恢复执行，同样以 SSE 流式返回。"""
-    _validate_thread_id(thread_id)
-    _ensure_ready(service, body.model)
+    normalized = _validate_thread_id(thread_id)
 
-    payload = {"decisions": [item.model_dump(exclude_none=True) for item in body.decisions]}
+    payload = {
+        "decisions": [item.model_dump(exclude_none=True) for item in body.decisions]
+    }
 
-    async def generate() -> Any:
-        async for event in service.resume(
-            thread_id,
-            payload,
-            model_name=body.model,
-        ):
-            yield event.encode()
+    try:
+        events = await runs.resume(normalized, payload, model_name=body.model)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except ThreadBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("Agent 初始化失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent 初始化失败：{exc}",
+        ) from exc
 
     return StreamingResponse(
-        generate(),
+        _encode_stream(events),
         media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        headers=SSE_HEADERS,
     )
+
+
+async def _encode_stream(events: AsyncIterator[AgentEvent]) -> AsyncIterator[str]:
+    """把应用事件流转成 SSE 文本帧流。"""
+    async for event in events:
+        yield encode_sse(event)

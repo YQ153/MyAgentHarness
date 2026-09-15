@@ -34,9 +34,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_AGENT_CACHE: dict[str, CompiledStateGraph] = {}
-_AGENT_LOCK = threading.Lock()
-
 _FALLBACK_SYSTEM_PROMPT = """你是通用任务助手，工作目录是受限虚拟文件系统。
 
 超过 3 步的任务先用 write_todos 拆解计划，再逐步执行，并在完成后更新状态。
@@ -133,14 +130,14 @@ def build_agent(
         raise
 
 
-def get_agent(
-    config: AppConfig,
-    *,
-    checkpointer: BaseCheckpointSaver | None = None,
-    store: BaseStore | None = None,
-    model_name: str | None = None,
-) -> CompiledStateGraph:
-    """获取 app 级别的 Agent 实例，按模型别名缓存。
+class AgentFactory:
+    """按模型别名提供（并缓存）已装配的图。
+
+    WHY 由工厂实例持有依赖，而不是模块级 dict 缓存：图的缓存键必须包含
+    checkpointer 与 store——它们决定了会话状态与长期记忆落在哪。若用全局 dict
+    只以模型名为键，换一组依赖后仍会返回先前的图，表现为「长期记忆串味」
+    「对话状态读不到」这类难以定位的问题；而且全局缓存无法在测试之间隔离，
+    也无法在配置变更后重建。
 
     WHY 缓存而非每次新建：``create_deep_agent`` 会重建整条中间件栈与工具集，
     开销可观；而模型切换只需要在首次切换时付一次代价。
@@ -148,23 +145,71 @@ def get_agent(
     WHY 由调用方共享 store：``/memories/`` 路由绑定的是 Store 实例，若每个
     模型各持一份，用户在 A 模型下写入的长期记忆在 B 模型下就消失了。
     """
-    resolved_name = model_name or config.default_model
 
-    cached = _AGENT_CACHE.get(resolved_name)
-    if cached is not None:
-        return cached
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        checkpointer: BaseCheckpointSaver | None = None,
+        store: BaseStore | None = None,
+    ) -> None:
+        """构造工厂。
 
-    with _AGENT_LOCK:
-        cached = _AGENT_CACHE.get(resolved_name)
+        Args:
+            config: 应用配置。
+            checkpointer: 会话持久化实现；``None`` 时无持久化，中断恢复不可用。
+            store: 长期记忆存储；``None`` 时新建进程内存储。
+
+        Raises:
+            ValueError: ``config`` 为 ``None``。
+        """
+        if config is None:
+            raise ValueError("config 不能为 None")
+
+        self._config = config
+        self._checkpointer = checkpointer
+        self._store: BaseStore = store if store is not None else build_store(config)
+        self._cache: dict[str, CompiledStateGraph] = {}
+        # WHY 用锁而非直接依赖 GIL：``get`` 可能被多个 worker 线程并发调用，
+        # 重复装配会浪费一次完整的中间件栈构建，也可能突破 provider 侧限流。
+        self._lock = threading.Lock()
+
+    @property
+    def store(self) -> BaseStore:
+        """本工厂共享的长期记忆存储，供需要直接读写 ``/memories/`` 的场景使用。"""
+        return self._store
+
+    def get(self, model_name: str | None = None) -> CompiledStateGraph:
+        """取一个已装配的图，按模型别名缓存。
+
+        Args:
+            model_name: 模型别名；``None`` 表示使用配置中的默认模型。
+
+        Returns:
+            已编译的 LangGraph 图。
+
+        Raises:
+            KeyError: 模型别名未注册。
+            RuntimeError: 模型初始化失败或装配过程出错。
+        """
+        resolved_name = model_name or self._config.default_model
+
+        cached = self._cache.get(resolved_name)
         if cached is not None:
             return cached
 
-        agent = build_agent(
-            config,
-            checkpointer=checkpointer,
-            store=store,
-            model_name=resolved_name,
-        )
-        _AGENT_CACHE[resolved_name] = agent
-        logger.info("已缓存 Agent 实例：model=%s", resolved_name)
-        return agent
+        with self._lock:
+            # 双检锁：快路径无锁返回，慢路径加锁后二次确认，避免重复装配
+            cached = self._cache.get(resolved_name)
+            if cached is not None:
+                return cached
+
+            agent = build_agent(
+                self._config,
+                checkpointer=self._checkpointer,
+                store=self._store,
+                model_name=resolved_name,
+            )
+            self._cache[resolved_name] = agent
+            logger.info("已缓存 Agent 实例：model=%s", resolved_name)
+            return agent

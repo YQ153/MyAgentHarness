@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from application.agent_service import AgentService
+from agent.graph import AgentFactory, get_registry
+from application.model_catalog import ModelCatalog
+from application.run_service import RunService
+from application.thread_service import ThreadService
 from interfaces.web.routes import router
 from runtime.checkpointer import checkpointer_context
 from runtime.thread_store import open_thread_store
@@ -38,11 +41,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         checkpointer_context(config.db_path) as checkpointer,
         open_thread_store(config.db_path) as thread_store,
     ):
-        app.state.service = AgentService(
+        # WHY 由工厂统一持有长期记忆存储：``/memories/`` 路由绑定的是 Store
+        # 实例，若每个模型各持一份，用户在 A 模型下写入的长期记忆在 B 模型下
+        # 就消失了。
+        graph_factory = AgentFactory(config, checkpointer=checkpointer)
+
+        app.state.threads = ThreadService(
             config,
             checkpointer=checkpointer,
             thread_store=thread_store,
+            graph_factory=graph_factory,
         )
+        app.state.runs = RunService(
+            config,
+            thread_store=thread_store,
+            graph_factory=graph_factory,
+        )
+        app.state.catalog = ModelCatalog(get_registry(config))
+
         logger.info("Web 服务启动完成")
         try:
             yield

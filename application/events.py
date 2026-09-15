@@ -1,18 +1,22 @@
 """统一事件模型。
 
 CLI 与 Web 消费同一套事件定义，避免同一件事实在两处各写一遍渲染逻辑。
+
+WHY 命名为 ``AgentEvent`` 而非 ``SSEEvent``：本模块位于应用层，描述的是
+「运行过程中发生了什么」，与传输方式无关——CLI 直接渲染到终端，Web 走 SSE。
+以 SSE 命名会把应用层绑死在 HTTP 传输上；序列化成 SSE 文本帧的职责已下沉到
+``interfaces.web.sse``。
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 
-class SSEEventType(StrEnum):
-    """SSE 事件类型。
+class AgentEventType(StrEnum):
+    """运行事件类型。
 
     命名与前端约定一一对应，前端据此分派渲染。
     """
@@ -43,25 +47,12 @@ class SSEEventType(StrEnum):
 
 
 @dataclass(frozen=True)
-class SSEEvent:
-    """一条 SSE 帧。
+class AgentEvent:
+    """一条运行事件。
 
     WHY 冻结数据类：事件一旦生成就不应被下游修改，可避免共享状态导致的
     难以复现的渲染错乱。
     """
 
-    event: SSEEventType
+    event: AgentEventType
     payload: dict[str, Any]
-
-    def encode(self) -> str:
-        """序列化为 SSE 文本帧。
-
-        WHY 手动拼帧而非依赖框架：原生 ``EventSource`` 只支持 GET，
-        这里必须走 POST + ReadableStream，因此由服务端保证帧格式正确。
-
-        WHY ``ensure_ascii=False``：中文内容若被转义成 \\uXXXX，虽然可解析，
-        但会让 SSE 帧体积翻倍，也妨碍调试时肉眼阅读。
-        """
-        body = json.dumps(self.payload, ensure_ascii=False, default=str)
-        # WHY 每行都要独立换行：SSE 规范用空行分隔帧，多行数据会产生多帧
-        return f"event: {self.event.value}\ndata: {body}\n\n"

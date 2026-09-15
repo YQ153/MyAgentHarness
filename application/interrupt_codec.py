@@ -20,6 +20,15 @@ DecisionType = Literal["approve", "edit", "reject", "respond"]
 
 _VALID_DECISIONS: frozenset[str] = frozenset({"approve", "edit", "reject", "respond"})
 
+INTERRUPT_NODE = "__interrupt__"
+"""LangGraph 用于承载中断信息的特殊 updates 键。
+
+WHY 定义在编解码模块而不是服务层：这个字面量是 LangGraph 的内部约定，
+框架改名时必须只改一处。此前它在服务层被硬编码了一份，一旦框架变更，
+``decode_interrupt`` 会静默返回 ``None``，中断事件不再上报——这类失效
+没有任何报错，只能靠前端「点了审批没反应」才能发现。
+"""
+
 
 @dataclass(frozen=True)
 class InterruptRequest:
@@ -53,7 +62,7 @@ def decode_interrupt(update: Any) -> InterruptRequest | None:
     if not isinstance(update, dict):
         return None
 
-    raw = update.get("__interrupt__")
+    raw = update.get(INTERRUPT_NODE)
     if raw is None:
         return None
 

@@ -26,16 +26,47 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from text_utils import build_title
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # WHY 硬上限放在存储层：即便调用方漏做校验，也不允许超长文本灌进数据库。
-_MAX_THREAD_ID_CHARS = 128
+MAX_THREAD_ID_CHARS = 128
 _MAX_TITLE_CHARS = 200
 _MAX_LIMIT = 200
 _MAX_TURN_DELTA = 100
+
+
+def normalize_thread_id(thread_id: str) -> str:
+    """校验会话 ID 并返回规范化结果。
+
+    WHY 做成模块级公开函数：会话 ID 的合法性校验此前在路由层、服务层与存储层
+    各写了一遍，三处的规则（是否 strip、长度上限多少、非字符串如何处理）随时
+    可能漂移。这里作为唯一实现，上层只负责把 ``ValueError`` 转成各自的语义
+    （HTTP 400 / 事件流错误帧）。
+
+    Args:
+        thread_id: 待校验的会话 ID。
+
+    Returns:
+        去除首尾空白后的会话 ID。
+
+    Raises:
+        ValueError: 非字符串、为空或超出长度上限。
+    """
+    if not isinstance(thread_id, str):
+        raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
+    normalized = thread_id.strip()
+    if not normalized:
+        raise ValueError("thread_id 不能为空")
+    if len(normalized) > MAX_THREAD_ID_CHARS:
+        raise ValueError(
+            f"thread_id 过长（{len(normalized)} > {MAX_THREAD_ID_CHARS}）"
+        )
+    return normalized
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_meta (
@@ -63,14 +94,14 @@ def _utc_now() -> str:
 
 
 def _normalize_title(title: str | None) -> str:
-    """压缩标题中的空白并截断到存储层硬上限。"""
-    if not title:
-        return ""
-    # WHY 折叠换行与连续空白：标题会渲染在单行列表项里，保留换行会撑破布局
-    collapsed = " ".join(str(title).split())
-    if len(collapsed) > _MAX_TITLE_CHARS:
-        return collapsed[: _MAX_TITLE_CHARS - 1] + "…"
-    return collapsed
+    """压缩标题中的空白并截断到存储层硬上限。
+
+    WHY 复用 ``text_utils.build_title`` 而不是各写一份：折叠与截断的规则必须与
+    应用层完全一致，否则会出现「列表页显示的标题与库中存的不是同一个」。
+    两层的区别只是阈值——应用层按展示宽度截，存储层按入库硬上限截，
+    因此阈值作为参数传入。
+    """
+    return build_title(title, _MAX_TITLE_CHARS)
 
 
 class ThreadMetaStore:
@@ -98,16 +129,7 @@ class ThreadMetaStore:
         Raises:
             ValueError: 为空、非字符串或超出长度上限。
         """
-        if not isinstance(thread_id, str):
-            raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
-        normalized = thread_id.strip()
-        if not normalized:
-            raise ValueError("thread_id 不能为空")
-        if len(normalized) > _MAX_THREAD_ID_CHARS:
-            raise ValueError(
-                f"thread_id 过长（{len(normalized)} > {_MAX_THREAD_ID_CHARS}）"
-            )
-        return normalized
+        return normalize_thread_id(thread_id)
 
     @staticmethod
     def _validate_paging(limit: int, offset: int) -> None:
@@ -242,6 +264,41 @@ class ThreadMetaStore:
             return None
 
         return await self.get(normalized_id)
+
+    async def touch(self, thread_id: str) -> bool:
+        """只刷新最近活动时间，不改变标题与轮次。
+
+        WHY 单独一个方法而不是复用 ``record_turn(turn_delta=0)``：一轮运行会在
+        开始与结束各刷新一次时间，用 UPSERT 做纯时间刷新会连带执行
+        ``turn_count + 0`` 与标题的 CASE 判断，多一次无意义的写放大与锁窗口。
+
+        Args:
+            thread_id: 会话 ID。
+
+        Returns:
+            是否命中并更新了一行；``False`` 表示该会话尚未登记。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET updated_at = ? WHERE thread_id = ?",
+                    (_utc_now(), normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("刷新会话活动时间失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.debug("刷新活动时间未命中任何行：thread=%s", normalized_id)
+        return updated
 
     async def delete(self, thread_id: str) -> bool:
         """删除会话元数据。

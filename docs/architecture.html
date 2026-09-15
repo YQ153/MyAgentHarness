@@ -206,8 +206,12 @@
   <div class="layerrow">
     <div class="layername">应用层</div>
     <div class="layerbody">
-      <div class="card"><b>application/agent_service.py</b><span>会话编排、事件归一化</span></div>
-      <div class="card"><b>application/events.py</b><span>统一事件与 SSE 编码</span></div>
+      <div class="card"><b>application/thread_service.py</b><span>会话元数据生命周期</span></div>
+      <div class="card"><b>application/run_service.py</b><span>运行推进与并发互斥</span></div>
+      <div class="card"><b>application/model_catalog.py</b><span>模型目录</span></div>
+      <div class="card"><b>application/event_translator.py</b><span>流增量 → 应用事件</span></div>
+      <div class="card"><b>application/events.py</b><span>统一事件模型（与传输无关）</span></div>
+      <div class="card"><b>application/dto.py</b><span>对外返回契约</span></div>
       <div class="card"><b>application/interrupt_codec.py</b><span>HITL 载荷编解码</span></div>
     </div>
   </div>
@@ -255,7 +259,7 @@
     <tr><td><code>agent/backends.py</code></td><td>deepagents.backends、runtime 的 Store</td><td>agent/graph</td></tr>
     <tr><td><code>agent/guardrails.py</code></td><td>deepagents、langchain 中间件</td><td>agent/graph</td></tr>
     <tr><td><code>llm/registry.py</code></td><td>langchain、agent/profiles</td><td>agent/graph、application</td></tr>
-    <tr><td><code>agent/graph.py</code></td><td>agent/*、llm/*、runtime/*</td><td>application/agent_service</td></tr>
+    <tr><td><code>agent/graph.py</code></td><td>agent/*、llm/*、runtime/*</td><td>application/*（经 AgentFactory 注入）</td></tr>
     <tr><td><code>application/*</code></td><td>agent、runtime、config</td><td>interfaces/*</td></tr>
     <tr><td><code>interfaces/*</code></td><td>application、runtime、config</td><td>main.py</td></tr>
   </tbody>
@@ -279,11 +283,14 @@
     <tr><td>配置中心 <code>AppConfig</code></td><td><code>config.py:37</code></td><td>环境变量装载、路径展开、目录创建、技能/记忆路径换算</td></tr>
     <tr><td>模型注册表 <code>ModelRegistry</code></td><td><code>llm/registry.py:97</code></td><td>按别名提供模型实例，双检锁懒加载，密钥与地址校验</td></tr>
     <tr><td>装配入口 <code>build_agent</code></td><td><code>agent/graph.py:62</code></td><td>唯一的图构造点，挂载中间件、Backend、权限、中断与 Profile</td></tr>
-    <tr><td>图缓存 <code>get_agent</code></td><td><code>agent/graph.py:136</code></td><td>按模型别名缓存已编译图，避免重复装配</td></tr>
+    <tr><td>图工厂 <code>AgentFactory</code></td><td><code>agent/graph.py</code></td><td>按模型别名缓存已编译图；缓存上下文含 checkpointer 与 store，随工厂实例失效</td></tr>
     <tr><td>Backend 工厂</td><td><code>agent/backends.py:36</code></td><td>按执行档位决定「文件落在哪、命令在哪跑」</td></tr>
     <tr><td>护栏 <code>build_permissions</code></td><td><code>agent/guardrails.py:41</code></td><td>敏感文件黑名单 + 读写放行规则（顺序敏感）</td></tr>
     <tr><td>中断配置 <code>build_interrupt_on</code></td><td><code>agent/guardrails.py:72</code></td><td>仅 <code>local</code> 档位为 <code>execute</code> 开启审批</td></tr>
-    <tr><td>会话服务 <code>AgentService</code></td><td><code>application/agent_service.py:42</code></td><td>发起运行、事件归一化、历史读取、会话删除</td></tr>
+    <tr><td>会话服务 <code>ThreadService</code></td><td><code>application/thread_service.py</code></td><td>会话标识、清单、历史读取、删除</td></tr>
+    <tr><td>运行服务 <code>RunService</code></td><td><code>application/run_service.py</code></td><td>发起运行、恢复执行、并发互斥与事件产出</td></tr>
+    <tr><td>模型目录 <code>ModelCatalog</code></td><td><code>application/model_catalog.py</code></td><td>可切换模型的只读清单</td></tr>
+    <tr><td>事件翻译器</td><td><code>application/event_translator.py</code></td><td>LangGraph 流增量 → 应用事件（有状态解析器）</td></tr>
     <tr><td>中断编解码</td><td><code>application/interrupt_codec.py</code></td><td>解析 <code>__interrupt__</code>、规整 decisions、构造 <code>Command</code></td></tr>
     <tr><td>检查点上下文</td><td><code>runtime/checkpointer.py:19</code></td><td>异步 SQLite 保存器的建立、建表与关闭</td></tr>
     <tr><td>会话元数据 <code>ThreadMetaStore</code></td><td><code>runtime/thread_store.py:76</code></td><td>会话标题、创建/活动时间与轮次的读写，与检查点共用同一个 SQLite 文件</td></tr>
@@ -296,6 +303,7 @@
 <pre><code>MyAgentHarness/
 ├── main.py                 进程入口：解析子命令 → 装载配置 → 日志 → 分发
 ├── config.py               配置中心（唯一的环境变量解析点）
+├── text_utils.py           文本规整：空白折叠与截断（应用层与存储层共享）
 ├── pyproject.toml          依赖声明（requires-python >= 3.14）
 ├── .env.example            配置模板
 ├── README.md               面向使用者的快速上手
@@ -306,12 +314,18 @@
 │   ├── backends.py         ★ CompositeBackend 装配（工作区 + /memories/）
 │   ├── guardrails.py       ★ 文件权限规则与 HITL 中断配置
 │   ├── profiles.py         HarnessProfile 注册（提示词、子 Agent 开关）
-│   └── __init__.py         仅导出 build_agent
+│   └── __init__.py         导出 build_agent / AgentFactory
 ├── application/            应用层：会话编排与对外协议
-│   ├── agent_service.py    ★ 会话服务：stream / resume / history / list_threads / delete
-│   ├── events.py           ★ 统一事件模型与 SSE 帧编码
+│   ├── thread_service.py   ★ 会话服务：new_thread_id / list_threads / history / delete_thread
+│   ├── run_service.py      ★ 运行服务：stream / resume（并发互斥与事件产出）
+│   ├── model_catalog.py    ★ 模型目录：list_models
+│   ├── event_translator.py ★ LangGraph 流增量 → AgentEvent
+│   ├── events.py           ★ 统一事件模型 AgentEvent（与传输方式无关）
+│   ├── dto.py              ★ 服务层对外的 pydantic 返回契约
+│   ├── errors.py           可预期异常（ThreadBusyError 等）
+│   ├── runnable.py         LangGraph 运行配置构造
 │   ├── interrupt_codec.py  ★ 中断解析与恢复指令构造
-│   └── __init__.py         导出 AgentService / SSEEvent / SSEEventType
+│   └── __init__.py         导出三个服务与事件模型
 ├── interfaces/             接口层：两种适配器
 │   ├── cli.py              ★ 终端交互：事件渲染 + stdin 审批
 │   └── web/
@@ -340,10 +354,11 @@
   <tbody>
     <tr><td><code>main.py</code></td><td><code>main()</code> <code>main.py:79</code></td><td>子命令解析（<code>_build_parser</code> <code>main.py:33</code>）、配置失败兜底（退出码 2）、按命令分发到 <code>_run_cli</code> / <code>_run_web</code></td></tr>
     <tr><td><code>config.py</code></td><td><code>AppConfig.load()</code> <code>config.py:182</code></td><td>装载后立即 <code>ensure_directories()</code>；<code>get_config()</code> <code>config.py:196</code> 以 <code>lru_cache</code> 保证进程内共享同一份</td></tr>
-    <tr><td><code>agent/graph.py</code></td><td><code>build_agent()</code> / <code>get_agent()</code></td><td><code>get_agent</code> 为带锁双检的缓存版本，供应用层使用</td></tr>
+    <tr><td><code>agent/graph.py</code></td><td><code>build_agent()</code> / <code>AgentFactory.get()</code></td><td><code>AgentFactory</code> 为带锁双检的缓存版本，由装配层构造后注入服务</td></tr>
     <tr><td><code>agent/backends.py</code></td><td><code>build_backend()</code></td><td>校验工作区存在性；<code>sandbox</code> 档位显式抛 <code>NotImplementedError</code> 而非静默降级</td></tr>
     <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>:360</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>:76</code> 提供登记、轮次累加、列表与删除</td></tr>
-    <tr><td><code>application/agent_service.py</code></td><td><code>AgentService.stream()</code> <code>:240</code> / <code>resume()</code> <code>:267</code></td><td>异步生成器，逐条产出 <code>SSEEvent</code>；内部 <code>_consume()</code> <code>:305</code> 完成 LangGraph 事件到应用事件的翻译</td></tr>
+    <tr><td><code>application/run_service.py</code></td><td><code>RunService.stream()</code> / <code>resume()</code></td><td>普通协程，<strong>在进入流之前</strong>完成校验与模型初始化；返回产出 <code>AgentEvent</code> 的异步迭代器</td></tr>
+    <tr><td><code>application/thread_service.py</code></td><td><code>ThreadService.history()</code> / <code>delete_thread()</code></td><td>删除返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分不存在 / 部分成功 / 失败</td></tr>
     <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>:160</code></td><td>主循环 + <code>_run_turn()</code> <code>:133</code> 中断循环 + <code>ask_human()</code> <code>:80</code> 决策采集</td></tr>
     <tr><td><code>interfaces/web/app.py</code></td><td><code>create_app()</code> <code>:53</code></td><td>路由注册必须在静态挂载之前，否则 API 被 <code>/</code> 吞掉</td></tr>
     <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>7 个端点，2 个以 SSE 返回</td></tr>
@@ -485,17 +500,18 @@
 
 <h4>图缓存与并发</h4>
 <p>
-  <code>get_agent()</code>（<code>:136</code>）按<strong>模型别名</strong>缓存已编译图
-  （<code>_AGENT_CACHE</code> + <code>_AGENT_LOCK</code> 双检锁）。WHY 缓存：
-  <code>create_deep_agent</code> 会重建整条中间件栈与工具集，开销可观。
-  WHY 由调用方共享 <code>store</code>：<code>/memories/</code> 路由绑定 Store 实例，
-  若每个模型各持一份，用户在 A 模型下写入的长期记忆在 B 模型下就消失了。
+  <code>AgentFactory.get()</code> 按<strong>模型别名</strong>缓存已编译图（工厂实例内
+  <code>threading.Lock</code> 双检锁）。WHY 缓存：<code>create_deep_agent</code> 会重建
+  整条中间件栈与工具集，开销可观。WHY 由工厂共享 <code>store</code>：
+  <code>/memories/</code> 路由绑定 Store 实例，若每个模型各持一份，用户在 A 模型下
+  写入的长期记忆在 B 模型下就消失了。
 </p>
-<div class="box warn">
-  <span class="t">维护注意</span>
-  缓存键只有模型别名，<strong>不含 checkpointer / store</strong>。因此首次装配时传入的
-  checkpointer 会被后续所有同别名调用沿用。当前两种运行形态都在各自进程内固定注入，
-  不构成问题；但若将来在同一进程内为不同用户切换 checkpointer，必须改用复合缓存键。
+<div class="box">
+  <span class="t">缓存上下文为何随工厂实例而非全局</span>
+  早期实现用模块级 <code>_AGENT_CACHE</code>，键只有模型别名，<strong>不含
+  checkpointer / store</strong>：换一组依赖后仍会返回先前的图，表现为「长期记忆串味」
+  「对话状态读不到」这类难以定位的问题，且无法在测试之间隔离。改为由工厂实例持有依赖后，
+  依赖本身就是缓存上下文，上述隐患被结构性消除。
 </div>
 
 <h3>6.2 <code>agent/backends.py</code>：文件与执行策略</h3>
@@ -589,66 +605,84 @@
 <h2 id="c-service">7. 核心组件：应用服务层</h2>
 
 <p>
-  <code>AgentService</code>（<code>application/agent_service.py:43</code>）是 CLI 与 Web 的
-  共同下游。两者的差异只在「人工决策从哪来」——CLI 读 stdin，Web 收 HTTP 请求体——
-  而恢复图执行的逻辑完全一致，因此下沉到此处以避免两份实现漂移。
+  应用层由三个互不下沉的服务组成，它们都是 CLI 与 Web 的共同下游。两者的差异只在
+  「人工决策从哪来」——CLI 读 stdin，Web 收 HTTP 请求体——而恢复图执行的逻辑完全一致，
+  因此下沉到此处以避免两份实现漂移。
 </p>
 
-<h4>构造依赖（强制注入 checkpointer）</h4>
-<p>
-  <code>__init__</code>（<code>:46</code>）要求 <code>checkpointer</code> 与
-  <code>thread_store</code> 都必须由外部传入，任一为 <code>None</code> 时直接抛
-  <code>ValueError</code>。WHY：异步连接由上下文管理器托管，本类若自行创建就无从关闭，
-  必然泄漏连接；而没有 checkpointer 就没有会话恢复能力，没有 thread_store 则会话清单
-  永远是空的——两者都属于必须满足的前置条件。内部另行构造 <code>store</code>
-  （<code>runtime/store.py</code>）与 <code>registry</code>。
-</p>
-
-<h4>公开方法</h4>
 <table>
-  <thead><tr><th>方法</th><th>位置</th><th>职责</th></tr></thead>
+  <thead><tr><th>服务</th><th>职责</th><th>不做什么</th></tr></thead>
   <tbody>
-    <tr>
-      <td><code>models()</code></td><td><code>:79</code></td>
-      <td>返回不含密钥的模型展示信息</td>
-    </tr>
-    <tr>
-      <td><code>ensure_ready()</code></td><td><code>:83</code></td>
-      <td>提前构造图，把配置与模型错误暴露在 SSE 开始之前。<strong>这是 Web 侧错误可读性的关键</strong>：
-      流一旦开始，状态码与响应头已发出，异常只能表现为「连接被中断」</td>
-    </tr>
-    <tr>
-      <td><code>new_thread()</code></td><td><code>:101</code></td>
-      <td><strong>只发号、不落库</strong>：会话的诞生时刻是「首条消息被接受」
-      （见 <code>stream()</code>），因此此刻返回的 ID 在数据库中并不存在。
-      仍由服务端发号是为了保留 <code>uuid4</code> 的不可预测性——端点无鉴权，
-      客户端可自选 ID 就意味着能覆盖他人会话</td>
-    </tr>
-    <tr>
-      <td><code>list_threads()</code></td><td><code>:118</code></td>
-      <td>返回 <code>{"items": [...], "total": N}</code>；只查元数据表，不逐个读图状态</td>
-    </tr>
-    <tr>
-      <td><code>history()</code></td><td><code>:148</code></td>
-      <td>用 <code>aget_state()</code> 读取历史；异常或不存在的 thread 一律返回空列表而非抛错</td>
-    </tr>
-    <tr>
-      <td><code>delete_thread()</code></td><td><code>:174</code></td>
-      <td>先删元数据再删检查点（<code>_delete_checkpoints()</code> <code>:218</code>）；
-      返回值<strong>以元数据登记为准</strong>，从未发言过的 ID 返回 <code>False</code></td>
-    </tr>
-    <tr>
-      <td><code>stream()</code></td><td><code>:240</code></td>
-      <td>发起一轮对话，产出 <code>SSEEvent</code> 异步序列；
-      在<strong>进入图之前</strong>登记会话（标题取自本次输入）</td>
-    </tr>
-    <tr>
-      <td><code>resume()</code></td><td><code>:267</code></td>
-      <td>把审批载荷编成 <code>Command(resume=...)</code> 后恢复执行；
-      只刷新活动时间，不重复计入轮次</td>
-    </tr>
+    <tr><td><code>ThreadService</code></td><td>会话的元数据生命周期：发号、清单、历史、删除</td><td>不推进运行、不产出事件</td></tr>
+    <tr><td><code>RunService</code></td><td>一次运行的推进、并发互斥与事件产出</td><td>不管会话清单与历史</td></tr>
+    <tr><td><code>ModelCatalog</code></td><td>可切换模型的只读目录</td><td>不参与会话与运行编排</td></tr>
   </tbody>
 </table>
+
+<div class="box">
+  <span class="t">为什么要拆开</span>
+  合并为一个 <code>AgentService</code> 时，它同时是「会话元数据门面」「运行编排器」
+  「LangGraph 流协议解析器」「模型目录代理」四件事：模型目录只为了转发一行
+  <code>registry.describe()</code> 而让服务持有整个注册表；约 170 行的流解析内联其中，
+  导致单测必须同时 mock 图、检查点、元数据存储与模型初始化。拆开后每件事的依赖边界
+  与测试成本都回到合理范围。
+</div>
+
+<h4>构造依赖（强制注入）</h4>
+<p>
+  三个服务都要求依赖由外部传入，任一为 <code>None</code> 时直接抛 <code>ValueError</code>。
+  WHY：异步连接由上下文管理器托管，服务若自行创建就无从关闭，必然泄漏连接；而没有
+  checkpointer 就没有会话恢复能力，没有 thread_store 则会话清单永远是空的——两者都属于
+  必须满足的前置条件。依赖在装配层（<code>interfaces/web/app.py</code> 的 lifespan 与
+  <code>interfaces/cli.py</code> 的 <code>run_cli</code>）一次性构造后注入，服务自身
+  不再自行 <code>build_store</code> / <code>get_registry</code>。
+</p>
+
+<h4><code>ThreadService</code> 公开方法</h4>
+<table>
+  <thead><tr><th>方法</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>new_thread_id()</code></td><td><strong>只发号、不落库</strong>：会话的诞生时刻是「首条消息被接受」（见 <code>RunService.stream()</code>），因此此刻返回的 ID 在数据库中并不存在。仍由服务端发号是为了保留 <code>uuid4</code> 的不可预测性——端点无鉴权，客户端可自选 ID 就意味着能覆盖他人会话</td></tr>
+    <tr><td><code>list_threads()</code></td><td>返回 <code>ThreadListResult</code>；只查元数据表，不逐个读图状态</td></tr>
+    <tr><td><code>history()</code></td><td>用 <code>aget_state()</code> 读取历史；不存在的会话返回空列表，<strong>查询失败则抛错</strong>（不再把故障伪装成空列表）</td></tr>
+    <tr><td><code>delete_thread()</code></td><td>先删元数据再删检查点；返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分 <code>deleted</code> / <code>not_found</code> / <code>partial</code> / <code>failed</code></td></tr>
+  </tbody>
+</table>
+
+<h4><code>RunService</code> 公开方法</h4>
+<table>
+  <thead><tr><th>方法</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>stream()</code></td><td>发起一轮对话。<strong>普通协程而非异步生成器</strong>：校验与模型初始化都在 <code>await</code> 时完成，错误能在响应开始之前被映射成正常状态码；在进入图之前登记会话（标题取自本次输入）</td></tr>
+    <tr><td><code>resume()</code></td><td>把审批载荷编成 <code>Command(resume=...)</code> 后恢复执行；只刷新活动时间，不重复计入轮次</td></tr>
+    <tr><td><code>release_run_slot()</code></td><td>归还运行槽位。生成器只在被消费时通过 <code>finally</code> 归还；调用方拿到迭代器后若因异常未能消费，需显式归还</td></tr>
+  </tbody>
+</table>
+
+<h4><code>ModelCatalog</code> 公开方法</h4>
+<table>
+  <thead><tr><th>方法</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>list_models()</code></td><td>返回 <code>list[ModelInfo]</code>，不含任何密钥信息</td></tr>
+    <tr><td><code>has()</code></td><td>判断模型别名是否已注册</td></tr>
+  </tbody>
+</table>
+
+<div class="box">
+  <span class="t">为什么不再需要 ensure_ready()</span>
+  它此前的存在理由是「SSE 一旦开始就无法改状态码」，属于<strong>传输层约束倒逼出的
+  应用层 API</strong>。把 <code>stream</code> / <code>resume</code> 改成普通协程后，取图
+  （含模型别名解析与初始化）发生在 <code>await</code> 阶段，这个约束自然消失，
+  接口层也不必再为传输限制在服务上开洞。
+</div>
+
+<div class="box warn">
+  <span class="t">并发互斥</span>
+  同一会话并发发起两轮会让图状态竞争：两轮各自读写同一 thread 的检查点，后写的一方会
+  覆盖先写一方的中间结果，表现为消息丢失或工具结果错配。因此 <code>RunService</code>
+  用「运行中会话集合」做互斥，命中时抛 <code>ThreadBusyError</code>（HTTP 409）
+  <strong>而非排队</strong>——一次运行可能持续数分钟，排队会让请求无限期挂起。
+</div>
 
 <div class="box">
   <span class="t">为什么用异步接口而不是同步接口</span>
@@ -658,10 +692,14 @@
   <code>delete_thread</code> 用 <code>adelete_thread</code>，全链路异步对齐。
 </div>
 
-<h4>事件翻译核心：<code>_consume()</code>（<code>:305</code>）</h4>
+<h4>事件翻译核心：<code>LangGraphEventTranslator</code></h4>
 
 <p>
-  以 <code>stream_mode=["messages", "updates"]</code> 双流订阅图，然后归一到应用事件：
+  <code>RunService._iterate()</code> 以 <code>stream_mode=["messages", "updates"]</code>
+  双流订阅图，交给 <code>application/event_translator.py</code> 的翻译器归一到应用事件。
+  WHY 独立成类：这是一段<strong>有状态</strong>的解析逻辑（工具参数按分片到达，需跨
+  chunk 累积），与会话编排无关；独立后可脱离图与存储直接单测，LangGraph 调整 chunk
+  结构时也只需改这一处。
 </p>
 
 <table>
@@ -669,7 +707,7 @@
   <tbody>
     <tr>
       <td><code>messages</code> 流中的 <code>AIMessageChunk</code></td>
-      <td><code>_handle_message</code> <code>:371</code></td>
+      <td><code>translator._on_ai_chunk()</code></td>
       <td><code>token</code>（文本增量）；<code>tool_call_chunks</code> 按 <code>index</code> 累积到
       <code>pending_tool_calls</code> 缓冲</td>
     </tr>
@@ -686,7 +724,7 @@
     </tr>
     <tr>
       <td><code>updates</code> 流含 <code>__interrupt__</code></td>
-      <td><code>_handle_updates</code> <code>:423</code> + <code>decode_interrupt</code></td>
+      <td><code>translator._on_updates()</code> + <code>decode_interrupt</code></td>
       <td><code>interrupt</code> 事件（携带 <code>action_requests</code> / <code>review_configs</code>）</td>
     </tr>
     <tr>
@@ -708,7 +746,7 @@
 </table>
 
 <p>
-  <code>_flush_tool_calls()</code>（<code>:452</code>）按 <code>index</code> 排序后依次产出
+  <code>translator.flush()</code> 按 <code>index</code> 排序后依次产出
   <code>tool_call</code>；参数分片拼成的 JSON 若解析失败，会保留原文并包成
   <code>{"__raw__": ...}</code> 交给前端原样展示，便于排查。
 </p>
@@ -850,9 +888,11 @@ ON CONFLICT(thread_id) DO UPDATE SET
 
 <h4><code>app.py</code>：应用工厂与生命周期</h4>
 <ul>
-  <li><code>_lifespan</code>（<code>:28</code>）：在 lifespan 中打开检查点与会话元数据表、构造 <code>AgentService</code>
-    并挂到 <code>app.state.service</code>。WHY 不放在模块导入时：服务构造会打开 SQLite 连接并初始化模型，
-    只有放在这里才能保证进程退出（含异常退出）一定走到清理逻辑。</li>
+  <li><code>_lifespan</code>（<code>:28</code>）：在 lifespan 中打开检查点与会话元数据表、
+    构造 <code>AgentFactory</code> 与三个服务，分别挂到 <code>app.state.threads</code> /
+    <code>app.state.runs</code> / <code>app.state.catalog</code>。WHY 不放在模块导入时：
+    服务构造会打开 SQLite 连接并初始化模型，只有放在这里才能保证进程退出（含异常退出）
+    一定走到清理逻辑。</li>
   <li><code>create_app</code>（<code>:53</code>）：注册路由后<strong>再</strong>挂载静态目录。
     WHY：<code>mount("/")</code> 会吞掉之后注册的所有路径，导致 API 404。</li>
 </ul>
@@ -875,12 +915,16 @@ ON CONFLICT(thread_id) DO UPDATE SET
   三个横切关注点在路由层统一处理：
 </p>
 <ul>
-  <li><code>get_service</code>（<code>:41</code>）：从 <code>app.state</code> 取服务单例，
-    未初始化时返回 500。WHY 单例：图与 checkpointer 都是有状态的重量对象。</li>
-  <li><code>_validate_thread_id</code>（<code>:56</code>）：空 ID 直接 400。</li>
-  <li><code>_ensure_ready</code>（<code>:130</code>）：在返回 <code>StreamingResponse</code> 之前
-    调用 <code>service.ensure_ready()</code>，把 <code>KeyError</code>（未知模型）映射为 400、
-    其他异常映射为 500 并附上 <code>detail</code>。</li>
+  <li><code>get_threads</code> / <code>get_runs</code> / <code>get_catalog</code>：从
+    <code>app.state</code> 取服务单例，未初始化时返回 500。WHY 单例：图与 checkpointer
+    都是有状态的重量对象。</li>
+  <li><code>_validate_thread_id</code>：复用存储层的 <code>normalize_thread_id</code>，
+    把 <code>ValueError</code> 翻译成 400。WHY：会话 ID 的合法性规则只有一份定义，
+    路由层不再自己维护一套判断。</li>
+  <li>运行端点在 <code>await runs.stream(...)</code> 处捕获 <code>ValueError</code> /
+    <code>KeyError</code>（400）、<code>ThreadBusyError</code>（409）与
+    <code>RuntimeError</code>（500）。WHY 能拿到正确状态码：校验与模型初始化都发生在
+    <code>await</code> 阶段，早于 <code>StreamingResponse</code> 的构造。</li>
 </ul>
 
 <p>
@@ -959,10 +1003,10 @@ ON CONFLICT(thread_id) DO UPDATE SET
 <h3>10.2 CLI 启动序列</h3>
 <pre><code>main() → _run_cli() → asyncio.run(run_cli(config, model_name))
   └─ async with checkpointer_context(config.db_path)   # 建表 + 连接
-       └─ AgentService(config, checkpointer=...)       # 构造 store / registry
-            ├─ service.models() 比对别名               # 未知模型 → 打印可选值，退出码 2
-            ├─ service.new_thread()                    # uuid4().hex
-            └─ while True: input("\n> ") → _run_turn()</code></pre>
+     └─ AgentFactory(config, checkpointer=...)         # 共享 store
+          ├─ ModelCatalog.list_models() 比对别名       # 未知模型 → 打印可选值，退出码 2
+          ├─ threads.new_thread_id()                   # uuid4().hex
+          └─ while True: input("\n> ") → _run_turn()</code></pre>
 
 <h3>10.3 Web 启动序列</h3>
 <pre><code>main() → _run_web() → create_app(config)
@@ -971,8 +1015,9 @@ ON CONFLICT(thread_id) DO UPDATE SET
   └─ mount("/", StaticFiles(...))    # 后挂静态资源
 
 uvicorn.run() → 触发 _lifespan：
-  └─ async with checkpointer_context() → app.state.service = AgentService(...)
-       └─ yield（服务运行中）→ finally: 记录停止日志并关闭检查点连接</code></pre>
+  └─ async with checkpointer_context() + open_thread_store()
+       └─ AgentFactory → app.state.threads / runs / catalog
+            └─ yield（服务运行中）→ finally: 记录停止日志并关闭连接</code></pre>
 
 <!-- ============================================================ -->
 <h2 id="flow-turn">11. 流程：一轮对话</h2>
@@ -982,23 +1027,24 @@ uvicorn.run() → 触发 _lifespan：
 <div class="flow">
   <span class="step">前端 POST /runs</span><span class="sep">→</span>
   <span class="step">_validate_thread_id</span><span class="sep">→</span>
-  <span class="step hot">_ensure_ready</span><span class="sep">→</span>
+  <span class="step hot">await runs.stream()</span><span class="sep">→</span>
+  <span class="step">校验 + 取图 + 登记会话</span><span class="sep">→</span>
   <span class="step">StreamingResponse(SSE)</span><span class="sep">→</span>
-  <span class="step hot">service.stream()</span><span class="sep">→</span>
-  <span class="step">graph.astream()</span><span class="sep">→</span>
-  <span class="step">逐帧 encode → 前端 parseFrame</span>
+  <span class="step hot">graph.astream()</span><span class="sep">→</span>
+  <span class="step">逐帧 encode_sse → 前端 parseFrame</span>
 </div>
 
 <h4>内部调用链</h4>
 <pre><code>routes.run_agent
- └─ AgentService.stream(thread_id, content, model_name)      # :240
-     ├─ _record_turn(title_hint=用户输入, turn_delta=1)       # :259 会话在此刻诞生
-     └─ _consume({"messages":[{"role":"user","content":...}]}, ...)  # :305
-         ├─ get_agent(config, checkpointer, store, model_name)  # 缓存命中则零开销
+ └─ await runs.stream(thread_id, content, model_name)      # 普通协程，校验在此完成
+     ├─ normalize_thread_id / 校验 user_input
+     ├─ graph_factory.get(model_name)                      # 别名解析 + 模型初始化
+     ├─ _record_turn(title_hint=用户输入, turn_delta=1)     # 会话在此刻诞生
+     └─ _consume(graph, payload, thread_id)                # 返回异步生成器
          ├─ graph.astream(payload, config, stream_mode=["messages","updates"])
-         │    ├─ 节点切换 → _flush_tool_calls()
+         │    ├─ 节点切换 → translator.flush()
          │    ├─ AIMessageChunk → token 事件 + 累积 tool_call_chunks
-         │    ├─ ToolMessage → tool_result 事件（截断 2000 字符）
+         │    ├─ ToolMessage → tool_result 事件（上限由 tool_result_preview_chars 控制）
          │    ├─ __interrupt__ → decode_interrupt() → interrupt 事件
          │    └─ 其他节点更新 → step / todos 事件
          ├─ 异常 → error 事件（不向上抛，避免流被硬切断）
@@ -1006,15 +1052,18 @@ uvicorn.run() → 触发 _lifespan：
          └─ 流结束 → flush 残留工具调用 → done 事件</code></pre>
 
 <p>
-  每个 <code>SSEEvent</code> 经 <code>SSEEvent.encode()</code>（<code>application/events.py:56</code>）
-  变成 <code>event: 名称\ndata: JSON\n\n</code> 的文本帧。
+  每个 <code>AgentEvent</code> 在接口层经 <code>encode_sse()</code>
+  （<code>interfaces/web/sse.py</code>）变成
+  <code>event: 名称\ndata: JSON\n\n</code> 的文本帧。WHY 编码放在接口层而不是应用层：
+  SSE 是 HTTP 传输格式，而应用事件与传输方式无关（CLI 直接渲染到终端），
+  写进应用层会把后者绑死在 HTTP 上。
   <code>json.dumps</code> 使用 <code>ensure_ascii=False</code>：中文若被转义成 <code>\uXXXX</code>，
   帧体积会翻倍，也妨碍调试时肉眼阅读。
 </p>
 
 <div class="box ok">
   <span class="t">错误可读性设计</span>
-  模型初始化错误必须在 <code>_ensure_ready</code> 阶段抛出（映射为 400/500），
+  模型初始化错误必须在 <code>await runs.stream()</code> 阶段抛出（映射为 400/500），
   运行期错误则转为 <code>error</code> 事件在流内下发。两者分工明确：
   前者保证「请求还没开始就能看到原因」，后者保证「流已经开始也不会被硬切断」。
 </div>
@@ -1030,8 +1079,8 @@ uvicorn.run() → 触发 _lifespan：
 <h4>中断阶段</h4>
 <pre><code>1. HumanInTheLoopMiddleware 在 execute 执行前调用 interrupt()
 2. LangGraph 产出 updates: {"__interrupt__": (Interrupt(value=HITLRequest, id=...),)}
-3. _handle_updates (:423) 先识别 __interrupt__，交由 decode_interrupt 解析
-4. AgentService 先 flush 未发送的工具调用，再产出 interrupt 事件
+3. translator._on_updates() 先识别 __interrupt__，交由 decode_interrupt 解析
+4. 翻译器先 flush 未发送的工具调用，再产出 interrupt 事件
 5. 事件经 SSE 到达前端 → renderApproval() 按 allowed_decisions 渲染按钮
    （CLI 侧：_run_turn 捕获 interrupt 载荷存进 pending_payload，跳出后调用 ask_human）</code></pre>
 
@@ -1100,8 +1149,8 @@ uvicorn.run() → 触发 _lifespan：
       <td>读取历史</td>
       <td><code>GET /api/threads/{id}</code></td>
       <td><code>graph.aget_state(cfg)</code> → <code>values["messages"]</code> →
-      <code>_message_to_dict</code>（<code>agent_service.py:524</code>）统一成
-      <code>{role, content, name, tool_calls}</code>；异常时返回空列表</td>
+      <code>ThreadService._message_to_dto</code> 统一成 <code>HistoryMessage</code>；
+      会话不存在返回空列表，<strong>查询失败则抛错</strong>（不再把故障伪装成空列表）</td>
     </tr>
     <tr>
       <td>删除会话</td>
@@ -1128,7 +1177,9 @@ uvicorn.run() → 触发 _lifespan：
 
 <p>
   CLI 与 Web 消费同一套事件定义，避免同一件事实在两处各写一遍渲染逻辑。
-  <code>SSEEvent</code> 是冻结数据类——事件一旦生成就不应被下游修改（<code>:49</code>）。
+  <code>AgentEvent</code> 是冻结数据类——事件一旦生成就不应被下游修改。
+  WHY 不以 <code>SSE</code> 命名：它描述的是「运行过程中发生了什么」，与传输方式无关；
+  CLI 直接渲染到终端，只有 Web 才经 <code>encode_sse()</code> 序列化成文本帧。
 </p>
 
 <table>
@@ -1154,7 +1205,8 @@ data: {"index":0,"name":"read_file","args":{"path":"/AGENTS.md"}}
 
 </code></pre>
 <p class="lede">
-  每帧以空行结尾。多行数据会产生多帧，因此服务端保证 payload 单行化（<code>events.py:65-67</code>）。
+  每帧以空行结尾。多行数据会产生多帧，因此服务端保证 payload 单行化
+  （<code>interfaces/web/sse.py</code> 的 <code>encode_sse</code>）。
 </p>
 
 <h3>14.3 一次完整请求的数据流</h3>
@@ -1162,9 +1214,10 @@ data: {"index":0,"name":"read_file","args":{"path":"/AGENTS.md"}}
   │ ① POST /api/threads                       → {thread_id}
   │ ② POST /api/threads/{id}/runs  {content, model}
   ▼
-FastAPI 路由 ── ③ 校验 thread_id / ensure_ready（此处失败返回 400/500）
+FastAPI 路由 ── ③ 校验 thread_id；await runs.stream() 完成校验 + 取图 +
+  │              登记会话（此处失败返回 400 / 409 / 500）
   ▼
-AgentService ── ④ 组装 {"messages":[{"role":"user","content":...}]}
+RunService ──── ④ 组装 {"messages":[{"role":"user","content":...}]}
   │            ⑤ graph.astream(stream_mode=["messages","updates"])
   ▼
 LangGraph 图 ── ⑥ 中间件栈：TodoList → ContextEditing → ModelCallLimit
@@ -1172,9 +1225,9 @@ LangGraph 图 ── ⑥ 中间件栈：TodoList → ContextEditing → ModelCal
   │            ⑧ execute 前可能触发 interrupt（local 档位）
   │            ⑨ 每步状态由 AsyncSqliteSaver 写入 .data/agent.db
   ▼
-AgentService._consume ── ⑩ 翻译为 SSEEvent
+事件翻译器 ──── ⑩ 翻译为 AgentEvent（RunService._iterate 逐条产出）
   ▼
-SSEEvent.encode ── ⑪ "event: X\ndata: JSON\n\n"
+encode_sse ────── ⑪ "event: X\ndata: JSON\n\n"（interfaces/web/sse.py）
   ▼
 StreamingResponse(text/event-stream)
   ▼
@@ -1335,13 +1388,14 @@ StreamingResponse(text/event-stream)
     </tr>
     <tr>
       <td>新增事件类型</td>
-      <td><code>application/events.py</code> 的 <code>SSEEventType</code> + <code>AgentService._consume</code>
-      产出点 + <code>cli.render_event()</code> + <code>static/app.js</code> 的 <code>handleEvent()</code>（四处齐改）</td>
+      <td><code>application/events.py</code> 的 <code>AgentEventType</code> +
+      <code>event_translator.py</code> 的产出点 + <code>cli.render_event()</code> +
+      <code>static/app.js</code> 的 <code>handleEvent()</code>（四处齐改）</td>
     </tr>
     <tr>
       <td>新增会话元数据字段</td>
       <td><code>runtime/thread_store.py</code> 的 <code>_SCHEMA</code> 与 <code>_COLUMNS</code>
-      + <code>schemas.py</code> 的 <code>ThreadSummary</code>。注意 <code>_SCHEMA</code> 只有
+      + <code>application/dto.py</code> 的 <code>ThreadSummary</code>。注意 <code>_SCHEMA</code> 只有
       <code>CREATE TABLE IF NOT EXISTS</code>，对已存在的库不会自动加列，需手工
       <code>ALTER TABLE</code> 或引入迁移脚本</td>
     </tr>

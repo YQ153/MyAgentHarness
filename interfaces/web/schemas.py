@@ -1,10 +1,17 @@
-"""Web 接口的请求与响应模型。"""
+"""Web 接口的请求与响应模型。
+
+WHY 只在这里定义「请求体」与「HTTP 专属的响应包装」：服务层产出的数据结构
+定义在 ``application.dto``，那是本应用对外的稳定契约。响应模型若在这里再抄一份
+字段，两处迟早漂移——改了 DTO 忘了改 schema，接口就会静默少字段。
+"""
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+from application.dto import DeleteOutcome, HistoryMessage, ModelInfo, ThreadSummary
 
 
 class EditedAction(BaseModel):
@@ -46,21 +53,6 @@ class ThreadResponse(BaseModel):
     thread_id: str
 
 
-class ThreadSummary(BaseModel):
-    """会话列表中的一条记录。
-
-    WHY 时间字段用字符串而非 ``datetime``：库中存的就是定宽 ISO8601 文本，
-    直接透出可以避免一次无意义的正反序列化；同时也让前端无需处理时区转换
-    （后端统一写 UTC 并带 ``+00:00`` 偏移）。
-    """
-
-    thread_id: str = Field(description="会话标识")
-    title: str = Field(description="会话标题，尚未产生首轮对话时为空串")
-    created_at: str = Field(description="创建时间（ISO8601 UTC）")
-    updated_at: str = Field(description="最近活动时间（ISO8601 UTC）")
-    turn_count: int = Field(description="已发生的用户对话轮数")
-
-
 class ThreadListResponse(BaseModel):
     """会话清单及其总数。"""
 
@@ -69,24 +61,27 @@ class ThreadListResponse(BaseModel):
 
 
 class DeleteResponse(BaseModel):
-    """删除结果。"""
+    """删除结果。
+
+    WHY 同时给出 ``deleted`` 与 ``outcome``：``deleted`` 保持既有前端可读的布尔
+    语义（会话是否已从清单移除），``outcome`` 则暴露「不存在 / 部分成功 / 失败」
+    的区分，让调用方能判断是否需要重试或提示人工介入。
+    """
 
     thread_id: str
-    deleted: bool
+    deleted: bool = Field(description="会话是否已从清单中移除")
+    outcome: DeleteOutcome = Field(description="删除结果分类")
+    detail: str = Field(default="", description="失败原因摘要，成功时为空串")
 
 
-class ModelInfo(BaseModel):
-    """模型展示信息，不含任何密钥。"""
-
-    name: str
-    provider: str
-    model: str
-
-
-class HistoryMessage(BaseModel):
-    """一条历史消息。"""
-
-    role: str
-    content: str
-    name: str = ""
-    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+__all__ = [
+    "ChatRequest",
+    "DecisionPayload",
+    "DeleteResponse",
+    "EditedAction",
+    "HistoryMessage",
+    "ModelInfo",
+    "ResumeRequest",
+    "ThreadListResponse",
+    "ThreadResponse",
+]

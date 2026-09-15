@@ -71,6 +71,13 @@ class AppConfig(BaseSettings):
     宽侧栏浪费空间；而这里只约束「截断长度」，不参与任何存储结构。
     """
 
+    tool_result_preview_chars: int = Field(default=2000, ge=100, le=50_000)
+    """推送给前端的工具结果预览长度上限。
+
+    WHY 做成配置：命令输出或大文件读取可达数十万字符，直接推送会占满带宽并
+    让界面卡死；而不同部署的前端能承载的预览长度不同，硬编码无法按环境调整。
+    """
+
     # ---------------- 执行与安全 ----------------
     execution_mode: ExecutionMode = ExecutionMode.DISABLED
     shell_timeout: int = Field(default=120, gt=0)

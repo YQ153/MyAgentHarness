@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from application.agent_service import AgentService
-from application.events import SSEEvent, SSEEventType
+from agent.graph import AgentFactory, get_registry
+from application.errors import ThreadBusyError
+from application.events import AgentEvent, AgentEventType
+from application.model_catalog import ModelCatalog
+from application.run_service import RunService
+from application.thread_service import ThreadService
 from runtime.checkpointer import checkpointer_context
 from runtime.thread_store import open_thread_store
 
@@ -32,27 +37,27 @@ def _render_todos(items: list[dict[str, Any]]) -> None:
     print("")
 
 
-def render_event(event: SSEEvent) -> None:
+def render_event(event: AgentEvent) -> None:
     """把单个事件渲染到终端。"""
     payload = event.payload
 
-    if event.event is SSEEventType.TOKEN:
+    if event.event is AgentEventType.TOKEN:
         # WHY 不换行并强制刷缓冲：流式输出必须逐字吐出，否则用户会以为卡死
         print(payload.get("text", ""), end="", flush=True)
-    elif event.event is SSEEventType.TOOL_CALL:
+    elif event.event is AgentEventType.TOOL_CALL:
         args = payload.get("args", {})
         print(f"\n[调用] {payload.get('name', '')} {_format_args(args)}", flush=True)
-    elif event.event is SSEEventType.TOOL_RESULT:
+    elif event.event is AgentEventType.TOOL_RESULT:
         status = payload.get("status") or ""
         suffix = " (已截断)" if payload.get("truncated") else ""
         print(f"[结果] {payload.get('name', '')} {status}{suffix}", flush=True)
-    elif event.event is SSEEventType.TODOS:
+    elif event.event is AgentEventType.TODOS:
         _render_todos(list(payload.get("items") or []))
-    elif event.event is SSEEventType.STEP:
+    elif event.event is AgentEventType.STEP:
         pass
-    elif event.event is SSEEventType.ERROR:
+    elif event.event is AgentEventType.ERROR:
         print(f"\n[错误] {payload.get('message', '')}", flush=True)
-    elif event.event is SSEEventType.DONE:
+    elif event.event is AgentEventType.DONE:
         print("", flush=True)
 
 
@@ -115,8 +120,6 @@ def ask_human(payload: dict[str, Any]) -> dict[str, Any]:
             elif chosen == "edit":
                 raw_json = input("新的参数(JSON) > ").strip()
                 try:
-                    import json
-
                     decision["edited_action"] = {
                         "name": name,
                         "args": json.loads(raw_json),
@@ -131,7 +134,7 @@ def ask_human(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _run_turn(
-    service: AgentService,
+    runs: RunService,
     thread_id: str,
     user_input: str,
     model_name: str | None = None,
@@ -142,19 +145,23 @@ async def _run_turn(
     async def consume(events: Any) -> None:
         nonlocal pending_payload
         async for event in events:
-            if event.event is SSEEventType.INTERRUPT:
+            if event.event is AgentEventType.INTERRUPT:
                 pending_payload = event.payload
                 continue
             render_event(event)
 
-    await consume(service.stream(thread_id, user_input, model_name=model_name))
+    # WHY 先 await 拿到事件流再消费：``stream`` 是普通协程，参数校验与模型
+    # 初始化都在这一步完成，错误能在进入渲染之前抛出，而不是混在事件流里。
+    events = await runs.stream(thread_id, user_input, model_name=model_name)
+    await consume(events)
 
     while pending_payload is not None:
         decision = ask_human(pending_payload)
         pending_payload = None
         # WHY 恢复时同样带上 model_name：中断与恢复是同一次运行的两个半程，
         # 走不同模型会让缓存里多出一个实例，也会让成本与行为出现不可预期偏差。
-        await consume(service.resume(thread_id, decision, model_name=model_name))
+        resumed = await runs.resume(thread_id, decision, model_name=model_name)
+        await consume(resumed)
 
 
 async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
@@ -165,7 +172,7 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
         model_name: 本次会话使用的模型别名；``None`` 表示用配置里的默认模型。
 
     Returns:
-        进程退出码：0 正常，1 运行期异常。
+        进程退出码：0 正常，1 运行期异常，2 参数错误。
     """
     if config is None:
         raise ValueError("config 不能为 None")
@@ -179,21 +186,29 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
         checkpointer_context(config.db_path) as checkpointer,
         open_thread_store(config.db_path) as thread_store,
     ):
-        service = AgentService(
+        graph_factory = AgentFactory(config, checkpointer=checkpointer)
+        threads = ThreadService(
             config,
             checkpointer=checkpointer,
             thread_store=thread_store,
+            graph_factory=graph_factory,
         )
+        runs = RunService(
+            config,
+            thread_store=thread_store,
+            graph_factory=graph_factory,
+        )
+        catalog = ModelCatalog(get_registry(config))
 
         # WHY 启动即校验模型别名：等到第一次提问才报「模型不存在」，用户会
         # 以为是网络或密钥问题；而且这里只比对名称，不需要密钥，能快速失败。
-        available = {item["name"] for item in service.models()}
+        available = {item.name for item in catalog.list_models()}
         if resolved_model not in available:
             print(f"错误：未知模型 {resolved_model!r}，可选：{sorted(available)}")
             return 2
 
         # 只发号不落库：会话在首轮输入被接受时才登记，直接退出不会留下空会话
-        thread_id = service.new_thread()
+        thread_id = threads.new_thread_id()
 
         print("通用 Agent 已启动，输入 exit 退出。")
         print(f"工作区：{config.workspace}")
@@ -216,7 +231,12 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
                 if user_input.lower() in _EXIT_COMMANDS:
                     break
 
-                await _run_turn(service, thread_id, user_input, model_name)
+                await _run_turn(runs, thread_id, user_input, model_name)
+        except ThreadBusyError as exc:
+            # WHY 单独提示而不是当成崩溃：CLI 顺序执行本不该并发，出现说明
+            # 上一轮的事件流没有被消费完，属于可恢复的状态问题。
+            print(f"\n{exc}")
+            return 1
         except KeyboardInterrupt:
             print("\n已中断")
             return 0
