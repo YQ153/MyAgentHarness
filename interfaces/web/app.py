@@ -1,4 +1,8 @@
-"""FastAPI 应用工厂。"""
+"""FastAPI 应用工厂。
+
+职责边界：只做「协议适配」——注册路由、挂载静态资源、托管 Web 专有资源的
+生命周期。对象组装全部交给 ``bootstrap`` 层，因此本模块不直接依赖 ``runtime``。
+"""
 
 from __future__ import annotations
 
@@ -6,27 +10,15 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from agent.graph import AgentFactory, get_registry
-from application.model_catalog import ModelCatalog
-from application.rate_limiter import RateLimiter
-from application.run_service import RunService
-from application.thread_service import ThreadService
+from bootstrap.core import build_app_context
+from bootstrap.web import build_http_client, build_rate_limiter
+from config import AppConfig
 from interfaces.web.auth import router as auth_router
 from interfaces.web.routes import router
-from runtime.api_key_store import open_api_key_store
-from runtime.audit_store import open_audit_store
-from runtime.checkpointer import checkpointer_context
-from runtime.device_flow_store import open_device_flow_store
-from runtime.thread_store import open_thread_store
-
-if TYPE_CHECKING:
-    from config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,49 +29,35 @@ _STATIC_DIR = Path(__file__).parent / "static"
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """管理应用级资源的生命周期。
 
-    WHY 放在 lifespan 而不是模块导入时：服务构造会打开 SQLite 连接并初始化
-    模型，放到这里才能保证进程退出时一定走到清理逻辑（哪怕是异常退出）。
+    WHY 组装放在 lifespan 内而非 ``create_app``：store 与 checkpointer 的构造
+    需要异步上下文（``async with``），而 ``create_app`` 是同步函数。放在这里
+    既能托管生命周期，也能保证进程退出时一定走到清理逻辑（含异常退出）。
     """
     config: AppConfig = app.state.config
-    # WHY 用上下文管理器托管连接：它们的生命周期都与应用一致，
-    # 只有放在这里才能保证正常退出与异常退出时连接都被关闭。
-    # http_client 供 OIDC 流程使用，与数据库连接一起开闭。
-    http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=False)
-    rate_limiter = RateLimiter(
-        window_seconds=config.auth_rate_limit_window_seconds,
-        max_attempts=config.auth_rate_limit_max_attempts,
-    )
-    async with (
-        checkpointer_context(config.db_path) as checkpointer,
-        open_thread_store(config.db_path) as thread_store,
-        open_audit_store(config.db_path) as audit_store,
-        open_api_key_store(config.db_path) as api_key_store,
-        open_device_flow_store(config.db_path) as device_flow_store,
-    ):
-        # WHY 由工厂统一持有长期记忆存储：``/memories/`` 路由绑定的是 Store
-        # 实例，若每个模型各持一份，用户在 A 模型下写入的长期记忆在 B 模型下
-        # 就消失了。
-        graph_factory = AgentFactory(config, checkpointer=checkpointer)
 
+    async with build_app_context(config) as context:
+        # WHY http_client 与 rate_limiter 不放进 AppContext：它们只有 Web 形态
+        # 需要，放进共享上下文会让 CLI 承担无谓的构造开销。
+        http_client = build_http_client()
+        rate_limiter = build_rate_limiter(config)
+
+        # WHY 清理过期 device flow 记录：CLI 轮询产生的过期 code 若不清理，
+        # 该表会随服务运行时长单调增长。
+        try:
+            await context.device_flow_store.cleanup()
+        except Exception:
+            logger.exception("device flow 过期记录清理失败，不影响服务启动")
+
+        # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
+        # 保持既有路由代码不变。
+        app.state.context = context
         app.state.http_client = http_client
         app.state.rate_limiter = rate_limiter
-        app.state.api_key_store = api_key_store
-        app.state.device_flow_store = device_flow_store
-        await device_flow_store.cleanup()
-        app.state.threads = ThreadService(
-            config,
-            checkpointer=checkpointer,
-            thread_store=thread_store,
-            graph_factory=graph_factory,
-            audit_store=audit_store,
-        )
-        app.state.runs = RunService(
-            config,
-            thread_store=thread_store,
-            graph_factory=graph_factory,
-            audit_store=audit_store,
-        )
-        app.state.catalog = ModelCatalog(get_registry(config))
+        app.state.api_key_store = context.api_key_store
+        app.state.device_flow_store = context.device_flow_store
+        app.state.threads = context.threads
+        app.state.runs = context.runs
+        app.state.catalog = context.catalog
 
         logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
         try:
@@ -97,6 +75,9 @@ def create_app(config: AppConfig) -> FastAPI:
 
     Returns:
         已装配路由与静态资源的应用实例。
+
+    Raises:
+        ValueError: ``config`` 为 ``None``。
     """
     if config is None:
         raise ValueError("config 不能为 None")

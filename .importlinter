@@ -1,0 +1,92 @@
+; 层间依赖契约
+;
+; WHY 需要自动校验：架构约定若只写在文档里，会随每次「临时加个导入」逐步退化，
+; 而退化过程没有告警、没有失败用例，等到问题显现时已经难以回退。
+; 把约定变成可执行规则后，违规会在提交阶段就被拦截。
+;
+; 运行：uv run lint-imports
+
+[importlinter]
+root_packages =
+    agent
+    application
+    bootstrap
+    interfaces
+    llm
+    runtime
+
+; ---------------------------------------------------------------- 契约 1
+; 接口层必须通过应用层访问基础设施，不得绕过 application 直接依赖 runtime。
+; 这条契约是 composition root 改造的固化结果。
+[importlinter:contract:interfaces-no-runtime]
+name = interfaces 不得直接依赖 runtime
+type = forbidden
+source_modules =
+    interfaces
+forbidden_modules =
+    runtime
+; 只约束直接导入。interfaces → application → runtime 是分层设计的正常传递路径，
+; 若一并禁止，本契约将与「application 允许依赖 runtime」自相矛盾。
+allow_indirect_imports = True
+
+; ---------------------------------------------------------------- 契约 2
+; llm 只负责按名字提供模型实例，不应反向依赖 agent 的装配知识。
+[importlinter:contract:llm-no-agent]
+name = llm 不得依赖 agent
+type = forbidden
+source_modules =
+    llm
+forbidden_modules =
+    agent
+
+; ---------------------------------------------------------------- 契约 3
+; runtime 是基础设施叶子层，不得依赖任何上层或装配层。
+[importlinter:contract:runtime-is-leaf]
+name = runtime 不得依赖 application / interfaces / agent / llm / bootstrap
+type = forbidden
+source_modules =
+    runtime
+forbidden_modules =
+    application
+    interfaces
+    agent
+    llm
+    bootstrap
+
+; ---------------------------------------------------------------- 契约 4
+; 应用层描述业务，不得依赖接口层或装配层。
+[importlinter:contract:application-no-upper]
+name = application 不得依赖 interfaces / bootstrap
+type = forbidden
+source_modules =
+    application
+forbidden_modules =
+    interfaces
+    bootstrap
+
+; ---------------------------------------------------------------- 契约 5
+; agent 是图装配层，不得依赖 application / interfaces / bootstrap。
+[importlinter:contract:agent-no-upper]
+name = agent 不得依赖 application / interfaces / bootstrap
+type = forbidden
+source_modules =
+    agent
+forbidden_modules =
+    application
+    interfaces
+    bootstrap
+
+; ---------------------------------------------------------------- 契约 6
+; 装配层位于业务层之上：接口适配器可以调用它完成对象组装，但业务层与基础设施层
+; 不得依赖它，否则紧耦合会从装配点蔓延到整个代码库。
+[importlinter:contract:bootstrap-not-depended-by-lower]
+name = bootstrap 不得被 application / agent / llm / runtime 依赖
+type = forbidden
+source_modules =
+    agent
+    application
+    llm
+    runtime
+forbidden_modules =
+    bootstrap
+allow_indirect_imports = True

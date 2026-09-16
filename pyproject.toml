@@ -18,3 +18,8 @@ dependencies = [
     "itsdangerous>=2.1.0",
     "python-multipart>=0.0.20",
 ]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.15",
+]

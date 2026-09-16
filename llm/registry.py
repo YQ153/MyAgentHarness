@@ -21,8 +21,6 @@ from urllib.parse import urlparse
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
-from agent.profiles import ensure_profiles_registered
-
 if TYPE_CHECKING:
     from config import AppConfig
 
@@ -166,9 +164,12 @@ class ModelRegistry:
         return view
 
     def _build(self, spec: ModelSpec) -> BaseChatModel:
-        """真正构造模型实例，异常统一收敛为 RuntimeError。"""
-        ensure_profiles_registered()
+        """真正构造模型实例，异常统一收敛为 RuntimeError。
 
+        WHY 不再在此注册 HarnessProfile：注册属于装配层职责，由
+        ``agent.graph.get_registry`` 在构造 registry 之前完成。放在这里会让
+        ``llm`` 包反向依赖 ``agent``，形成包级循环依赖。
+        """
         api_key = os.getenv(spec.api_key_env, "").strip() if spec.api_key_env else ""
         if spec.api_key_env and not api_key:
             # 入口处显式失败，优于让 SDK 在首次请求时抛出难以定位的鉴权错误
@@ -226,6 +227,10 @@ def build_default_registry(config: AppConfig) -> ModelRegistry:
 
     当前默认只注册 DeepSeek；新增 provider 只需在此追加一条 ``ModelSpec``，
     其余代码无需改动。
+
+    前置条件：调用方必须已注册 HarnessProfile（见 ``agent.profiles``），
+    通常由装配层或 ``agent.graph.get_registry`` 完成。本函数刻意不自行注册，
+    以避免 ``llm`` 包反向依赖 ``agent`` 形成包级循环。
     """
     if config is None:
         raise ValueError("config 不能为 None")

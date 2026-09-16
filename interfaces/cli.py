@@ -17,22 +17,16 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from agent.graph import AgentFactory, get_registry
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
-from application.model_catalog import ModelCatalog
+from application.ports import APIKeyRepository
 from application.principal import Principal
-from application.run_service import RunService
-from application.thread_service import ThreadService
-from runtime.api_key_store import open_api_key_store
-from runtime.audit_store import open_audit_store
-from runtime.checkpointer import checkpointer_context
-from runtime.thread_store import open_thread_store
+from bootstrap.core import build_app_context
 
 if TYPE_CHECKING:
     from config import AppConfig
 
-    from runtime.api_key_store import APIKeyStore
+    from application.run_service import RunService
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +142,7 @@ async def _validate_api_key_for_cli(
     config: AppConfig,
     api_key: str,
     *,
-    api_key_store: "APIKeyStore | None" = None,
+    api_key_store: APIKeyRepository | None = None,
 ) -> Principal:
     """校验单个 API Key，返回 Principal；校验失败直接抛异常。"""
     # WHY 优先校验环境变量里的 dev key：保留最小可用的单 key 快速入口，
@@ -252,7 +246,7 @@ async def _authenticate_oidc_device_flow(config: AppConfig) -> str:
 async def _build_cli_principal(
     config: AppConfig,
     *,
-    api_key_store: "APIKeyStore | None" = None,
+    api_key_store: APIKeyRepository | None = None,
 ) -> Principal | None:
     """根据 CLI 参数/环境变量构造认证主体。
 
@@ -331,31 +325,17 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
 
     resolved_model = model_name or config.default_model
 
-    # WHY 由上下文管理器托管这几类连接：CLI 与 Web 共用同一套生命周期约定，
+    # WHY 由上下文管理器托管这些连接：CLI 与 Web 共用同一套生命周期约定，
     # 无论是正常退出还是 Ctrl+C，连接都能被确定关闭而不是依赖 GC。
-    # 元数据存储同样要开：否则 CLI 创建的会话不会出现在 Web 的会话清单里。
-    async with (
-        checkpointer_context(config.db_path) as checkpointer,
-        open_thread_store(config.db_path) as thread_store,
-        open_audit_store(config.db_path) as audit_store,
-        open_api_key_store(config.db_path) as api_key_store,
-    ):
-        principal = await _build_cli_principal(config, api_key_store=api_key_store)
-        graph_factory = AgentFactory(config, checkpointer=checkpointer)
-        threads = ThreadService(
-            config,
-            checkpointer=checkpointer,
-            thread_store=thread_store,
-            graph_factory=graph_factory,
-            audit_store=audit_store,
+    # 装配逻辑集中在 bootstrap，两种形态不会出现「一方有审计、另一方没有」
+    # 这类难以通过功能测试发现的行为分叉。
+    async with build_app_context(config) as context:
+        principal = await _build_cli_principal(
+            config, api_key_store=context.api_key_store
         )
-        runs = RunService(
-            config,
-            thread_store=thread_store,
-            graph_factory=graph_factory,
-            audit_store=audit_store,
-        )
-        catalog = ModelCatalog(get_registry(config))
+        threads = context.threads
+        runs = context.runs
+        catalog = context.catalog
 
         # WHY 启动即校验模型别名：等到第一次提问才报「模型不存在」，用户会
         # 以为是网络或密钥问题；而且这里只比对名称，不需要密钥，能快速失败。

@@ -26,6 +26,7 @@ from application.events import AgentEvent
 from application.model_catalog import ModelCatalog
 from application.principal import Principal
 from application.run_service import RunService
+from application.thread_id import normalize_thread_id
 from application.thread_service import ThreadService
 from interfaces.web.auth import get_principal, require_permission
 from interfaces.web.schemas import (
@@ -37,7 +38,6 @@ from interfaces.web.schemas import (
     ThreadResponse,
 )
 from interfaces.web.sse import SSE_HEADERS, encode_sse
-from runtime.thread_store import normalize_thread_id
 
 logger = logging.getLogger(__name__)
 

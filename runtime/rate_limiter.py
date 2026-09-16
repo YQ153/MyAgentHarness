@@ -8,6 +8,11 @@ WHY 内存实现：单节点/小集群场景够用；多实例负载均衡下需
 - 滑动窗口计数，窗口结束时清理过期记录。
 - 使用 ``threading.Lock`` 保护桶表：操作极短，且清理动作需要同步完成。
 - 不持久化，进程重启后计数清零。
+
+WHY 位于 runtime 层：本模块不含任何业务语义，只依赖标准库的 ``threading``
+与 ``time``，属于基础设施组件。若留在 application 层，接口层为获取它必须
+依赖应用层（语义错位）；下沉到 runtime 后，未来 runtime 内部需要限流时也不会
+形成 ``runtime → application`` 的反向依赖。
 """
 
 from __future__ import annotations
