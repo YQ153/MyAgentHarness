@@ -262,6 +262,43 @@ async def test_admin_can_run_others_thread(tmp_path, thread_store):
     assert record["owner_id"] == "alice"
 
 
+async def test_resume_requires_hitl_approve_permission(tmp_path, thread_store):
+    """WHY 覆盖 T3 的权限拆分：审批让此前被拦下的高危工具真正执行，
+    只持有 thread:create 的主体不得恢复运行。"""
+    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
+    service = _make_service(config, thread_store)
+
+    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
+
+    payload = {"decisions": [{"type": "approve"}]}
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await service.resume("t1", payload, principal=_principal("v", role="viewer"))
+    assert exc_info.value.permission == "hitl:approve"
+
+
+async def test_resume_allowed_for_member(tmp_path, thread_store):
+    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
+    service = _make_service(config, thread_store)
+
+    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
+
+    payload = {"decisions": [{"type": "approve"}]}
+    events = await _drain(await service.resume("t1", payload, principal=_principal("alice")))
+
+    assert events[-1].event == AgentEventType.DONE
+
+
+async def test_resume_rejects_foreign_thread(tmp_path, thread_store):
+    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
+    service = _make_service(config, thread_store)
+
+    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
+
+    payload = {"decisions": [{"type": "approve"}]}
+    with pytest.raises(OwnershipError):
+        await service.resume("t1", payload, principal=_principal("bob"))
+
+
 async def test_concurrent_claim_conflict_detected(tmp_path):
     """WHY 覆盖「校验时行不可见、登记时已被他人认领」的竞态：
     此前 ``_record_turn`` 不返回记录，``stream`` 的登记后复查是死代码，

@@ -261,9 +261,13 @@ async def resume_agent(
     thread_id: str,
     body: ResumeRequest,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:create")),
+    principal: Principal = Depends(require_permission("hitl:approve")),
 ) -> StreamingResponse:
-    """人工审批后恢复执行，同样以 SSE 流式返回。"""
+    """人工审批后恢复执行，同样以 SSE 流式返回。
+
+    WHY 用 ``hitl:approve`` 而不是 ``thread:create``：审批会让此前被拦下的
+    高危工具真正执行，风险量级高于发起对话，必须与「能发消息」解耦。
+    """
     normalized = _validate_thread_id(thread_id)
 
     payload = {

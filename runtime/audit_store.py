@@ -12,7 +12,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,68 @@ class AuditStore:
             except Exception:
                 logger.exception("审计日志写入失败：%s actor=%s", event_type, actor_id)
                 raise
+
+    async def purge_expired(self, *, retention_days: int) -> int:
+        """删除超过保留期的审计记录。
+
+        WHY 按 ``created_at`` 的字符串比较而不是日期函数：``created_at`` 以
+        UTC ISO-8601 秒级字符串落库，同一格式的字符串比较与时序比较等价
+        （``ORDER BY created_at`` 已在列表中依赖这一性质），无需让 SQLite
+        做日期解析，也就不会受列类型与本地时区影响。
+
+        WHY 只删不导出：本期没有外部归档系统，「归档」以删除前的日志摘要
+        留痕（条数与截止时间）；需要离线留存时，应在此处挂一个归档 sink，
+        而不是让保留策略依赖人工导出。
+
+        Args:
+            retention_days: 保留天数，必须 >= 1。
+
+        Returns:
+            实际删除的记录条数。
+
+        Raises:
+            ValueError: ``retention_days`` 小于 1。
+            RuntimeError: 删除失败（连接异常、表被锁等）。
+        """
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool):
+            raise ValueError("retention_days 必须是整数")
+        if retention_days < 1:
+            raise ValueError("retention_days 不能小于 1")
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        async with self._lock:
+            try:
+                cursor = await self._conn.execute(
+                    "DELETE FROM audit_log WHERE created_at < ?", (cutoff,)
+                )
+                await self._conn.commit()
+            except Exception:
+                logger.exception("审计日志清理失败：retention_days=%s cutoff=%s", retention_days, cutoff)
+                raise
+
+        deleted = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        if deleted:
+            logger.info("审计日志清理完成：删除 %d 条（早于 %s）", deleted, cutoff)
+        else:
+            logger.debug("审计日志清理完成：无超期记录（早于 %s）", cutoff)
+        return deleted
+
+    async def count_all(self) -> int:
+        """返回审计记录总数，供保留策略与后续指标使用。
+
+        Returns:
+            记录条数；表不可用时抛出 ``RuntimeError``。
+        """
+        async with self._lock:
+            try:
+                async with self._conn.execute("SELECT COUNT(*) AS total FROM audit_log") as cursor:
+                    row = await cursor.fetchone()
+            except Exception:
+                logger.exception("统计审计日志条数失败")
+                raise
+        return int(row["total"]) if row is not None else 0
 
     async def list(
         self,

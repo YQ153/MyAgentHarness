@@ -12,6 +12,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from application.audit_context import audit_client_info
 from application.dto import (
     DeleteOutcome,
     DeleteResult,
@@ -127,16 +128,28 @@ class ThreadService:
         outcome: str,
         details: dict[str, Any] | None = None,
     ) -> None:
+        """记录一条审计事件，并自动补上当前请求的 IP / User-Agent。
+
+        WHY IP/UA 由本方法统一补齐：调用点只关心「记了什么」，来源信息由
+        接口层中间件写入的 ``contextvars`` 提供，任一调用点都不会漏；审计
+        失败同样不上抛——它是旁路职责，不应把一次成功的删除变成 500。
+        """
         if self._audit_store is None:
             return
-        await self._audit_store.log(
-            event_type=event_type,
-            actor_id=actor_id,
-            target_id=target_id,
-            action=action,
-            outcome=outcome,
-            details=details,
-        )
+        ip, ua = audit_client_info()
+        try:
+            await self._audit_store.log(
+                event_type=event_type,
+                actor_id=actor_id,
+                target_id=target_id,
+                action=action,
+                outcome=outcome,
+                ip=ip,
+                user_agent=ua,
+                details=details,
+            )
+        except Exception:
+            logger.exception("审计事件写入失败：event_type=%s actor=%s", event_type, actor_id)
 
     # ------------------------------------------------------------------ 查询
 

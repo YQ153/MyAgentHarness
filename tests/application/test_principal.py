@@ -61,6 +61,18 @@ def test_role_matrix_is_strict_subset_chain():
     assert ROLE_PERMISSIONS["viewer"] < ROLE_PERMISSIONS["member"]
 
 
+def test_hitl_approve_is_separated_from_thread_create():
+    """WHY 本用例是 T3 的核心语义：审批让高危工具真正执行，
+    必须与「能发消息」解耦，只读角色不得拥有。"""
+    assert _principal("member").has_permission("hitl:approve") is True
+    assert _principal("admin").has_permission("hitl:approve") is True
+    assert _principal("viewer").has_permission("hitl:approve") is False
+
+    # 反向确认：能发消息不等于能审批
+    assert _principal("viewer").has_permission("thread:create") is False
+    assert "hitl:approve" in PERMISSIONS
+
+
 def test_unknown_role_denied_everything():
     principal = _principal("ghost")
 

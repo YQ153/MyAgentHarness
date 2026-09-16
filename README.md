@@ -187,6 +187,8 @@ python scripts/smoke_sandbox.py
 | `MEMORY_FILE` | `./workspace/AGENTS.md` | 长期记忆文件 |
 | `DB_PATH` | `./.data/agent.db` | SQLite 数据库（检查点表 + 会话元数据表） |
 | `THREAD_TITLE_MAX_CHARS` | `24` | 会话列表标题的字符上限，超出以省略号截断 |
+| `AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期记录由定期任务删除 |
+| `AUDIT_RETENTION_INTERVAL_SECONDS` | `86400` | 审计保留清理任务的执行间隔（秒） |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Web 监听地址与端口 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 
@@ -204,7 +206,8 @@ Web 形态对外提供以下接口（均以 `/api` 为前缀）：
 | `GET` | `/api/threads/{thread_id}` | 读取会话历史，用于刷新后恢复上下文 |
 | `DELETE` | `/api/threads/{thread_id}` | 删除会话及其检查点 |
 | `POST` | `/api/threads/{thread_id}/runs` | 发起一轮对话，**以 SSE 流式返回** |
-| `POST` | `/api/threads/{thread_id}/resume` | 提交人工审批结果，继续被中断的运行 |
+| `POST` | `/api/threads/{thread_id}/resume` | 提交人工审批结果，继续被中断的运行（需 `hitl:approve` 权限） |
+| `POST` | `/api/threads/{thread_id}/stop` | 请求停止当前运行；幂等返回 200，未运行时 `stopped=false` |
 
 发起对话的请求体：
 

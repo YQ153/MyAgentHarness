@@ -230,6 +230,22 @@ class AppConfig(BaseSettings):
     oidc_device_flow_base_url: str = "http://127.0.0.1:8000"
     """CLI 在 OIDC 模式下做 Device Flow 时访问的 Web 服务地址。"""
 
+    # 审计保留
+    audit_retention_days: int = Field(default=180, ge=1)
+    """审计日志保留天数；超期的记录会被定期清理任务删除。
+
+    WHY 必须有保留策略：审计表随每次运行、审批、登录单调增长，长期运行的
+    部署里它会成为最大的一张表，而超过保留期的记录在合规上通常已无留存
+    必要。做成配置而非常量，是因为不同部署的合规要求差异极大。
+    """
+
+    audit_retention_interval_seconds: int = Field(default=86400, ge=60)
+    """保留清理任务的执行间隔（秒）。
+
+    WHY 与保留天数分开配置：保留期决定「删什么」，间隔决定「多久扫一次」；
+    小部署希望每天清一次，大表则可能需要更频繁地分批清理。
+    """
+
     # 认证端点限流
     auth_rate_limit_window_seconds: int = Field(default=60, ge=1)
     auth_rate_limit_max_attempts: int = Field(default=10, ge=1)

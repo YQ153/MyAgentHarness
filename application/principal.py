@@ -57,6 +57,7 @@ PERMISSIONS = {
     "thread:read": "GET /api/threads/{id}",
     "thread:create": "POST /api/threads/{id}/runs",
     "thread:delete": "DELETE /api/threads/{id}",
+    "hitl:approve": "POST /api/threads/{id}/resume（人工审批决策）",
     "file:read": "FilesystemBackend read",
     "file:write": "FilesystemBackend write",
     "file:execute": "execute tool in sandbox/local mode",
@@ -66,10 +67,17 @@ PERMISSIONS = {
     "admin:all": "所有资源的所有操作",
 }
 
-# 角色到权限集合的映射。默认成员只读自己的会话、发送消息。
+# 角色到权限集合的映射。默认成员只读自己的会话、发送消息、审批自己的中断。
+#
+# WHY ``hitl:approve`` 独立于 ``thread:create``：审批是「授权高危工具真正
+# 执行」的动作，与「发起一轮对话」的风险量级不同。合成一个权限后，
+# 只读角色（viewer）只要能发消息就能批准任意 shell 执行——这正是 HITL
+# 作为主防线要挡住的路径。
 ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
     "viewer": frozenset({"thread:read", "thread:list"}),
-    "member": frozenset({"thread:read", "thread:list", "thread:create", "file:read"}),
+    "member": frozenset(
+        {"thread:read", "thread:list", "thread:create", "hitl:approve", "file:read"}
+    ),
     "admin": frozenset(PERMISSIONS.keys()),
 }
 

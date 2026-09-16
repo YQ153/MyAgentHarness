@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from application.audit_context import audit_client_info
 from application.errors import NotFoundError, OwnershipError, PermissionDeniedError, ThreadBusyError
 from application.event_translator import LangGraphEventTranslator
 from application.events import AgentEvent, AgentEventType
@@ -186,16 +187,30 @@ class RunService:
         outcome: str,
         details: dict[str, Any] | None = None,
     ) -> None:
+        """记录一条审计事件；缺失审计存储或运行时异常均不影响业务。
+
+        WHY 在此读取请求上下文：IP/UA 是审计的定位信息，由接口层的中间件
+        写入 ``contextvars``。放在这里统一读取，调用点就不必逐个透传请求
+        信息，也不会因为某个调用点漏传而产出无来源的记录。
+        """
         if self._audit_store is None:
             return
-        await self._audit_store.log(
-            event_type=event_type,
-            actor_id=actor_id,
-            target_id=target_id,
-            action=action,
-            outcome=outcome,
-            details=details,
-        )
+        ip, ua = audit_client_info()
+        try:
+            await self._audit_store.log(
+                event_type=event_type,
+                actor_id=actor_id,
+                target_id=target_id,
+                action=action,
+                outcome=outcome,
+                ip=ip,
+                user_agent=ua,
+                details=details,
+            )
+        except Exception:
+            # WHY 审计失败不上抛：审计是旁路职责，把一次成功的业务操作变成
+            # 500 会让「日志库满」演变成全站故障；失败已留完整日志供告警。
+            logger.exception("审计事件写入失败：event_type=%s actor=%s", event_type, actor_id)
 
     # ------------------------------------------------------------------ 运行
 
@@ -312,10 +327,15 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法，或审批载荷格式非法。
             KeyError: 模型别名未注册。
+            PermissionDeniedError: 缺少 hitl:approve 权限。
             NotFoundError: 会话不存在。
             OwnershipError: 无权访问该会话。
             RuntimeError: 模型初始化或装配失败。
         """
+        # WHY 审批需要独立权限：这一调用会让此前被拦下的高危工具真正执行，
+        # 风险量级高于「发起对话」，不能复用 thread:create。
+        self._ensure_permission(principal, "hitl:approve")
+
         normalized = normalize_thread_id(thread_id)
         # WHY 在这里就完成审批载荷校验：非法载荷必须在事件流开始之前失败，
         # 否则只能表现为连接中断，前端拿不到任何可读的失败原因。

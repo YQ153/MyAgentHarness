@@ -9,6 +9,8 @@ from __future__ import annotations
 import httpx
 
 from config import AppConfig
+from runtime.audit_retention import AuditRetentionWorker
+from runtime.audit_store import AuditStore
 from runtime.rate_limiter import RateLimiter
 
 
@@ -34,4 +36,32 @@ def build_rate_limiter(config: AppConfig) -> RateLimiter:
     return RateLimiter(
         window_seconds=config.auth_rate_limit_window_seconds,
         max_attempts=config.auth_rate_limit_max_attempts,
+    )
+
+
+def build_audit_retention_worker(config: AppConfig, audit_store: AuditStore) -> AuditRetentionWorker:
+    """按配置构造审计保留期的定期清理任务。
+
+    WHY 在此装配而不是在 ``bootstrap.core``：只有长驻进程（Web）需要周期
+    清理；放进共享装配会让 CLI 这种一次性进程也背上常驻协程与退出等待。
+
+    Args:
+        config: 应用配置，提供保留天数与清理间隔。
+        audit_store: 审计存储。
+
+    Returns:
+        尚未启动的清理任务；由调用方（Web lifespan）``start()``。
+
+    Raises:
+        ValueError: ``config`` 或 ``audit_store`` 为 ``None``。
+    """
+    if config is None:
+        raise ValueError("config 不能为 None")
+    if audit_store is None:
+        raise ValueError("audit_store 不能为 None")
+
+    return AuditRetentionWorker(
+        audit_store,
+        retention_days=config.audit_retention_days,
+        interval_seconds=config.audit_retention_interval_seconds,
     )

@@ -15,9 +15,10 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from bootstrap.core import build_app_context
-from bootstrap.web import build_http_client, build_rate_limiter
+from bootstrap.web import build_audit_retention_worker, build_http_client, build_rate_limiter
 from config import AppConfig
 from interfaces.web.auth import router as auth_router
+from interfaces.web.request_context import RequestContextMiddleware
 from interfaces.web.routes import router
 
 logger = logging.getLogger(__name__)
@@ -48,21 +49,42 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             logger.exception("device flow 过期记录清理失败，不影响服务启动")
 
-        # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
-        # 保持既有路由代码不变。
-        app.state.context = context
-        app.state.http_client = http_client
-        app.state.rate_limiter = rate_limiter
-        app.state.api_key_store = context.api_key_store
-        app.state.device_flow_store = context.device_flow_store
-        app.state.threads = context.threads
-        app.state.runs = context.runs
-        app.state.catalog = context.catalog
-
-        logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
+        # WHY 整个启动段都包在 try/finally 里：http_client 与清理任务都在
+        # yield 之前创建，若构造阶段抛错而不进 finally，这两者会连同已装配的
+        # 连接一起泄漏。
+        retention_worker = None
         try:
+            # WHY 只在 Web 形态启动保留清理：CLI 是一次性进程，跑一个常驻清理
+            # 协程既无收益也会拖慢退出。清理任务会先立即执行一次，再进入周期。
+            retention_worker = build_audit_retention_worker(config, context.audit_store)
+            try:
+                retention_worker.start()
+            except Exception:
+                # WHY 不阻断启动：审计清理是运维旁路能力，失败时保留全量日志
+                # 远好于让服务起不来；失败原因已记日志，可另行告警。
+                logger.exception("审计保留清理任务启动失败，审计日志将不再自动归档清理")
+
+            # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
+            # 保持既有路由代码不变。
+            app.state.context = context
+            app.state.http_client = http_client
+            app.state.rate_limiter = rate_limiter
+            app.state.api_key_store = context.api_key_store
+            app.state.device_flow_store = context.device_flow_store
+            app.state.threads = context.threads
+            app.state.runs = context.runs
+            app.state.catalog = context.catalog
+
+            logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
             yield
         finally:
+            # WHY 先停清理任务再关连接：清理任务持有 audit_store 连接，
+            # 顺序颠倒会让它在关闭的连接上执行 DELETE。
+            if retention_worker is not None:
+                try:
+                    await retention_worker.stop()
+                except Exception:
+                    logger.exception("审计保留清理任务停止失败")
             await http_client.aclose()
             logger.info("Web 服务已停止")
 
@@ -89,6 +111,11 @@ def create_app(config: AppConfig) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.config = config
+
+    # WHY 审计上下文中间件最先注册：Starlette 的中间件按注册顺序由外向内执行，
+    # 最先注册即最外层，路由与异常处理都在它之内，任何分支写下的审计都能
+    # 读到 IP/UA（包括鉴权失败这类在下游就被拦截的请求）。
+    app.add_middleware(RequestContextMiddleware)
 
     app.include_router(auth_router)
     app.include_router(router)

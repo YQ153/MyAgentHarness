@@ -9,13 +9,15 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from application.audit_context import bind_request_context, reset_request_context
 from config import AppConfig
+from runtime.audit_store import AuditStore, open_audit_store
 from runtime.thread_store import ThreadMetaStore, open_thread_store
 
 
@@ -57,3 +59,25 @@ async def thread_store(tmp_path: Path) -> AsyncIterator[ThreadMetaStore]:
     """落在临时目录里的会话元数据存储。"""
     async with open_thread_store(tmp_path / "threads.db") as store:
         yield store
+
+
+@pytest.fixture
+async def audit_store(tmp_path: Path) -> AsyncIterator[AuditStore]:
+    """落在临时目录里的审计日志存储。"""
+    async with open_audit_store(tmp_path / "audit.db") as store:
+        yield store
+
+
+@pytest.fixture(autouse=True)
+def _isolated_request_context() -> Iterator[None]:
+    """每个用例前后清理审计请求上下文。
+
+    WHY 自动生效：``contextvars`` 的默认值是进程级的，某个用例若忘记回滚，
+    泄漏的 IP/UA 会串到后续用例的审计断言上——这类串扰只在批量跑测试时
+    出现，且表现为随机失败。
+    """
+    token = bind_request_context(ip="", user_agent="")
+    try:
+        yield
+    finally:
+        reset_request_context(token)
