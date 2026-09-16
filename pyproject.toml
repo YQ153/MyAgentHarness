@@ -22,4 +22,15 @@ dependencies = [
 [dependency-groups]
 dev = [
     "import-linter>=2.15",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.0",
+    "pytest-cov>=7.1.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# WHY 显式加项目根到 sys.path：测试直接按顶层包名导入
+# （application / runtime / config），不依赖安装动作。
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

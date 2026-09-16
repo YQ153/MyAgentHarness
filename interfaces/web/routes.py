@@ -34,6 +34,7 @@ from interfaces.web.schemas import (
     DeleteResponse,
     HistoryMessage,
     ResumeRequest,
+    StopResponse,
     ThreadListResponse,
     ThreadResponse,
 )
@@ -307,6 +308,42 @@ async def resume_agent(
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+@router.post("/threads/{thread_id}/stop", response_model=StopResponse)
+async def stop_run(
+    thread_id: str,
+    runs: RunService = Depends(get_runs),
+    principal: Principal = Depends(require_permission("thread:create")),
+) -> StopResponse:
+    """请求停止会话的当前运行。
+
+    WHY 幂等返回 200 而不是 409：停止请求的意图是「让运行停下来」，
+    会话未在运行时该意图视为已满足；409 暗示冲突，会把「连点停止按钮」
+    变成一次报错。真正的鉴权失败（403 / 404）仍然照常返回。
+    """
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        result = await runs.stop(normalized, principal=principal)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+
+    return StopResponse(**result)
 
 
 async def _encode_stream(events: AsyncIterator[AgentEvent]) -> AsyncIterator[str]:

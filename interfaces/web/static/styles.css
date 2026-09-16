@@ -347,7 +347,15 @@ textarea {
 
 textarea:focus { border-color: var(--accent); }
 
-#send { flex-shrink: 0; }
+#send, #stop { flex-shrink: 0; }
+
+/* 用户主动停止的收尾提示：区别于 error，内容不完整但不是故障 */
+.msg.notice {
+  align-self: center;
+  background: #f3f4f6;
+  color: var(--muted);
+  font-size: 12px;
+}
 
 /* ---------- 窄屏：侧栏让位于对话区 ---------- */
 @media (max-width: 720px) {

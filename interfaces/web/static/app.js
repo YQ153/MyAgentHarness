@@ -27,6 +27,7 @@
     messages: document.getElementById('messages'),
     input: document.getElementById('input'),
     send: document.getElementById('send'),
+    stop: document.getElementById('stop'),
     newThread: document.getElementById('new-thread'),
     modelSelect: document.getElementById('model-select'),
     threadList: document.getElementById('thread-list'),
@@ -77,6 +78,10 @@
     state.running = running;
     els.send.disabled = running;
     els.send.textContent = running ? '运行中' : '发送';
+    // 运行中暴露停止按钮：发送被禁用的同一时刻必须能停止，
+    // 否则长任务一旦发起就只能干等（或刷新页面断开连接）
+    els.stop.hidden = !running;
+    els.stop.disabled = false;
   }
 
   /**
@@ -543,6 +548,10 @@
       case 'done':
         state.assistantEl = null;
         state.toolNodes = [];
+        // 用户主动停止：流正常关闭但内容不完整，给出可见反馈而不是静默截断
+        if (data.reason === 'stopped') {
+          els.messages.appendChild(el('div', 'msg notice', '本轮已停止'));
+        }
         scrollToBottom();
         // WHY 结束时刷新清单：标题与最近活动时间正是在本轮结束时刷新的，
         // 不刷新则列表还停留在旧标题上
@@ -574,6 +583,27 @@
 
   async function handleStream(response) {
     await consumeSSE(response, handleEvent);
+  }
+
+  /**
+   * 请求服务端停止当前会话的运行。
+   *
+   * 只触发取消、不等流结束：SSE 流会继续推送已产出的事件，
+   * 最终以 done(reason=stopped) 收尾，由 handleEvent 复位界面。
+   * 后端对 not_running / already_stopping 均返回 200，无需在这里报错。
+   */
+  async function stopRun() {
+    if (!state.running || !state.threadId) return;
+    // 禁用防止连点；失败时恢复可点，成功则等流收尾后由 setRunning 复位
+    els.stop.disabled = true;
+    try {
+      await api(`/api/threads/${encodeURIComponent(state.threadId)}/stop`, {
+        method: 'POST',
+      });
+    } catch (err) {
+      appendError('停止失败：' + err.message);
+      els.stop.disabled = false;
+    }
   }
 
   /* ------------------------------------------------------------------ 交互 */
@@ -629,6 +659,7 @@
 
   function bindEvents() {
     els.send.addEventListener('click', send);
+    els.stop.addEventListener('click', stopRun);
 
     els.input.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {

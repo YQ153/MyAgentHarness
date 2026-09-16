@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from application.errors import NotFoundError, OwnershipError, PermissionDeniedError, ThreadBusyError
@@ -29,6 +32,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STREAM_MODES = ["messages", "updates"]
+
+
+@dataclass(frozen=True, eq=False)
+class RunHandle:
+    """一次运行中会话的运行句柄。
+
+    WHY 独立成类而不是继续用裸集合：停止（``stop``）、运行超时（后续迭代）
+    与运行指标（``/metrics``）都需要「thread_id → 取消信号 + 开始时间」这
+    同一份登记，各自另写一套必然出现口径不一致（例如超时任务看到的运行
+    集合与 stop 看到的不一致）。
+
+    eq=False：句柄的身份就是对象本身，按字段比较两个句柄（含 ``Event``）
+    没有意义，反而容易在集合操作中被误判相等。
+    """
+
+    thread_id: str
+    started_at: float
+    """``time.monotonic()`` 口径的开始时间，用于超时判断与指标。"""
+    cancel_event: asyncio.Event
+    """停止信号；置位后运行在下一个分片边界被中止。"""
+
+    @property
+    def stop_requested(self) -> bool:
+        """是否已收到停止请求。"""
+        return self.cancel_event.is_set()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """已运行时长（秒）。"""
+        return time.monotonic() - self.started_at
+
+    def request_stop(self) -> None:
+        """请求停止本次运行；重复调用幂等。"""
+        self.cancel_event.set()
+
+
+class _RunStoppedError(Exception):
+    """内部信号：运行因用户停止请求而中止。
+
+    WHY 私有：这是 ``_stream_graph`` 与 ``_iterate`` 之间的控制流协议，
+    不属于服务的对外契约；对外的「已停止」表达是 DONE 事件的 reason 字段。
+    """
+
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(f"会话 {thread_id} 的运行已被停止")
+        self.thread_id = thread_id
 
 
 class RunService:
@@ -65,11 +114,11 @@ class RunService:
         self._graph_factory = graph_factory
         self._audit_store = audit_store
 
-        # WHY 用 threading.Lock 保护「运行中」集合：加解锁之间不 await，
+        # WHY 用 threading.Lock 保护「运行中」登记表：加解锁之间不 await，
         # 临界区极短；更重要的是释放动作必须能在 finally 里同步完成——
         # 若用 asyncio.Lock，客户端断开连接触发 GeneratorExit 时在 finally
         # 中 await 会破坏生成器的关闭流程。
-        self._running: set[str] = set()
+        self._running: dict[str, RunHandle] = {}
         self._running_guard = threading.Lock()
 
         logger.info(
@@ -213,7 +262,8 @@ class RunService:
         if recorded is not None and self._config.auth_mode != "disabled":
             recorded_owner = recorded.get("owner_id") or ""
             expected_owner = self._owner_id(principal)
-            if recorded_owner and recorded_owner != expected_owner:
+            is_admin = principal is not None and principal.is_admin()
+            if recorded_owner and recorded_owner != expected_owner and not is_admin:
                 logger.warning(
                     "会话认领冲突：thread=%s expected_owner=%s actual_owner=%s",
                     normalized, expected_owner, recorded_owner,
@@ -232,10 +282,10 @@ class RunService:
         # 首个事件被拉取时才执行，此时响应已经开始，ThreadBusyError 只能表现为
         # 连接中断。占用成功后紧接返回生成器，中间不再有任何可能失败的语句，
         # 因此不会出现「占了槽位却没人为它收尾」。
-        self._acquire_run_slot(normalized)
+        handle = self._acquire_run_slot(normalized)
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
-        return self._consume(graph, payload, normalized)
+        return self._consume(graph, payload, handle)
 
     async def resume(
         self,
@@ -291,8 +341,74 @@ class RunService:
             details={"decisions": [d.get("type") for d in decisions]},
         )
 
-        self._acquire_run_slot(normalized)
-        return self._consume(graph, command, normalized)
+        handle = self._acquire_run_slot(normalized)
+        return self._consume(graph, command, handle)
+
+    async def stop(
+        self,
+        thread_id: str,
+        *,
+        principal: Principal | None = None,
+    ) -> dict[str, Any]:
+        """请求停止指定会话的当前运行。
+
+        语义：只「触发」取消而不等待运行真正结束——已产出但尚未送达的事件
+        会继续推送，运行最终以 DONE（payload 含 ``reason: "stopped"``）收尾。
+
+        幂等：会话未在运行时返回 ``stopped=False``；对已请求过停止的会话
+        重复调用返回 ``stopped=True``。二者都不是错误——「连点停止按钮」与
+        「运行恰好在请求前一刻自然结束」不应让用户看到报错。
+
+        Args:
+            thread_id: 会话 ID。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
+
+        Returns:
+            ``{"thread_id": str, "stopped": bool, "reason": str}``，其中
+            ``reason`` 为 ``"requested"`` / ``"already_stopping"`` /
+            ``"not_running"`` 三者之一。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            PermissionDeniedError: 缺少 thread:create 权限。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权访问该会话。
+        """
+        self._ensure_permission(principal, "thread:create")
+        normalized = normalize_thread_id(thread_id)
+
+        # WHY 所有权校验不可省：停止是「终止他人计算」的操作，若弱化为
+        # 「会话在跑就能停」，任何登录用户都能打断别人的长任务。
+        await self._ensure_ownership(normalized, principal)
+
+        handle = self.run_handle(normalized)
+        if handle is None:
+            logger.info("会话 %s 收到停止请求：当前无运行", normalized)
+            return {"thread_id": normalized, "stopped": False, "reason": "not_running"}
+
+        if handle.stop_requested:
+            logger.info("会话 %s 收到重复停止请求：忽略", normalized)
+            return {"thread_id": normalized, "stopped": True, "reason": "already_stopping"}
+
+        actor_id = principal.user_id if principal else "anonymous"
+        # WHY 同步置位后再做任何 await：判重与置位之间不插入等待，
+        # 单事件循环内天然原子，并发重复请求只有一次会生效并落审计。
+        handle.request_stop()
+        logger.info(
+            "会话 %s 收到停止请求：actor=%s 已运行 %.1f 秒",
+            normalized,
+            actor_id,
+            handle.elapsed_seconds,
+        )
+        await self._audit(
+            event_type="run_cancelled",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="stop",
+            outcome="success",
+            details={"elapsed_seconds": round(handle.elapsed_seconds, 3)},
+        )
+        return {"thread_id": normalized, "stopped": True, "reason": "requested"}
 
     # ------------------------------------------------------------------ 内部
 
@@ -300,22 +416,24 @@ class RunService:
         self,
         graph: Any,
         payload: Any,
-        thread_id: str,
+        handle: RunHandle,
     ) -> AsyncIterator[AgentEvent]:
         """消费 LangGraph 事件流并翻译成本应用事件。
 
         Args:
             graph: 已装配的 LangGraph 图。
             payload: 用户消息字典，或恢复执行用的 ``Command``。
-            thread_id: 已规范化的会话 ID。
+            handle: 本次运行的句柄，槽位归属与停止信号都挂在它上面。
 
         运行槽位由调用方（``stream`` / ``resume``）在进入前占用，此处负责释放。
 
         Yields:
-            统一事件。运行出错时会先产出 ERROR，再以 DONE 收尾。
+            统一事件。运行出错时先产出 ERROR 再以 DONE 收尾；
+            被用户停止时以 DONE（含 ``reason: "stopped"``）收尾。
         """
+        thread_id = handle.thread_id
         try:
-            async for event in self._iterate(graph, payload, thread_id):
+            async for event in self._iterate(graph, payload, handle):
                 yield event
         finally:
             # WHY 同步释放：客户端断开连接时这里可能正处于 GeneratorExit，
@@ -330,14 +448,19 @@ class RunService:
         # 那条消息」，只有 ERROR 而没有 DONE 时，下一轮回复的文本会被追加到上
         # 一轮已经出错的气泡里。让 DONE 统一表示「流已关闭」，
         # 前端就不需要在两处分别处理结束条件。
+        done_payload: dict[str, Any] = {"thread_id": thread_id}
+        if handle.stop_requested:
+            # 用户主动停止不是错误：前端据此复位输入框并提示「已停止」，
+            # 而不是把半截输出渲染成错误。
+            done_payload["reason"] = "stopped"
         logger.info("会话 %s 本轮结束", thread_id)
-        yield AgentEvent(AgentEventType.DONE, {"thread_id": thread_id})
+        yield AgentEvent(AgentEventType.DONE, done_payload)
 
     async def _iterate(
         self,
         graph: Any,
         payload: Any,
-        thread_id: str,
+        handle: RunHandle,
     ) -> AsyncIterator[AgentEvent]:
         """逐条翻译流增量，并负责运行期错误收敛。"""
         translator = LangGraphEventTranslator(
@@ -345,11 +468,7 @@ class RunService:
         )
 
         try:
-            async for mode, chunk in graph.astream(
-                payload,
-                config=build_runnable_config(self._config, thread_id),
-                stream_mode=_STREAM_MODES,
-            ):
+            async for mode, chunk in self._stream_graph(graph, payload, handle):
                 for event in translator.feed(mode, chunk):
                     yield event
 
@@ -360,16 +479,69 @@ class RunService:
         except asyncio.CancelledError:
             # WHY 单独捕获取消：客户端断开是预期行为，不应记成错误日志，
             # 但必须原样向上传播，否则 asyncio 无法完成取消流程。
-            logger.info("会话 %s 运行被取消", thread_id)
+            logger.info("会话 %s 运行被取消", handle.thread_id)
             raise
+        except _RunStoppedError:
+            # 用户主动停止不是错误：已产出的部分照常送达；未拼完的工具调用
+            # 草稿刻意不冲出——参数 JSON 可能残缺，发出只会误导前端。
+            logger.info("会话 %s 运行被用户停止", handle.thread_id)
         except Exception as exc:
-            logger.exception("会话 %s 运行失败", thread_id)
+            logger.exception("会话 %s 运行失败", handle.thread_id)
             yield AgentEvent(AgentEventType.ERROR, {"message": str(exc)})
+
+    async def _stream_graph(
+        self,
+        graph: Any,
+        payload: Any,
+        handle: RunHandle,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """带停止通道地转发 ``graph.astream`` 的原始分片。
+
+        WHY 每个分片都与停止信号竞争、而不是在分片间隙查标志位：模型调用
+        与工具执行期间可能数十秒不产出任何分片，纯协作式检查会让「停止」
+        长时间无响应；竞争等待让停止请求在下一个事件循环周期即生效。
+        """
+        astream = graph.astream(
+            payload,
+            config=build_runnable_config(self._config, handle.thread_id),
+            stream_mode=_STREAM_MODES,
+        )
+        stop_task: asyncio.Task[bool] = asyncio.ensure_future(handle.cancel_event.wait())
+        chunk_task: asyncio.Task[tuple[str, Any]] | None = None
+        try:
+            while True:
+                chunk_task = asyncio.ensure_future(anext(astream))
+                done, _pending = await asyncio.wait(
+                    {chunk_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done:
+                    # 停止请求先到：取消仍在等待的分片任务，让图执行收到
+                    # CancelledError 并触发各自的资源清理（含沙箱进程回收）
+                    chunk_task.cancel()
+                    raise _RunStoppedError(handle.thread_id)
+                try:
+                    item = chunk_task.result()
+                except StopAsyncIteration:
+                    return
+                yield item
+        finally:
+            # WHY 必须清理两个任务：无论正常结束、停止还是客户端断开触发的
+            # 取消，都不能留下悬挂任务，否则事件循环关闭时会报
+            # "Task was destroyed but it is pending"。先 cancel 再逐一 await
+            # 吸收结果，避免「异常从未被取回」的告警。
+            for task in (chunk_task, stop_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (chunk_task, stop_task):
+                if task is not None:
+                    with suppress(BaseException):
+                        await task
 
     # -------------------------------------------------------------- 并发控制
 
-    def _acquire_run_slot(self, thread_id: str) -> None:
-        """占用该会话的运行槽位。
+    def _acquire_run_slot(self, thread_id: str) -> RunHandle:
+        """占用该会话的运行槽位并登记运行句柄。
 
         WHY 必须互斥：同一会话并发发起两轮会让图状态产生竞争——两轮各自读写
         同一 thread 的检查点，后写的一方会覆盖先写一方的中间结果，表现为消息
@@ -378,13 +550,22 @@ class RunService:
         Args:
             thread_id: 已规范化的会话 ID。
 
+        Returns:
+            本次运行的句柄；停止请求与运行指标都通过它传递。
+
         Raises:
             ThreadBusyError: 该会话已有运行中的轮次。
         """
         with self._running_guard:
             if thread_id in self._running:
                 raise ThreadBusyError(thread_id)
-            self._running.add(thread_id)
+            handle = RunHandle(
+                thread_id=thread_id,
+                started_at=time.monotonic(),
+                cancel_event=asyncio.Event(),
+            )
+            self._running[thread_id] = handle
+        return handle
 
     def release_run_slot(self, thread_id: str) -> None:
         """释放该会话的运行槽位。
@@ -397,7 +578,26 @@ class RunService:
             thread_id: 会话 ID。
         """
         with self._running_guard:
-            self._running.discard(thread_id)
+            self._running.pop(thread_id, None)
+
+    def run_handle(self, thread_id: str) -> RunHandle | None:
+        """返回指定会话的运行句柄；未在运行时为 ``None``。
+
+        WHY 公开：运行指标（``/metrics``）与运行超时治理需要读同一份登记，
+        各自维护一套集合会出现口径不一致。
+        """
+        with self._running_guard:
+            return self._running.get(thread_id)
+
+    def is_running(self, thread_id: str) -> bool:
+        """该会话当前是否有运行中的轮次。"""
+        with self._running_guard:
+            return thread_id in self._running
+
+    def running_thread_ids(self) -> tuple[str, ...]:
+        """当前运行中的会话 ID 快照（供指标暴露）。"""
+        with self._running_guard:
+            return tuple(self._running)
 
     # ------------------------------------------------------------------ 元数据
 
@@ -408,14 +608,20 @@ class RunService:
         title_hint: str | None,
         turn_delta: int,
         principal: Principal | None = None,
-    ) -> None:
-        """把本轮对话登记到元数据表。
+    ) -> dict[str, Any] | None:
+        """把本轮对话登记到元数据表，并返回登记后的元数据。
+
+        WHY 返回记录而不是 ``None``：``stream`` 依赖登记后的 ``owner_id``
+        做「并发首条消息认领冲突」复查；此前本方法不返回值，该复查成为
+        死代码，并发认领冲突会被静默漏检（Bob 可在 Alice 抢先认领的会话上
+        继续运行）。
 
         WHY 吞掉异常：对话本身已经完成，元数据只是列表展示用的旁路信息，
-        让它把一次成功的交互变成错误响应是本末倒置；失败会留下完整日志供排查。
+        让它把一次成功的交互变成错误响应是本末倒置；失败会留下完整日志供
+        排查，返回 ``None`` 让调用方跳过复查（登记失败时无从复查）。
         """
         try:
-            await self._thread_store.record_turn(
+            return await self._thread_store.record_turn(
                 thread_id,
                 title_hint=self._build_title(title_hint),
                 turn_delta=turn_delta,
@@ -423,6 +629,7 @@ class RunService:
             )
         except Exception:
             logger.exception("会话活动记录失败：thread=%s", thread_id)
+            return None
 
     async def _touch(self, thread_id: str) -> None:
         """刷新会话的最近活动时间。

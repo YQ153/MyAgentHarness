@@ -47,6 +47,22 @@ class ResumeRequest(BaseModel):
     model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
 
 
+class StopResponse(BaseModel):
+    """停止运行请求的结果。
+
+    WHY 幂等语义由 ``reason`` 表达而不是状态码：``not_running`` 与
+    ``already_stopping`` 都是「意图已满足」的正常结果，用 200 + 明细
+    让前端可以区分提示，而不是把连点停止当成冲突报错。
+    """
+
+    thread_id: str
+    stopped: bool = Field(description="是否已对运行中的会话触发停止")
+    reason: str = Field(
+        description="结果分类：requested（本次触发）/ "
+        "already_stopping（此前已触发）/ not_running（当前无运行）"
+    )
+
+
 class ThreadResponse(BaseModel):
     """新会话的标识。"""
 
@@ -82,6 +98,7 @@ __all__ = [
     "HistoryMessage",
     "ModelInfo",
     "ResumeRequest",
+    "StopResponse",
     "ThreadListResponse",
     "ThreadResponse",
 ]
