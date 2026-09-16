@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from deepagents.backends import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
+from agent.path_safety import ExtendedPathSafeBackendMixin
 from runtime.sandbox.errors import SandboxError
 from runtime.sandbox.models import CommandRequest
 
@@ -36,8 +37,13 @@ _EMPTY_OUTPUT = "<no output>"
 """空输出占位；与 ``LocalShellBackend`` 的约定一致，避免模型误判为执行失败。"""
 
 
-class SandboxedFilesystemBackend(LocalShellBackend):
-    """把命令执行委托给沙箱 runner 的文件系统 backend。"""
+class SandboxedFilesystemBackend(ExtendedPathSafeBackendMixin, LocalShellBackend):
+    """把命令执行委托给沙箱 runner 的文件系统 backend。
+
+    ``ExtendedPathSafeBackendMixin`` 置于 MRO 首位：只覆盖
+    ``_resolve_path`` / ``_to_virtual_path`` 消除 Windows ``\\\\?\\`` 扩展
+    前缀在并行新建目录时的越界误报，不影响下述 isinstance 语义。
+    """
 
     def __init__(
         self,

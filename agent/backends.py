@@ -17,6 +17,7 @@ from deepagents.backends import (
     StoreBackend,
 )
 
+from agent.path_safety import ExtendedPathSafeBackendMixin
 from agent.sandbox_backend import SandboxedFilesystemBackend
 from runtime.sandbox import build_sandbox_runner
 
@@ -29,6 +30,19 @@ if TYPE_CHECKING:
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _ExtendedPathSafeLocalShellBackend(ExtendedPathSafeBackendMixin, LocalShellBackend):
+    """local 档位：混入 Windows 扩展前缀容错。
+
+    WHY 不直接用 LocalShellBackend：并行 write_file 新建目录时
+    ``Path.resolve()`` 可能返回 ``\\\\?\\`` 前缀路径，官方越界校验会误报
+    （见 agent/path_safety.py 的故障复盘）。
+    """
+
+
+class _ExtendedPathSafeFilesystemBackend(ExtendedPathSafeBackendMixin, FilesystemBackend):
+    """disabled 档位：混入 Windows 扩展前缀容错，理由同上。"""
 
 _MEMORY_NAMESPACE = lambda rt: ("memories",)  # noqa: E731
 """/memories/ 路由的存储命名空间。
@@ -58,7 +72,7 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
         logger.warning(
             "执行档位=local：Agent 可在本机执行任意 shell 命令，禁止用于 Web 环境"
         )
-        default = LocalShellBackend(
+        default = _ExtendedPathSafeLocalShellBackend(
             root_dir=str(workspace),
             virtual_mode=True,
             timeout=config.shell_timeout,
@@ -91,7 +105,7 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
         # SandboxBackendProtocol，execute 工具调用时会直接返回错误，
         # 正好实现「工具存在但不可用」，模型也能据此调整策略。
         logger.info("执行档位=disabled：execute 工具调用将返回错误")
-        default = FilesystemBackend(root_dir=str(workspace))
+        default = _ExtendedPathSafeFilesystemBackend(root_dir=str(workspace))
 
     return CompositeBackend(
         default=default,
