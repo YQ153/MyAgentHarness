@@ -18,13 +18,42 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "TZ",
+    "LANG",
+)
+"""沙箱环境变量白名单。
+
+刻意不含 ``USERPROFILE`` / ``HOME`` / ``APPDATA``：这些变量会引导 git、
+aws-cli 等工具去读用户目录下的凭据文件，属于「合法变量导致的凭据泄漏」。
+
+WHY 定义在配置层而非 runtime 层：``runtime.sandbox`` 需要引用它构造策略，
+而它又是配置项的默认值，放在下层会让 config 反向依赖 runtime。
+"""
+
+NETWORK_MODE_NONE = "none"
+NETWORK_MODE_HOST = "host"
+"""沙箱网络模式；``none`` 表示不向子进程传递代理类变量。"""
+
 
 class ExecutionMode(StrEnum):
     """``execute`` 工具的执行档位。
 
     local:    宿主机直跑 shell，仅限本机开发，与 ``LocalShellBackend`` 的安全
               警告一致——绝不可用于 Web 或多租户环境。
-    sandbox:  容器内执行，需要外部沙盒实现，尚未接入。
+    sandbox:  沙箱内执行 shell。具体隔离强度由 ``SandboxTier`` 决定，当前已
+              实现 Tier 0（进程沙箱，零依赖），需与人工审批配合使用。
     disabled: 使用非沙盒后端，``execute`` 工具仍存在但调用后返回错误；
               这是默认档位，保证进程上线即处于安全状态。
     """
@@ -32,6 +61,26 @@ class ExecutionMode(StrEnum):
     LOCAL = "local"
     SANDBOX = "sandbox"
     DISABLED = "disabled"
+
+
+class SandboxTier(StrEnum):
+    """``sandbox`` 档位下的隔离实现档位。
+
+    auto:    按隔离强度从高到低探测，选中首个可用的档位（wsl → process）。
+    process: Tier 0——宿主机进程沙箱。Windows 用 Job Object 做进程树管控
+             与资源上限，POSIX 用进程组做超时终止。**不是安全边界**，
+             必须与 HITL 人工审批配合。
+    wsl:     Tier 1——在 WSL2 发行版内执行，与宿主之间隔着 utility VM 边界
+             与独立的 Linux 权限模型，资源上限由 Linux rlimit 施加。
+             发行版是持久环境（不是一次性容器），且通过 ``/mnt`` 仍能读写
+             宿主文件，因此同样需要与人工审批配合。
+    docker:  Tier 2——容器内执行。尚未实现。
+    """
+
+    AUTO = "auto"
+    PROCESS = "process"
+    WSL = "wsl"
+    DOCKER = "docker"
 
 
 class AppConfig(BaseSettings):
@@ -83,6 +132,63 @@ class AppConfig(BaseSettings):
     shell_timeout: int = Field(default=120, gt=0)
     shell_max_output_bytes: int = Field(default=100_000, gt=0)
 
+    # ---------------- 沙箱（仅 sandbox 档位生效） ----------------
+    sandbox_tier: SandboxTier = SandboxTier.AUTO
+    """隔离档位；``auto`` 会落到当前已实现的最高档位。"""
+
+    sandbox_timeout: int = Field(default=120, gt=0)
+    """单条命令的超时秒数。
+
+    WHY 独立于 ``shell_timeout``：``shell_timeout`` 是 ``local`` 档位的口径，
+    沙箱档位需要独立的资源与超时策略，二者混用会导致调一个影响另一个。
+    """
+
+    sandbox_max_output_bytes: int = Field(default=100_000, gt=0)
+    """stdout / stderr 各自的截断阈值。"""
+
+    sandbox_max_processes: int = Field(default=64, ge=1)
+    """活动进程数上限。
+
+    WHY 必须有：LLM 生成或复制来的命令里出现 fork bomb 的概率不高，但
+    一旦出现，宿主机在几秒内失去响应，且只能靠重启恢复——上限是唯一防线。
+    """
+
+    sandbox_max_memory_mb: int = Field(default=2048, ge=64)
+    """单个进程的内存上限（MB）。"""
+
+    sandbox_cpu_percent: int = Field(default=50, ge=1, le=100)
+    """CPU 占用硬上限百分比（Windows Job Object 生效）。"""
+
+    sandbox_env_allowlist: list[str] = Field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
+    """允许传入子进程的环境变量白名单。
+
+    WHY 白名单：宿主机环境常含 ``*_API_KEY``、云凭证、``USERPROFILE``，
+    黑名单补不全；命令真正需要的变量只有固定的少数几个。
+    """
+
+    sandbox_network_mode: str = Field(default=NETWORK_MODE_NONE, pattern="^(none|host)$")
+    """网络模式。
+
+    ``none`` 仅表示不向子进程传递代理类变量；Windows 上进程级网络阻断需要
+    管理员权限建防火墙规则，本期不做，残余风险由日志与文档显式标注。
+    """
+
+    sandbox_wsl_distro: str | None = None
+    """WSL 档位使用的发行版名称；``None`` 时自动挑选首个满足要求的发行版。
+
+    WHY 需要「显式指定」与「自动挑选」两条路：一台机器常有多个发行版，而
+    默认发行版未必适合跑命令（例如 Docker Desktop 自带的精简发行版没有
+    bash）；自动挑选会按 ``wsl --list --quiet`` 的顺序逐个探测，显式指定
+    则能跳过这段冷启动开销。
+    """
+
+    sandbox_require_approval: bool = True
+    """沙箱档位下是否仍需人工审批。
+
+    WHY 默认开启：Tier 0 不是安全边界，防不住本地提权与凭据嗅探；审批是
+    本档位真正的主防线，关闭它等于只剩资源管控。
+    """
+
     # ---------------- 护栏 ----------------
     max_model_calls_per_run: int = Field(default=60, gt=0)
     recursion_limit: int = Field(default=100, gt=0)
@@ -113,6 +219,26 @@ class AppConfig(BaseSettings):
         """容错大小写与空白，避免 ``LOCAL`` / `` local `` 被当成非法值。"""
         if isinstance(value, str):
             return value.strip().lower()
+        return value
+
+    @field_validator("sandbox_tier", mode="before")
+    @classmethod
+    def _normalize_tier(cls, value: object) -> object:
+        """容错大小写与空白，与 ``execution_mode`` 保持同一口径。"""
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("sandbox_wsl_distro", mode="before")
+    @classmethod
+    def _blank_distro_to_none(cls, value: object) -> object:
+        """把空串归一为 ``None``。
+
+        WHY：``SANDBOX_WSL_DISTRO=""`` 是 shell 里「清空变量」的常见写法，
+        若当成一个发行版名去探测，用户只会看到一条与真实意图无关的报错。
+        """
+        if isinstance(value, str):
+            return value.strip() or None
         return value
 
     def ensure_directories(self) -> None:
@@ -191,9 +317,10 @@ class AppConfig(BaseSettings):
         instance = cls()
         instance.ensure_directories()
         logger.info(
-            "配置加载完成：model=%s mode=%s workspace=%s",
+            "配置加载完成：model=%s mode=%s tier=%s workspace=%s",
             instance.default_model,
             instance.execution_mode,
+            instance.sandbox_tier,
             instance.workspace,
         )
         return instance

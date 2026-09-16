@@ -17,7 +17,11 @@ from deepagents.backends import (
     StoreBackend,
 )
 
+from agent.sandbox_backend import SandboxedFilesystemBackend
+from runtime.sandbox import build_sandbox_runner
+
 if TYPE_CHECKING:
+    from deepagents.backends.protocol import BackendProtocol
     from pathlib import Path
 
     from langgraph.store.base import BaseStore
@@ -48,6 +52,7 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
     if not workspace.is_dir():
         raise NotADirectoryError(f"工作区不是有效目录：{workspace}")
 
+    default: BackendProtocol
     if config.execution_mode.value == "local":
         # WHY 仅本机开发使用：无隔离、无资源限制，命令以当前用户权限直接作用于宿主机
         logger.warning(
@@ -62,11 +67,24 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
             inherit_env=False,
         )
     elif config.execution_mode.value == "sandbox":
-        # 沙盒需要外部部署信息才能落地，这里显式失败而不是退化成本机执行——
-        # 静默降级会让使用者误以为命令跑在容器里。
-        raise NotImplementedError(
-            "sandbox 档位需要接入外部沙盒（LangSmithSandbox 或自定义 BaseSandbox），"
-            "请提供部署信息后再启用"
+        # WHY 由 factory 装配 runner：档位是否可用由能力探测决定，装配失败
+        # 直接抛出，绝不退化到 LocalShellBackend——静默降级会让使用者误以为
+        # 命令跑在隔离环境里。
+        runner = build_sandbox_runner(config)
+        default = SandboxedFilesystemBackend(
+            root_dir=str(workspace),
+            runner=runner,
+            virtual_mode=True,
+            timeout=config.sandbox_timeout,
+            max_output_bytes=config.sandbox_max_output_bytes,
+            # WHY 不传 env：环境变量清洗交给 runner 的策略白名单统一负责，
+            # 在两处各维护一份白名单必然不一致。
+            inherit_env=False,
+        )
+        logger.warning(
+            "执行档位=sandbox（%s）：该档位只做资源管控，不是安全边界，"
+            "必须与人工审批配合使用",
+            default.describe(),
         )
     else:
         # WHY disabled 走普通 FilesystemBackend：非沙盒后端不满足

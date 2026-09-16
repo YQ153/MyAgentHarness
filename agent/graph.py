@@ -104,9 +104,10 @@ def build_agent(
     ]
 
     logger.info(
-        "装配 Agent：model=%s mode=%s skills=%d memory=%d",
+        "装配 Agent：model=%s mode=%s tier=%s skills=%d memory=%d",
         resolved_name,
         config.execution_mode.value,
+        config.sandbox_tier.value,
         len(config.skill_source_paths()),
         len(config.memory_paths),
     )
@@ -119,7 +120,11 @@ def build_agent(
             skills=config.skill_source_paths() or None,
             memory=config.memory_paths or None,
             permissions=build_permissions(),
-            interrupt_on=build_interrupt_on(config.execution_mode),
+            interrupt_on=build_interrupt_on(
+                config.execution_mode,
+                config.sandbox_tier,
+                require_approval=config.sandbox_require_approval,
+            ),
             middleware=middleware,
             checkpointer=checkpointer,
             store=effective_store,
