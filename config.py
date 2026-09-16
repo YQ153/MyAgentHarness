@@ -12,6 +12,7 @@ import logging
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -197,6 +198,69 @@ class AppConfig(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"
+
+    # ---------------- 认证与鉴权 ----------------
+    auth_mode: Literal["disabled", "apikey", "oidc"] = "disabled"
+    """认证模式。
+
+    ``disabled``：保持原有行为，不校验身份（仅推荐本地开发）。
+    ``apikey``：启用简单 API Key 认证，适合 CLI 与快速试用。
+    ``oidc``：启用 OIDC RP 认证，对接 Authentik 等自托管 IdP。
+    """
+
+    auth_session_secret: str = ""
+    """本地会话 Cookie 签名密钥；auth_mode != disabled 时必须提供且不少于 32 字节。"""
+
+    auth_cookie_name: str = "harness_session"
+    auth_session_max_age_seconds: int = Field(default=28800, ge=60)
+    auth_cookie_secure: bool = False
+    """Cookie 的 Secure 标志；生产环境必须设为 ``True`` 并配合 HTTPS。"""
+    auth_cookie_samesite: str = Field(default="lax", pattern="^(lax|strict|none)$")
+    """Cookie 的 SameSite 属性；OIDC 回调需要浏览器带 Cookie，默认 ``lax``。"""
+
+    # API Key 模式
+    auth_api_key_header: str = "X-API-Key"
+    auth_api_key_dev: str = ""
+    """开发用 API Key；生产环境应使用可轮换的 key store，禁止长期单 key。"""
+
+    # OIDC Device Flow
+    device_flow_expires_in_seconds: int = Field(default=600, ge=60)
+    device_flow_poll_interval_seconds: int = Field(default=5, ge=1)
+    device_flow_api_key_expires_in_days: int = Field(default=30, ge=1)
+    oidc_device_flow_base_url: str = "http://127.0.0.1:8000"
+    """CLI 在 OIDC 模式下做 Device Flow 时访问的 Web 服务地址。"""
+
+    # 认证端点限流
+    auth_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    auth_rate_limit_max_attempts: int = Field(default=10, ge=1)
+    """单 IP 在窗口内允许的最大认证请求数（login/callback/apikey 校验）。"""
+
+    # OIDC 模式
+    oidc_issuer: str = ""
+    """IdP 的 issuer URL，例如 https://auth.example.com/application/o/myagentharness/。"""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    oidc_scope: str = "openid profile email harness:threads:read harness:threads:write"
+
+    @field_validator("auth_session_secret", mode="after")
+    @classmethod
+    def _validate_session_secret(cls, value: str, info: Any) -> str:
+        """auth_mode != disabled 时必须提供足够长的会话密钥。"""
+        mode = info.data.get("auth_mode")
+        if mode and mode != "disabled" and len(value) < 32:
+            raise ValueError("auth_mode 非 disabled 时，auth_session_secret 至少需要 32 字节")
+        return value
+
+    @field_validator("oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_redirect_uri", mode="after")
+    @classmethod
+    def _validate_oidc_fields(cls, value: str, info: Any) -> str:
+        """auth_mode == oidc 时 OIDC 相关字段不能为空。"""
+        mode = info.data.get("auth_mode")
+        if mode == "oidc" and not value:
+            field_name = info.field_name or "OIDC 字段"
+            raise ValueError(f"auth_mode=oidc 时，{field_name} 不能为空")
+        return value
 
     @field_validator("workspace", "memory_file", "db_path", mode="after")
     @classmethod

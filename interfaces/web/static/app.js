@@ -30,6 +30,20 @@
     newThread: document.getElementById('new-thread'),
     modelSelect: document.getElementById('model-select'),
     threadList: document.getElementById('thread-list'),
+    authStatus: document.getElementById('auth-status'),
+    adminModal: document.getElementById('admin-modal'),
+    adminClose: document.getElementById('admin-close'),
+    adminTabs: document.querySelectorAll('.modal-tabs .tab'),
+    tabPanels: document.querySelectorAll('.tab-panel'),
+    apikeyForm: document.getElementById('apikey-form'),
+    apikeyList: document.getElementById('apikey-list'),
+    apikeyPopup: document.getElementById('apikey-popup'),
+    apikeyValue: document.getElementById('apikey-value'),
+    apikeyCopy: document.getElementById('apikey-copy'),
+    popupClose: document.getElementById('popup-close'),
+    copyMsg: document.getElementById('copy-msg'),
+    auditRefresh: document.getElementById('audit-refresh'),
+    auditTableBody: document.querySelector('#audit-table tbody'),
   };
 
   const state = {
@@ -37,6 +51,8 @@
     running: false,
     assistantEl: null,
     toolNodes: [],
+    auth: { mode: 'disabled', principal: null },
+    admin: { apikeys: [] },
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -82,6 +98,12 @@
   async function api(path, options) {
     const response = await fetch(path, options);
     if (!response.ok) {
+      // WHY 认证模式下 401 直接跳转登录页：SSE / fetch 的 401 不便展示登录弹窗，
+      // 让浏览器走完整 OIDC 授权码流程是最稳的做法；disabled 模式下保持原错误提示。
+      if (response.status === 401 && state.auth.mode !== 'disabled') {
+        window.location.href = state.auth.login_url || '/auth/login';
+        throw new Error('未认证，即将跳转登录页');
+      }
       let detail = `HTTP ${response.status}`;
       try {
         const payload = await response.json();
@@ -628,8 +650,233 @@
     });
   }
 
+  function renderAuth() {
+    const container = els.authStatus;
+    container.innerHTML = '';
+    if (state.auth.mode === 'disabled') return;
+
+    const principal = state.auth.principal;
+    if (!principal) {
+      const login = el('a', 'auth-link', '登录');
+      login.href = state.auth.login_url || '/auth/login';
+      container.appendChild(login);
+      return;
+    }
+
+    const name = el('span', 'auth-name', principal.display_name || principal.user_id);
+    container.appendChild(name);
+
+    // 仅管理员显示管理入口
+    if ((principal.permissions || []).includes('apikey:manage')) {
+      const manage = el('a', 'auth-link', '管理');
+      manage.href = '#';
+      manage.addEventListener('click', (event) => {
+        event.preventDefault();
+        openAdminModal();
+      });
+      container.appendChild(manage);
+    }
+
+    const logout = el('a', 'auth-link', '退出');
+    logout.href = '/auth/logout';
+    container.appendChild(logout);
+  }
+
+  /* ------------------------------------------------------------------ 管理面板 */
+
+  function openAdminModal() {
+    els.adminModal.style.display = '';
+    loadApiKeys();
+  }
+
+  function closeAdminModal() {
+    els.adminModal.style.display = 'none';
+  }
+
+  function switchTab(target) {
+    els.adminTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.tab === target));
+    els.tabPanels.forEach((panel) => panel.classList.toggle('active', panel.id === `tab-${target}`));
+    if (target === 'audit') loadAudit();
+  }
+
+  async function loadApiKeys() {
+    try {
+      const response = await api('/auth/api-keys');
+      state.admin.apikeys = await response.json();
+      renderApiKeys();
+    } catch (err) {
+      appendError('API Key 列表加载失败：' + err.message);
+    }
+  }
+
+  function renderApiKeys() {
+    els.apikeyList.innerHTML = '';
+    if (!state.admin.apikeys.length) {
+      els.apikeyList.appendChild(el('div', 'admin-empty', '暂无 API Key'));
+      return;
+    }
+    state.admin.apikeys.forEach((item) => {
+      const row = el('div', 'apikey-item');
+      const meta = el('div', 'apikey-meta');
+      const info = [
+        `ID: ${item.key_id}`,
+        `角色: ${item.role}`,
+        `前缀: ${item.key_prefix}`,
+        item.description || '无描述',
+        item.revoked_at ? `已吊销 ${formatTime(item.revoked_at)}` : `创建于 ${formatTime(item.created_at)}`,
+      ].join(' · ');
+      meta.textContent = info;
+      row.appendChild(meta);
+
+      if (!item.revoked_at) {
+        const revokeBtn = el('button', 'danger small', '吊销');
+        revokeBtn.addEventListener('click', () => revokeApiKey(item.key_id));
+        row.appendChild(revokeBtn);
+      }
+      els.apikeyList.appendChild(row);
+    });
+  }
+
+  async function createApiKey(event) {
+    event.preventDefault();
+    const role = document.getElementById('apikey-role').value;
+    const scopes = document.getElementById('apikey-scopes').value;
+    const description = document.getElementById('apikey-desc').value;
+    const expiresAt = document.getElementById('apikey-expires').value;
+
+    try {
+      const params = new URLSearchParams();
+      params.append('role', role);
+      if (scopes) params.append('scopes', scopes);
+      if (description) params.append('description', description);
+      if (expiresAt) params.append('expires_at', expiresAt);
+
+      const response = await api('/auth/api-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params,
+      });
+      const result = await response.json();
+      await loadApiKeys();
+      showApiKeyPopup(result.key);
+      els.apikeyForm.reset();
+    } catch (err) {
+      appendError('创建 API Key 失败：' + err.message);
+    }
+  }
+
+  async function revokeApiKey(keyId) {
+    if (!confirm(`确认吊销 API Key ${keyId}？`)) return;
+    try {
+      await api(`/auth/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+      await loadApiKeys();
+    } catch (err) {
+      appendError('吊销 API Key 失败：' + err.message);
+    }
+  }
+
+  function showApiKeyPopup(key) {
+    els.apikeyValue.value = key;
+    els.apikeyPopup.style.display = '';
+    els.copyMsg.textContent = '';
+  }
+
+  function closeApiKeyPopup() {
+    els.apikeyPopup.style.display = 'none';
+    els.apikeyValue.value = '';
+  }
+
+  async function copyApiKey() {
+    try {
+      await navigator.clipboard.writeText(els.apikeyValue.value);
+      els.copyMsg.textContent = '已复制';
+    } catch (err) {
+      els.copyMsg.textContent = '复制失败，请手动复制';
+    }
+  }
+
+  async function loadAudit() {
+    try {
+      const response = await api('/auth/audit?limit=100');
+      const rows = await response.json();
+      renderAudit(rows);
+    } catch (err) {
+      appendError('审计日志加载失败：' + err.message);
+    }
+  }
+
+  function renderAudit(rows) {
+    els.auditTableBody.innerHTML = '';
+    if (!rows.length) {
+      const tr = el('tr');
+      const td = el('td');
+      td.colSpan = 6;
+      td.textContent = '暂无记录';
+      td.className = 'audit-empty';
+      tr.appendChild(td);
+      els.auditTableBody.appendChild(tr);
+      return;
+    }
+    rows.forEach((row) => {
+      const tr = el('tr');
+      tr.appendChild(el('td', null, formatTime(row.created_at)));
+      tr.appendChild(el('td', null, row.event_type));
+      tr.appendChild(el('td', null, row.actor_id));
+      tr.appendChild(el('td', null, row.action || ''));
+      tr.appendChild(el('td', null, row.outcome));
+      tr.appendChild(el('td', null, row.ip || ''));
+      els.auditTableBody.appendChild(tr);
+    });
+  }
+
+  function bindAdminEvents() {
+    els.adminClose.addEventListener('click', closeAdminModal);
+    els.popupClose.addEventListener('click', closeApiKeyPopup);
+    els.apikeyCopy.addEventListener('click', copyApiKey);
+    els.auditRefresh.addEventListener('click', () => loadAudit());
+
+    els.adminTabs.forEach((tab) => {
+      tab.addEventListener('click', () => switchTab(tab.dataset.tab));
+    });
+
+    if (els.apikeyForm) {
+      els.apikeyForm.addEventListener('submit', createApiKey);
+    }
+
+    // 点击遮罩关闭弹窗
+    els.adminModal.querySelector('.modal-backdrop').addEventListener('click', closeAdminModal);
+    els.apikeyPopup.querySelector('.modal-backdrop').addEventListener('click', closeApiKeyPopup);
+  }
+
+  async function loadAuth() {
+    try {
+      const cfgResponse = await api('/auth/config');
+      const cfg = await cfgResponse.json();
+      state.auth.mode = cfg.auth_mode || 'disabled';
+      state.auth.login_url = cfg.login_url;
+
+      if (state.auth.mode !== 'disabled') {
+        try {
+          const meResponse = await api('/auth/me');
+          state.auth.principal = await meResponse.json();
+        } catch (err) {
+          // /auth/me 401 属于正常未登录态，无需报错
+          state.auth.principal = null;
+        }
+      }
+    } catch (err) {
+      // 认证配置读取失败不应阻塞主界面
+      state.auth.mode = 'disabled';
+    }
+    renderAuth();
+  }
+
   async function init() {
+    // WHY 先加载认证配置：后续所有 API 调用都依赖 401 处理逻辑
+    await loadAuth();
+
     bindEvents();
+    bindAdminEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
     // 让「URL 变化 → 同步界面」成为唯一入口，避免两处逻辑漂移

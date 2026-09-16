@@ -22,3 +22,38 @@ class ThreadBusyError(RuntimeError):
     def __init__(self, thread_id: str) -> None:
         super().__init__(f"会话 {thread_id} 正在运行中，请等待本轮结束后再发起")
         self.thread_id = thread_id
+
+
+class NotFoundError(RuntimeError):
+    """目标资源不存在。
+
+    对应 HTTP 404 Not Found。
+    """
+
+    def __init__(self, resource: str, identifier: str) -> None:
+        super().__init__(f"{resource} 不存在：{identifier}")
+        self.resource = resource
+        self.identifier = identifier
+
+
+class OwnershipError(RuntimeError):
+    """目标资源存在但当前主体无权访问。
+
+    对应 HTTP 403 Forbidden。
+    """
+
+    def __init__(self, resource: str, identifier: str) -> None:
+        super().__init__(f"无权访问 {resource}：{identifier}")
+        self.resource = resource
+        self.identifier = identifier
+
+
+class PermissionDeniedError(RuntimeError):
+    """当前主体缺少某项权限。
+
+    对应 HTTP 403 Forbidden。
+    """
+
+    def __init__(self, permission: str) -> None:
+        super().__init__(f"缺少权限：{permission}")
+        self.permission = permission

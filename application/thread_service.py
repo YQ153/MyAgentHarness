@@ -19,7 +19,10 @@ from application.dto import (
     ThreadListResult,
     ThreadSummary,
 )
+from application.errors import NotFoundError, OwnershipError
+from application.principal import Principal
 from application.runnable import build_runnable_config
+from runtime.audit_store import AuditStore
 from runtime.thread_store import ThreadMetaStore, normalize_thread_id
 
 if TYPE_CHECKING:
@@ -41,6 +44,7 @@ class ThreadService:
         checkpointer: BaseCheckpointSaver,
         thread_store: ThreadMetaStore,
         graph_factory: AgentFactory,
+        audit_store: AuditStore | None = None,
     ) -> None:
         """构造会话服务。
 
@@ -49,6 +53,7 @@ class ThreadService:
             checkpointer: 检查点保存器，用于清理会话状态。
             thread_store: 会话元数据存储。
             graph_factory: 图工厂，用于读取会话历史。
+            audit_store: 审计日志存储，可选；认证关闭时可为 ``None``。
 
         Raises:
             ValueError: 任一必需依赖为 ``None``。
@@ -68,8 +73,70 @@ class ThreadService:
         self._checkpointer = checkpointer
         self._thread_store = thread_store
         self._graph_factory = graph_factory
+        self._audit_store = audit_store
 
-        logger.info("ThreadService 就绪：workspace=%s", config.workspace)
+        logger.info("ThreadService 就绪：workspace=%s auth_mode=%s", config.workspace, config.auth_mode)
+
+    def _effective_owner_id(self, principal: Principal | None) -> str | None:
+        """根据认证模式返回查询时使用的 owner_id。
+
+        - disabled：返回 ``None``，列出全部（向后兼容）。
+        - 其他：返回 principal.user_id；未认证时会话层不处理，由路由层挡回。
+        """
+        if self._config.auth_mode == "disabled":
+            return None
+        if principal is None:
+            return "__unauthenticated__"
+        return principal.user_id
+
+    def _ensure_ownership(
+        self,
+        record: dict[str, Any] | None,
+        thread_id: str,
+        principal: Principal | None,
+        require_admin: bool = False,
+    ) -> None:
+        """校验主体是否拥有该会话的访问权。
+
+        Raises:
+            NotFoundError: 会话不存在。
+            OwnershipError: 会话存在但当前主体无权访问。
+        """
+        if record is None:
+            raise NotFoundError("会话", thread_id)
+
+        if self._config.auth_mode == "disabled":
+            return
+        if principal is None:
+            raise OwnershipError("会话", thread_id)
+        if principal.is_admin():
+            return
+        owner_id = record.get("owner_id") or ""
+        if owner_id and owner_id != principal.user_id:
+            raise OwnershipError("会话", thread_id)
+        if require_admin and not principal.is_admin():
+            raise OwnershipError("会话", thread_id)
+
+    async def _audit(
+        self,
+        *,
+        event_type: str,
+        actor_id: str,
+        target_id: str | None = None,
+        action: str | None = None,
+        outcome: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self._audit_store is None:
+            return
+        await self._audit_store.log(
+            event_type=event_type,
+            actor_id=actor_id,
+            target_id=target_id,
+            action=action,
+            outcome=outcome,
+            details=details,
+        )
 
     # ------------------------------------------------------------------ 查询
 
@@ -90,13 +157,20 @@ class ThreadService:
         """
         return uuid.uuid4().hex
 
-    async def list_threads(self, *, limit: int = 50, offset: int = 0) -> ThreadListResult:
+    async def list_threads(
+        self,
+        principal: Principal | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> ThreadListResult:
         """列出会话清单，最近活动的在前。
 
         WHY 只读元数据表而不遍历每个会话的图状态：后者需要对每个 thread 调用
         一次 ``aget_state``，成本随会话数线性增长；而列表页只需要标题与时间。
 
         Args:
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
             limit: 返回条数，1..200。
             offset: 跳过的条数，用于分页。
 
@@ -107,9 +181,12 @@ class ThreadService:
             ValueError: 分页参数非法（调用方应映射为 400）。
             RuntimeError: 查询失败（调用方应映射为 500）。
         """
+        owner_id = self._effective_owner_id(principal)
         try:
-            items = await self._thread_store.list_threads(limit=limit, offset=offset)
-            total = await self._thread_store.count()
+            items = await self._thread_store.list_threads(
+                owner_id=owner_id, limit=limit, offset=offset
+            )
+            total = await self._thread_store.count(owner_id=owner_id)
         except ValueError:
             # WHY 让参数错误原样透出：路由层需要把它映射为 400 而不是 500
             raise
@@ -123,7 +200,11 @@ class ThreadService:
             total=total,
         )
 
-    async def history(self, thread_id: str) -> list[HistoryMessage]:
+    async def history(
+        self,
+        thread_id: str,
+        principal: Principal | None = None,
+    ) -> list[HistoryMessage]:
         """读取会话历史，供前端刷新页面后恢复上下文。
 
         WHY 用 ``aget_state`` 而不用同步的 ``get_state``：异步检查点保存器
@@ -136,15 +217,21 @@ class ThreadService:
 
         Args:
             thread_id: 会话 ID。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             历史消息列表；会话不存在时为空列表。
 
         Raises:
             ValueError: ``thread_id`` 非法。
+            NotFoundError: 会话元数据不存在。
+            OwnershipError: 无权访问该会话。
             RuntimeError: 读取失败。
         """
         normalized = normalize_thread_id(thread_id)
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
         graph = self._graph_factory.get()
 
         try:
@@ -163,7 +250,11 @@ class ThreadService:
 
     # ------------------------------------------------------------------ 写入
 
-    async def delete_thread(self, thread_id: str) -> DeleteResult:
+    async def delete_thread(
+        self,
+        thread_id: str,
+        principal: Principal | None = None,
+    ) -> DeleteResult:
         """删除会话：检查点与元数据一并清理。
 
         WHY 直接调用 checkpointer 的删除接口：图的状态读取无法区分「空会话」
@@ -175,15 +266,23 @@ class ThreadService:
 
         Args:
             thread_id: 会话 ID。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             删除结果，含结果分类、检查点是否清理与失败摘要。
 
         Raises:
             ValueError: ``thread_id`` 非法。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权删除该会话。
         """
         normalized = normalize_thread_id(thread_id)
 
+        # WHY 先查再删：避免在无权访问时通过「删除不存在」的响应泄露会话存在性。
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        actor_id = principal.user_id if principal else "anonymous"
         meta_error = ""
         try:
             meta_deleted = await self._thread_store.delete(normalized)
@@ -218,11 +317,21 @@ class ThreadService:
         else:
             detail = ""
 
+        await self._audit(
+            event_type="thread_delete",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="delete",
+            outcome=outcome.value,
+            details={"checkpoint_removed": checkpoint_removed, "detail": detail},
+        )
+
         logger.info(
-            "删除会话完成：thread=%s outcome=%s checkpoint=%s",
+            "删除会话完成：thread=%s outcome=%s checkpoint=%s actor=%s",
             normalized,
             outcome.value,
             checkpoint_removed,
+            actor_id,
         )
         return DeleteResult(
             thread_id=normalized,

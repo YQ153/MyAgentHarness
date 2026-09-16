@@ -15,6 +15,7 @@
       </div>
       <div class="controls">
         <select id="model-select" title="切换模型"></select>
+        <div id="auth-status" class="auth-status"></div>
       </div>
     </header>
 
@@ -41,6 +42,69 @@
       <button id="send" type="button">发送</button>
     </footer>
   </div>
+  <!-- 管理面板：仅管理员可见 -->
+  <div id="admin-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>管理面板</h3>
+        <button id="admin-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <div class="modal-tabs">
+        <button type="button" class="tab active" data-tab="apikeys">API Keys</button>
+        <button type="button" class="tab" data-tab="audit">审计日志</button>
+      </div>
+      <div id="tab-apikeys" class="tab-panel active">
+        <form id="apikey-form" class="apikey-form">
+          <label>角色</label>
+          <select id="apikey-role" required>
+            <option value="member" selected>member</option>
+            <option value="admin">admin</option>
+            <option value="viewer">viewer</option>
+          </select>
+          <label>作用域（空格分隔）</label>
+          <input id="apikey-scopes" type="text" placeholder="例如：thread:list thread:read" />
+          <label>描述</label>
+          <input id="apikey-desc" type="text" placeholder="CLI 用" />
+          <label>过期时间（可选，ISO8601）</label>
+          <input id="apikey-expires" type="text" placeholder="2026-12-31T23:59:59" />
+          <button type="submit" class="primary">创建 API Key</button>
+        </form>
+        <div id="apikey-list" class="apikey-list"></div>
+      </div>
+      <div id="tab-audit" class="tab-panel">
+        <div class="audit-toolbar">
+          <button id="audit-refresh" type="button">刷新</button>
+        </div>
+        <div class="audit-table-wrap">
+          <table id="audit-table" class="audit-table">
+            <thead>
+              <tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- API Key 复制弹窗 -->
+  <div id="apikey-popup" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-small">
+      <div class="modal-header">
+        <h3>API Key 已创建</h3>
+        <button id="popup-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="hint">请立即复制，明文 key 只显示一次。</p>
+      <div class="apikey-value-wrap">
+        <input id="apikey-value" type="text" readonly />
+        <button id="apikey-copy" type="button">复制</button>
+      </div>
+      <p id="copy-msg" class="copy-msg"></p>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

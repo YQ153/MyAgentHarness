@@ -71,6 +71,7 @@ def normalize_thread_id(thread_id: str) -> str:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_meta (
     thread_id     TEXT PRIMARY KEY,
+    owner_id      TEXT NOT NULL DEFAULT '',
     title         TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
@@ -80,7 +81,17 @@ CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
 """
 
-_COLUMNS = "thread_id, title, created_at, updated_at, turn_count"
+_MIGRATIONS = [
+    """
+    ALTER TABLE thread_meta ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_thread_meta_owner_updated
+        ON thread_meta (owner_id, updated_at DESC, thread_id DESC);
+    """,
+]
+
+_COLUMNS = "thread_id, owner_id, title, created_at, updated_at, turn_count"
 
 
 def _utc_now() -> str:
@@ -149,12 +160,19 @@ class ThreadMetaStore:
 
     # ------------------------------------------------------------------ 写入
 
-    async def create(self, thread_id: str, *, title: str = "") -> dict[str, Any]:
+    async def create(
+        self,
+        thread_id: str,
+        *,
+        title: str = "",
+        owner_id: str = "",
+    ) -> dict[str, Any]:
         """登记一个新会话；已存在时保持原记录不变（幂等）。
 
         Args:
             thread_id: 会话 ID。
             title: 初始标题，空串表示尚未命名。
+            owner_id: 会话所有者标识；认证关闭时为空串。
 
         Returns:
             该会话的完整元数据字典。
@@ -172,11 +190,11 @@ class ThreadMetaStore:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, 0)
+                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
+                    VALUES (?, ?, ?, ?, ?, 0)
                     ON CONFLICT(thread_id) DO NOTHING
                     """,
-                    (normalized_id, normalized_title, now, now),
+                    (normalized_id, owner_id, normalized_title, now, now),
                 ) as cursor:
                     inserted = cursor.rowcount > 0
                 await self._conn.commit()
@@ -202,6 +220,7 @@ class ThreadMetaStore:
         *,
         title_hint: str | None = None,
         turn_delta: int = 1,
+        owner_id: str = "",
     ) -> dict[str, Any] | None:
         """记录一轮对话：刷新活动时间、累加轮次，并在标题为空时补写标题。
 
@@ -213,6 +232,7 @@ class ThreadMetaStore:
             thread_id: 会话 ID。
             title_hint: 用于生成标题的原始文本；为 ``None`` 时不改动标题。
             turn_delta: 本轮新增的对话轮次，恢复执行传 0（同一次运行的延续）。
+            owner_id: 新建会话时的所有者；已存在会话不会被覆盖所有者。
 
         Returns:
             更新后的元数据；``None`` 表示该会话此前未登记且本次未能写入。
@@ -234,18 +254,24 @@ class ThreadMetaStore:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         turn_count = thread_meta.turn_count + ?,
                         title = CASE
                             WHEN thread_meta.title = '' THEN excluded.title
                             ELSE thread_meta.title
+                        END,
+                        owner_id = CASE
+                            WHEN thread_meta.owner_id = '' OR thread_meta.owner_id IS NULL
+                                THEN excluded.owner_id
+                            ELSE thread_meta.owner_id
                         END
                     """,
                     (
                         normalized_id,
+                        owner_id,
                         normalized_title,
                         now,
                         now,
@@ -356,10 +382,20 @@ class ThreadMetaStore:
 
         return dict(row) if row is not None else None
 
-    async def list_threads(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    async def list_threads(
+        self,
+        *,
+        owner_id: str | None = None,
+        include_unowned: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         """按最近活动时间倒序列出会话。
 
         Args:
+            owner_id: 只返回该所有者的会话；``None`` 表示不限制。
+            include_unowned: 为 ``True`` 时同时返回 ``owner_id=''`` 的会话，
+                用于向后兼容与迁移场景。
             limit: 返回条数，1..200。
             offset: 跳过的条数，用于分页。
 
@@ -372,16 +408,27 @@ class ThreadMetaStore:
         """
         self._validate_paging(limit, offset)
 
+        conditions = []
+        params: list[Any] = []
+        if owner_id is not None:
+            if include_unowned:
+                conditions.append("(owner_id = ? OR owner_id = '')")
+            else:
+                conditions.append("owner_id = ?")
+            params.append(owner_id)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        sql = f"""
+            SELECT {_COLUMNS} FROM thread_meta
+            {where}
+            ORDER BY updated_at DESC, thread_id DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
         async with self._lock:
             try:
-                async with self._conn.execute(
-                    f"""
-                    SELECT {_COLUMNS} FROM thread_meta
-                    ORDER BY updated_at DESC, thread_id DESC
-                    LIMIT ? OFFSET ?
-                    """,
-                    (limit, offset),
-                ) as cursor:
+                async with self._conn.execute(sql, tuple(params)) as cursor:
                     rows = await cursor.fetchall()
             except Exception:
                 logger.exception("查询会话列表失败：limit=%s offset=%s", limit, offset)
@@ -390,17 +437,36 @@ class ThreadMetaStore:
         logger.debug("会话列表查询完成：返回 %d 条（offset=%s）", len(rows), offset)
         return [dict(row) for row in rows]
 
-    async def count(self) -> int:
+    async def count(
+        self,
+        *,
+        owner_id: str | None = None,
+        include_unowned: bool = False,
+    ) -> int:
         """返回会话总数，用于分页元信息。
+
+        Args:
+            owner_id: 只统计该所有者的会话；``None`` 表示不限制。
+            include_unowned: 是否同时统计 ``owner_id=''`` 的会话。
 
         Raises:
             aiosqlite.Error: 数据库层异常，原样向上抛出。
         """
+        conditions = []
+        params: list[Any] = []
+        if owner_id is not None:
+            if include_unowned:
+                conditions.append("(owner_id = ? OR owner_id = '')")
+            else:
+                conditions.append("owner_id = ?")
+            params.append(owner_id)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        sql = f"SELECT COUNT(1) FROM thread_meta {where}"
+
         async with self._lock:
             try:
-                async with self._conn.execute(
-                    "SELECT COUNT(1) FROM thread_meta"
-                ) as cursor:
+                async with self._conn.execute(sql, tuple(params)) as cursor:
                     row = await cursor.fetchone()
             except Exception:
                 logger.exception("统计会话总数失败")
@@ -450,6 +516,13 @@ async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
         # 默认行为是立即返回 "database is locked"，等待几秒远比报错合理。
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
+        for migration in _MIGRATIONS:
+            try:
+                await conn.executescript(migration)
+            except Exception:
+                # WHY 忽略重复迁移错误：SQLite 对已有列/索引的 ALTER 会抛错，
+                # 但幂等迁移不需要回滚；非重复错误会在外层被记录。
+                pass
         await conn.commit()
 
         logger.info("会话元数据表已就绪：%s", db_path)

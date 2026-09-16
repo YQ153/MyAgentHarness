@@ -16,11 +16,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from application.dto import ModelInfo
-from application.errors import ThreadBusyError
+from application.errors import (
+    NotFoundError,
+    OwnershipError,
+    PermissionDeniedError,
+    ThreadBusyError,
+)
 from application.events import AgentEvent
 from application.model_catalog import ModelCatalog
+from application.principal import Principal
 from application.run_service import RunService
 from application.thread_service import ThreadService
+from interfaces.web.auth import get_principal, require_permission
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
@@ -94,7 +101,10 @@ async def list_models(catalog: ModelCatalog = Depends(get_catalog)) -> list[Mode
 
 
 @router.post("/threads", response_model=ThreadResponse)
-async def create_thread(threads: ThreadService = Depends(get_threads)) -> ThreadResponse:
+async def create_thread(
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:create")),
+) -> ThreadResponse:
     """申请一个新的会话 ID。
 
     WHY 不是 201 Created：此刻并没有创建任何资源——会话要等首条消息被接受
@@ -108,6 +118,7 @@ async def list_threads(
     limit: int = Query(default=50, ge=1, le=200, description="返回条数"),
     offset: int = Query(default=0, ge=0, description="跳过的条数"),
     threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:list")),
 ) -> ThreadListResponse:
     """列出会话清单，最近活动的在前。
 
@@ -116,7 +127,7 @@ async def list_threads(
     ``/threads/summary`` 之类的静态子路径时被参数路由抢先匹配。
     """
     try:
-        result = await threads.list_threads(limit=limit, offset=offset)
+        result = await threads.list_threads(principal, limit=limit, offset=offset)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -133,14 +144,23 @@ async def list_threads(
 async def get_history(
     thread_id: str,
     threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:read")),
 ) -> list[HistoryMessage]:
     """读取会话历史，用于刷新页面后恢复上下文。"""
     normalized = _validate_thread_id(thread_id)
     try:
-        return await threads.history(normalized)
+        return await threads.history(normalized, principal)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except RuntimeError as exc:
         logger.exception("读取会话历史失败：thread=%s", normalized)
@@ -153,14 +173,23 @@ async def get_history(
 async def delete_thread(
     thread_id: str,
     threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:delete")),
 ) -> DeleteResponse:
     """删除会话。"""
     normalized = _validate_thread_id(thread_id)
     try:
-        result = await threads.delete_thread(normalized)
+        result = await threads.delete_thread(normalized, principal)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
 
     return DeleteResponse(
@@ -176,6 +205,7 @@ async def run_agent(
     thread_id: str,
     body: ChatRequest,
     runs: RunService = Depends(get_runs),
+    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """发起一轮对话，以 SSE 流式返回事件。
 
@@ -186,7 +216,7 @@ async def run_agent(
     normalized = _validate_thread_id(thread_id)
 
     try:
-        events = await runs.stream(normalized, body.content, model_name=body.model)
+        events = await runs.stream(normalized, body.content, principal=principal, model_name=body.model)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -194,6 +224,18 @@ async def run_agent(
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         raise HTTPException(
@@ -218,6 +260,7 @@ async def resume_agent(
     thread_id: str,
     body: ResumeRequest,
     runs: RunService = Depends(get_runs),
+    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """人工审批后恢复执行，同样以 SSE 流式返回。"""
     normalized = _validate_thread_id(thread_id)
@@ -227,7 +270,7 @@ async def resume_agent(
     }
 
     try:
-        events = await runs.resume(normalized, payload, model_name=body.model)
+        events = await runs.resume(normalized, payload, principal=principal, model_name=body.model)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -235,6 +278,18 @@ async def resume_agent(
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         raise HTTPException(

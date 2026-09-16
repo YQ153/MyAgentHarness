@@ -54,6 +54,7 @@ class ThreadSummary(BaseModel):
     """
 
     thread_id: str = Field(description="会话标识")
+    owner_id: str = Field(default="", description="所有者用户标识，未认证场景为空串")
     title: str = Field(description="会话标题，尚未产生首轮对话时为空串")
     created_at: str = Field(description="创建时间（ISO8601 UTC）")
     updated_at: str = Field(description="最近活动时间（ISO8601 UTC）")

@@ -12,11 +12,13 @@ import threading
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
-from application.errors import ThreadBusyError
+from application.errors import NotFoundError, OwnershipError, PermissionDeniedError, ThreadBusyError
 from application.event_translator import LangGraphEventTranslator
 from application.events import AgentEvent, AgentEventType
 from application.interrupt_codec import build_resume_command
+from application.principal import Principal
 from application.runnable import build_runnable_config
+from runtime.audit_store import AuditStore
 from runtime.thread_store import ThreadMetaStore, normalize_thread_id
 from text_utils import build_title
 
@@ -38,6 +40,7 @@ class RunService:
         *,
         thread_store: ThreadMetaStore,
         graph_factory: AgentFactory,
+        audit_store: AuditStore | None = None,
     ) -> None:
         """构造运行服务。
 
@@ -45,6 +48,7 @@ class RunService:
             config: 应用配置。
             thread_store: 会话元数据存储，用于登记轮次与刷新活动时间。
             graph_factory: 图工厂，提供已装配的 LangGraph 图。
+            audit_store: 审计日志存储，可选。
 
         Raises:
             ValueError: 任一必需依赖为 ``None``。
@@ -59,6 +63,7 @@ class RunService:
         self._config = config
         self._thread_store = thread_store
         self._graph_factory = graph_factory
+        self._audit_store = audit_store
 
         # WHY 用 threading.Lock 保护「运行中」集合：加解锁之间不 await，
         # 临界区极短；更重要的是释放动作必须能在 finally 里同步完成——
@@ -73,6 +78,76 @@ class RunService:
             config.recursion_limit,
         )
 
+    def _owner_id(self, principal: Principal | None) -> str:
+        """返回写入 thread_meta 的 owner_id。"""
+        if self._config.auth_mode == "disabled" or principal is None:
+            return ""
+        return principal.user_id
+
+    def _ensure_permission(
+        self,
+        principal: Principal | None,
+        permission: str,
+    ) -> None:
+        """校验主体是否拥有某权限。"""
+        if self._config.auth_mode == "disabled":
+            return
+        if principal is None or not principal.has_permission(permission):
+            raise PermissionDeniedError(permission)
+
+    async def _ensure_ownership(
+        self,
+        thread_id: str,
+        principal: Principal | None,
+        *,
+        allow_claim: bool = False,
+    ) -> dict[str, Any]:
+        """校验主体是否拥有该会话，并返回元数据记录。
+
+        Args:
+            allow_claim: 允许在未登记时「认领」该会话（用于 ``stream`` 首条消息场景）。
+
+        Raises:
+            NotFoundError: 会话不存在且 ``allow_claim=False``。
+            OwnershipError: 无权访问。
+        """
+        record = await self._thread_store.get(thread_id)
+        if record is None:
+            if allow_claim:
+                return {}
+            raise NotFoundError("会话", thread_id)
+        if self._config.auth_mode == "disabled":
+            return record
+        if principal is None:
+            raise OwnershipError("会话", thread_id)
+        if principal.is_admin():
+            return record
+        owner_id = record.get("owner_id") or ""
+        if owner_id and owner_id != principal.user_id:
+            raise OwnershipError("会话", thread_id)
+        return record
+
+    async def _audit(
+        self,
+        *,
+        event_type: str,
+        actor_id: str,
+        target_id: str | None = None,
+        action: str | None = None,
+        outcome: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self._audit_store is None:
+            return
+        await self._audit_store.log(
+            event_type=event_type,
+            actor_id=actor_id,
+            target_id=target_id,
+            action=action,
+            outcome=outcome,
+            details=details,
+        )
+
     # ------------------------------------------------------------------ 运行
 
     async def stream(
@@ -80,6 +155,7 @@ class RunService:
         thread_id: str,
         user_input: str,
         *,
+        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """发起一轮对话。
@@ -93,6 +169,7 @@ class RunService:
         Args:
             thread_id: 会话 ID。
             user_input: 用户本轮输入，不能为空。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
 
         Returns:
@@ -101,24 +178,55 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 或 ``user_input`` 非法。
             KeyError: 模型别名未注册。
+            PermissionDeniedError: 缺少 thread:create 权限。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权访问该会话。
             RuntimeError: 模型初始化或装配失败。
         """
+        self._ensure_permission(principal, "thread:create")
+
         normalized = normalize_thread_id(thread_id)
         if not isinstance(user_input, str) or not user_input.strip():
             raise ValueError("user_input 必须是非空字符串")
         text = user_input.strip()
 
+        # WHY 先鉴权再初始化模型：权限不足应快速失败，避免浪费模型调用。
+        # 首条消息可能还未登记元数据，允许当前主体认领该会话。
+        await self._ensure_ownership(normalized, principal, allow_claim=True)
+
         # WHY 在进入图之前取图：这一步会解析模型别名并真正初始化模型，
         # 把配置与密钥错误暴露在事件流开始之前。
         graph = self._graph_factory.get(model_name)
 
-        logger.info("会话 %s 发起运行（%d 字符）", normalized, len(text))
+        actor_id = principal.user_id if principal else "anonymous"
+        logger.info("会话 %s 发起运行（%d 字符）actor=%s", normalized, len(text), actor_id)
 
         # WHY 在进入图之前登记：这一刻才是会话真正诞生的时刻。放在轮次结束后
         # 登记，会让「模型初始化失败」这类早退场景下的会话凭空消失，而用户
         # 明明已经表达过意图。标题也取自这次输入——唯一「用户明确表达意图」
         # 的文本，不需要额外调用模型。
-        await self._record_turn(normalized, title_hint=text, turn_delta=1)
+        recorded = await self._record_turn(normalized, title_hint=text, turn_delta=1, principal=principal)
+
+        # WHY 登记后再校验一次所有权：并发首条消息场景下，UPSERT 会以首个写入者
+        # 的 owner_id 为准；登记后回读可发现该会话是否已被他人抢先认领，
+        # 避免后续运行写入错误的 owner 上下文。
+        if recorded is not None and self._config.auth_mode != "disabled":
+            recorded_owner = recorded.get("owner_id") or ""
+            expected_owner = self._owner_id(principal)
+            if recorded_owner and recorded_owner != expected_owner:
+                logger.warning(
+                    "会话认领冲突：thread=%s expected_owner=%s actual_owner=%s",
+                    normalized, expected_owner, recorded_owner,
+                )
+                raise OwnershipError("会话", normalized)
+
+        await self._audit(
+            event_type="thread_run",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="stream",
+            outcome="success",
+        )
 
         # WHY 在返回生成器之前占用运行槽位：占用动作若留在生成器体内，就要等到
         # 首个事件被拉取时才执行，此时响应已经开始，ThreadBusyError 只能表现为
@@ -134,6 +242,7 @@ class RunService:
         thread_id: str,
         decision_payload: Any,
         *,
+        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """人工审批后恢复被中断的执行。
@@ -144,6 +253,7 @@ class RunService:
         Args:
             thread_id: 会话 ID。
             decision_payload: 审批结果，形如 ``{"decisions": [{"type": "approve"}]}``。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
 
         Returns:
@@ -152,6 +262,8 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法，或审批载荷格式非法。
             KeyError: 模型别名未注册。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权访问该会话。
             RuntimeError: 模型初始化或装配失败。
         """
         normalized = normalize_thread_id(thread_id)
@@ -160,11 +272,24 @@ class RunService:
         command = build_resume_command(decision_payload)
         graph = self._graph_factory.get(model_name)
 
-        logger.info("会话 %s 恢复执行", normalized)
+        await self._ensure_ownership(normalized, principal)
+
+        actor_id = principal.user_id if principal else "anonymous"
+        logger.info("会话 %s 恢复执行 actor=%s", normalized, actor_id)
 
         # WHY turn_delta=0：恢复是同一轮运行的延续，重复计数会让「对话轮数」
         # 与实际用户输入次数不符；但仍然要刷新活动时间。
         await self._record_turn(normalized, title_hint=None, turn_delta=0)
+
+        decisions = decision_payload.get("decisions") or []
+        await self._audit(
+            event_type="hitl_decision",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="resume",
+            outcome="success",
+            details={"decisions": [d.get("type") for d in decisions]},
+        )
 
         self._acquire_run_slot(normalized)
         return self._consume(graph, command, normalized)
@@ -282,6 +407,7 @@ class RunService:
         *,
         title_hint: str | None,
         turn_delta: int,
+        principal: Principal | None = None,
     ) -> None:
         """把本轮对话登记到元数据表。
 
@@ -293,6 +419,7 @@ class RunService:
                 thread_id,
                 title_hint=self._build_title(title_hint),
                 turn_delta=turn_delta,
+                owner_id=self._owner_id(principal),
             )
         except Exception:
             logger.exception("会话活动记录失败：thread=%s", thread_id)
