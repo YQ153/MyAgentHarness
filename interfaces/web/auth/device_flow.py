@@ -26,12 +26,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _device_flow_expires_at(config: AppConfig) -> str:
-    """按配置计算 device flow 过期时间（ISO8601 UTC）。"""
-    delta = timedelta(seconds=config.device_flow_expires_in_seconds)
-    return (datetime.now(timezone.utc) + delta).isoformat(timespec="seconds")
-
-
 def _device_flow_key_expires_at(config: AppConfig) -> str:
     """按配置计算 device flow 派生 API Key 的过期时间（ISO8601 UTC）。"""
     delta = timedelta(days=config.device_flow_api_key_expires_in_days)
