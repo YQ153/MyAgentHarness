@@ -20,10 +20,13 @@ from application.errors import NotFoundError, OwnershipError, PermissionDeniedEr
 from application.event_translator import LangGraphEventTranslator
 from application.events import AgentEvent, AgentEventType
 from application.interrupt_codec import build_resume_command
+from application.ownership import ensure_thread_access
 from application.principal import Principal
 from application.runnable import build_runnable_config
+from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
 from runtime.thread_store import ThreadMetaStore, normalize_thread_id
+from runtime.usage_store import UsageStore
 from text_utils import build_title
 
 if TYPE_CHECKING:
@@ -53,6 +56,10 @@ class RunHandle:
     """``time.monotonic()`` 口径的开始时间，用于超时判断与指标。"""
     cancel_event: asyncio.Event
     """停止信号；置位后运行在下一个分片边界被中止。"""
+    model_name: str | None = None
+    """本轮使用的模型别名；``None`` 表示默认模型（落用量时按配置解析）。"""
+    owner_id: str = ""
+    """会话所有者；用量记录按它聚合，认证关闭时为空串。"""
 
     @property
     def stop_requested(self) -> bool:
@@ -91,6 +98,7 @@ class RunService:
         thread_store: ThreadMetaStore,
         graph_factory: AgentFactory,
         audit_store: AuditStore | None = None,
+        usage_store: UsageStore | None = None,
     ) -> None:
         """构造运行服务。
 
@@ -99,6 +107,7 @@ class RunService:
             thread_store: 会话元数据存储，用于登记轮次与刷新活动时间。
             graph_factory: 图工厂，提供已装配的 LangGraph 图。
             audit_store: 审计日志存储，可选。
+            usage_store: Token 用量存储，可选；为 ``None`` 时不记录用量。
 
         Raises:
             ValueError: 任一必需依赖为 ``None``。
@@ -114,6 +123,7 @@ class RunService:
         self._thread_store = thread_store
         self._graph_factory = graph_factory
         self._audit_store = audit_store
+        self._usage_store = usage_store
 
         # WHY 用 threading.Lock 保护「运行中」登记表：加解锁之间不 await，
         # 临界区极短；更重要的是释放动作必须能在 finally 里同步完成——
@@ -160,6 +170,9 @@ class RunService:
     ) -> dict[str, Any]:
         """校验主体是否拥有该会话，并返回元数据记录。
 
+        判定规则统一在 ``application.ownership.ensure_thread_access``，
+        与会话服务、用量服务共用同一份语义。
+
         Args:
             allow_claim: 允许在未登记时「认领」该会话（用于 ``stream`` 首条消息场景）。
 
@@ -168,20 +181,13 @@ class RunService:
             OwnershipError: 无权访问。
         """
         record = await self._thread_store.get(thread_id)
-        if record is None:
-            if allow_claim:
-                return {}
-            raise NotFoundError("会话", thread_id)
-        if self._config.auth_mode == "disabled":
-            return record
-        if principal is None:
-            raise OwnershipError("会话", thread_id)
-        if principal.is_admin():
-            return record
-        owner_id = record.get("owner_id") or ""
-        if owner_id and owner_id != principal.user_id:
-            raise OwnershipError("会话", thread_id)
-        return record
+        return ensure_thread_access(
+            record,
+            thread_id,
+            self._config,
+            principal,
+            allow_claim=allow_claim,
+        )
 
     async def _audit(
         self,
@@ -307,7 +313,11 @@ class RunService:
         # 首个事件被拉取时才执行，此时响应已经开始，ThreadBusyError 只能表现为
         # 连接中断。占用成功后紧接返回生成器，中间不再有任何可能失败的语句，
         # 因此不会出现「占了槽位却没人为它收尾」。
-        handle = self._acquire_run_slot(normalized)
+        handle = self._acquire_run_slot(
+            normalized,
+            model_name=model_name,
+            owner_id=self._owner_id(principal),
+        )
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
         return self._consume(graph, payload, handle)
@@ -375,7 +385,11 @@ class RunService:
             details={"decisions": [d.get("type") for d in decisions]},
         )
 
-        handle = self._acquire_run_slot(normalized)
+        handle = self._acquire_run_slot(
+            normalized,
+            model_name=model_name,
+            owner_id=self._owner_id(principal),
+        )
         return self._consume(graph, command, handle)
 
     async def stop(
@@ -468,6 +482,11 @@ class RunService:
         thread_id = handle.thread_id
         try:
             async for event in self._iterate(graph, payload, handle):
+                if event.event is AgentEventType.USAGE:
+                    # WHY 在这里落库而不是在 _iterate 里：写库是带副作用的动作，
+                    # 而 _iterate 只负责翻译流。让「产出事件」与「持久化」分层，
+                    # 事件流本身在无存储的环境下（CLI、测试）依然完整。
+                    await self._record_usage(handle, event.payload)
                 yield event
         finally:
             # WHY 同步释放：客户端断开连接时这里可能正处于 GeneratorExit，
@@ -523,6 +542,27 @@ class RunService:
         except Exception as exc:
             logger.exception("会话 %s 运行失败", handle.thread_id)
             yield AgentEvent(AgentEventType.ERROR, {"message": str(exc)})
+
+        # WHY 无论正常结束、被用户停止还是运行出错都上报用量：三种情况下
+        # token 都已经被真实消耗了。停止与出错时拿到的只是「部分用量」，
+        # 但部分用量也比没有任何数字更能回答「这次花了多少」。
+        if translator.has_usage:
+            usage = translator.usage
+            logger.info(
+                "会话 %s 本轮用量：prompt=%d completion=%d",
+                handle.thread_id,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            )
+            yield AgentEvent(AgentEventType.USAGE, usage.as_payload())
+        else:
+            # WHY 缺失必须留日志而不是静默跳过：长期为 0 意味着 provider 换了
+            # 字段口径而本模块的映射没跟上，静默会让成本统计悄悄失真。
+            logger.warning(
+                "会话 %s 本轮未取到 token 用量（provider 未提供或字段口径变更），按 0 记录",
+                handle.thread_id,
+            )
+            yield AgentEvent(AgentEventType.USAGE, TokenUsage(0, 0).as_payload())
 
     def _track_event(self, event: AgentEvent, handle: RunHandle) -> None:
         """按事件类型维护运行治理所需的派生状态。
@@ -587,15 +627,26 @@ class RunService:
 
     # -------------------------------------------------------------- 并发控制
 
-    def _acquire_run_slot(self, thread_id: str) -> RunHandle:
+    def _acquire_run_slot(
+        self,
+        thread_id: str,
+        *,
+        model_name: str | None = None,
+        owner_id: str = "",
+    ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
         WHY 必须互斥：同一会话并发发起两轮会让图状态产生竞争——两轮各自读写
         同一 thread 的检查点，后写的一方会覆盖先写一方的中间结果，表现为消息
         丢失或工具结果错配。
 
+        WHY 把模型别名与所有者一起登记进句柄：用量在流结束时才落库，那一刻
+        已经拿不到本轮的参数；挂在句柄上才能「谁的模型、谁的用量」对齐。
+
         Args:
             thread_id: 已规范化的会话 ID。
+            model_name: 本轮使用的模型别名；``None`` 表示默认模型。
+            owner_id: 会话所有者；认证关闭时为空串。
 
         Returns:
             本次运行的句柄；停止请求与运行指标都通过它传递。
@@ -610,6 +661,8 @@ class RunService:
                 thread_id=thread_id,
                 started_at=time.monotonic(),
                 cancel_event=asyncio.Event(),
+                model_name=model_name,
+                owner_id=owner_id,
             )
             self._running[thread_id] = handle
             # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，
@@ -728,6 +781,33 @@ class RunService:
         except Exception:
             logger.exception("会话活动记录失败：thread=%s", thread_id)
             return None
+
+    async def _record_usage(self, handle: RunHandle, payload: dict[str, Any]) -> None:
+        """把本轮用量写入用量表。
+
+        WHY 吞掉异常：用量是旁路数据，写库失败不应让一次成功的对话变成
+        错误响应，也不该影响已经产出的事件流；失败会留下完整日志供告警，
+        代价只是这一轮的用量缺失。
+
+        Args:
+            handle: 本次运行的句柄，提供会话、模型别名与所有者。
+            payload: USAGE 事件的载荷（prompt / completion / total）。
+        """
+        if self._usage_store is None:
+            return
+
+        prompt = payload.get("prompt_tokens") or 0
+        completion = payload.get("completion_tokens") or 0
+        try:
+            await self._usage_store.record(
+                thread_id=handle.thread_id,
+                model=handle.model_name or self._config.default_model,
+                prompt_tokens=int(prompt),
+                completion_tokens=int(completion),
+                owner_id=handle.owner_id,
+            )
+        except Exception:
+            logger.exception("用量记录失败：thread=%s", handle.thread_id)
 
     async def _touch(self, thread_id: str) -> None:
         """刷新会话的最近活动时间。

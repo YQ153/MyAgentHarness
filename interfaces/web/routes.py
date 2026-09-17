@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from application.dto import ModelInfo
+from application.dto import ModelInfo, UsageSummary
 from application.errors import (
     NotFoundError,
     OwnershipError,
@@ -27,6 +27,7 @@ from application.principal import Principal
 from application.run_service import RunService
 from application.thread_id import normalize_thread_id
 from application.thread_service import ThreadService
+from application.usage_service import UsageService
 from interfaces.web.auth import get_principal, require_permission
 from interfaces.web.deps import require_state
 from interfaces.web.schemas import (
@@ -67,6 +68,11 @@ def get_catalog(request: Request) -> ModelCatalog:
     return require_state(request, "catalog", "模型目录")
 
 
+def get_usage(request: Request) -> UsageService:
+    """取出用量统计服务单例。"""
+    return require_state(request, "usage", "用量统计服务")
+
+
 def _validate_thread_id(thread_id: str) -> str:
     """校验路径参数中的会话 ID。
 
@@ -88,6 +94,46 @@ def _validate_thread_id(thread_id: str) -> str:
 async def list_models(catalog: ModelCatalog = Depends(get_catalog)) -> list[ModelInfo]:
     """列出可切换的模型。"""
     return catalog.list_models()
+
+
+@router.get("/usage", response_model=UsageSummary)
+async def get_usage_summary(
+    thread_id: str | None = Query(default=None, description="限定会话；不传表示当前主体可见的全部"),
+    days: int | None = Query(default=None, ge=1, description="统计窗口天数；不传取配置默认值"),
+    group_by: str = Query(default="model", description="聚合维度：model / thread / day"),
+    usage: UsageService = Depends(get_usage),
+    principal: Principal = Depends(require_permission("usage:read")),
+) -> UsageSummary:
+    """按用户 / 会话 / 时间窗汇总 token 用量。
+
+    WHY 走 ``usage:read`` 而不是复用 ``thread:read``：用量是跨会话的成本数据，
+    能读某条会话不等于能看整体开销；独立权限才能在只读角色上精确收口。
+
+    WHY 非管理员即使有权限也只看到自己的：服务层按 ``owner_id`` 收敛数据，
+    权限控制的是「能不能调这个接口」，不是「能看到谁的数据」。
+    """
+    try:
+        return await usage.summarize(
+            principal,
+            thread_id=thread_id,
+            days=days,
+            group_by=group_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except OwnershipError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("用量聚合失败")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
 
 
 @router.post("/threads", response_model=ThreadResponse)

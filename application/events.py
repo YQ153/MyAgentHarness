@@ -42,6 +42,9 @@ class AgentEventType(StrEnum):
     ERROR = "error"
     """运行期错误。"""
 
+    USAGE = "usage"
+    """本轮累计的 token 用量；在流结束（含被停止、出错）时上报一次。"""
+
     DONE = "done"
     """本轮运行结束。"""
 

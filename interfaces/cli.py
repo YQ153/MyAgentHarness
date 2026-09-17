@@ -62,6 +62,15 @@ def render_event(event: AgentEvent) -> None:
         pass
     elif event.event is AgentEventType.ERROR:
         print(f"\n[错误] {payload.get('message', '')}", flush=True)
+    elif event.event is AgentEventType.USAGE:
+        # WHY CLI 也打印用量：命令行是排障与压测的主战场，
+        # 「这次跑了多少 token」在这里比在网页上更常被问到。
+        print(
+            f"\n[用量] 输入 {payload.get('prompt_tokens', 0)} / "
+            f"输出 {payload.get('completion_tokens', 0)} / "
+            f"合计 {payload.get('total_tokens', 0)} tokens",
+            flush=True,
+        )
     elif event.event is AgentEventType.DONE:
         print("", flush=True)
 

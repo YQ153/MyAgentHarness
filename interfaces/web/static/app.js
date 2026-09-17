@@ -510,6 +510,24 @@
 
   /* ------------------------------------------------------------------ 事件处理 */
 
+  /** 渲染本轮 token 用量。 */
+  function appendUsage(data) {
+    if (!data) return;
+    const prompt = Number(data.prompt_tokens) || 0;
+    const completion = Number(data.completion_tokens) || 0;
+    const total = Number(data.total_tokens) || prompt + completion;
+    const text = `本轮用量 · 输入 ${prompt.toLocaleString()} / 输出 ${completion.toLocaleString()} / 合计 ${total.toLocaleString()} tokens`;
+
+    // 正常情况下 usage 事件先于 done 到达，此时助手消息节点还在
+    const node = el('div', 'msg usage', text);
+    if (state.assistantEl) {
+      state.assistantEl.appendChild(node);
+    } else {
+      els.messages.appendChild(node);
+    }
+    scrollToBottom();
+  }
+
   function handleEvent(name, data) {
     switch (name) {
       case 'token':
@@ -535,6 +553,12 @@
 
       case 'interrupt':
         renderApproval(data);
+        break;
+
+      case 'usage':
+        // WHY 用量挂在助手消息之后而不是单独一行：它描述的就是「刚结束的这
+        // 一轮花了多少」，脱离上下文摆放会被误读成整个会话的累计值。
+        appendUsage(data);
         break;
 
       case 'error':

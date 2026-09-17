@@ -357,6 +357,21 @@ textarea:focus { border-color: var(--accent); }
   font-size: 12px;
 }
 
+/* 本轮 token 用量：贴在助手消息内，用最小视觉权重表达「元信息」 */
+.msg.usage {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: normal;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+
 /* ---------- 窄屏：侧栏让位于对话区 ---------- */
 @media (max-width: 720px) {
   .sidebar { display: none; }

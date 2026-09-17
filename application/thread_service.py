@@ -21,6 +21,7 @@ from application.dto import (
     ThreadSummary,
 )
 from application.errors import NotFoundError, OwnershipError
+from application.ownership import effective_owner_id, ensure_thread_access
 from application.principal import Principal
 from application.runnable import build_runnable_config
 from runtime.audit_store import AuditStore
@@ -81,14 +82,10 @@ class ThreadService:
     def _effective_owner_id(self, principal: Principal | None) -> str | None:
         """根据认证模式返回查询时使用的 owner_id。
 
-        - disabled：返回 ``None``，列出全部（向后兼容）。
-        - 其他：返回 principal.user_id；未认证时会话层不处理，由路由层挡回。
+        判定规则见 ``application.ownership.effective_owner_id``——此处只做
+        转发，保证本服务与运行服务、用量服务的口径完全一致。
         """
-        if self._config.auth_mode == "disabled":
-            return None
-        if principal is None:
-            return "__unauthenticated__"
-        return principal.user_id
+        return effective_owner_id(self._config, principal)
 
     def _ensure_ownership(
         self,
@@ -103,20 +100,13 @@ class ThreadService:
             NotFoundError: 会话不存在。
             OwnershipError: 会话存在但当前主体无权访问。
         """
-        if record is None:
-            raise NotFoundError("会话", thread_id)
-
-        if self._config.auth_mode == "disabled":
-            return
-        if principal is None:
-            raise OwnershipError("会话", thread_id)
-        if principal.is_admin():
-            return
-        owner_id = record.get("owner_id") or ""
-        if owner_id and owner_id != principal.user_id:
-            raise OwnershipError("会话", thread_id)
-        if require_admin and not principal.is_admin():
-            raise OwnershipError("会话", thread_id)
+        ensure_thread_access(
+            record,
+            thread_id,
+            self._config,
+            principal,
+            require_admin=require_admin,
+        )
 
     async def _audit(
         self,

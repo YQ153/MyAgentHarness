@@ -62,6 +62,7 @@ PERMISSIONS = {
     "file:write": "FilesystemBackend write",
     "file:execute": "execute tool in sandbox/local mode",
     "system:models": "GET /api/models",
+    "usage:read": "GET /api/usage（用量统计）",
     "apikey:manage": "管理 API Key（创建/列出/吊销）",
     "audit:read": "读取审计日志",
     "admin:all": "所有资源的所有操作",
@@ -75,8 +76,18 @@ PERMISSIONS = {
 # 作为主防线要挡住的路径。
 ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
     "viewer": frozenset({"thread:read", "thread:list"}),
+    # WHY member 也有 usage:read：用量是「自己的成本」，与「读自己的会话」
+    # 同量级；不给的话成员连自己花了多少 token 都看不到，只能去翻审计。
+    # 服务层仍按 owner_id 收敛，拿到权限也读不到别人的数据。
     "member": frozenset(
-        {"thread:read", "thread:list", "thread:create", "hitl:approve", "file:read"}
+        {
+            "thread:read",
+            "thread:list",
+            "thread:create",
+            "hitl:approve",
+            "file:read",
+            "usage:read",
+        }
     ),
     "admin": frozenset(PERMISSIONS.keys()),
 }

@@ -93,6 +93,35 @@ class DeleteResult(BaseModel):
         return self.outcome is DeleteOutcome.DELETED
 
 
+class UsageGroup(BaseModel):
+    """按某一维度聚合出的一档用量。"""
+
+    key: str = Field(description="分组键：模型别名 / 会话 ID / 日期（YYYY-MM-DD）")
+    prompt_tokens: int = Field(description="输入 token 合计")
+    completion_tokens: int = Field(description="输出 token 合计")
+    total_tokens: int = Field(description="输入输出合计")
+    run_count: int = Field(description="该分组内的运行次数")
+
+
+class UsageSummary(BaseModel):
+    """一个时间窗内的用量汇总。
+
+    WHY 同时给出总计与分组：总计回答「这段时间花了多少」，分组回答
+    「花在哪个模型 / 哪个会话 / 哪一天」。只给前者无法定位，只给后者
+    需要调用方自己再算一遍总和。
+    """
+
+    window_days: int = Field(description="统计窗口天数")
+    since: str = Field(description="窗口起点（ISO8601 UTC，含）")
+    group_by: str = Field(description="分组维度：model / thread / day")
+    thread_id: str | None = Field(default=None, description="限定会话时为其 ID，否则为 None")
+    prompt_tokens: int = Field(description="输入 token 合计")
+    completion_tokens: int = Field(description="输出 token 合计")
+    total_tokens: int = Field(description="输入输出合计")
+    run_count: int = Field(description="运行次数")
+    groups: list[UsageGroup] = Field(description="按维度聚合的分档明细")
+
+
 class CheckResult(BaseModel):
     """单项依赖探测的结果。
 

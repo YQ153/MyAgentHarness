@@ -76,6 +76,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.runs = context.runs
             app.state.catalog = context.catalog
             app.state.health = context.health
+            app.state.usage = context.usage
 
             logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
             yield

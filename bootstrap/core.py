@@ -17,6 +17,7 @@ from application.health import HealthService
 from application.model_catalog import ModelCatalog
 from application.run_service import RunService
 from application.thread_service import ThreadService
+from application.usage_service import UsageService
 from bootstrap.context import AppContext
 from config import AppConfig
 from runtime.api_key_store import open_api_key_store
@@ -24,6 +25,7 @@ from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
 from runtime.device_flow_store import open_device_flow_store
 from runtime.thread_store import open_thread_store
+from runtime.usage_store import open_usage_store
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         open_audit_store(config.db_path) as audit_store,
         open_api_key_store(config.db_path) as api_key_store,
         open_device_flow_store(config.db_path) as device_flow_store,
+        open_usage_store(config.db_path) as usage_store,
     ):
         graph_factory = AgentFactory(config, checkpointer=checkpointer)
 
@@ -70,6 +73,7 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             thread_store=thread_store,
             graph_factory=graph_factory,
             audit_store=audit_store,
+            usage_store=usage_store,
         )
 
         context = AppContext(
@@ -97,6 +101,12 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
                 run_service=runs,
                 audit_store=audit_store,
                 catalog=catalog,
+            ),
+            usage_store=usage_store,
+            usage=UsageService(
+                config,
+                usage_store=usage_store,
+                thread_store=thread_store,
             ),
         )
 

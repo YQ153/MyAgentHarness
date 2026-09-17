@@ -19,6 +19,7 @@ from application.audit_context import bind_request_context, reset_request_contex
 from config import AppConfig
 from runtime.audit_store import AuditStore, open_audit_store
 from runtime.thread_store import ThreadMetaStore, open_thread_store
+from runtime.usage_store import UsageStore, open_usage_store
 
 
 def make_config(tmp_path: Path, **overrides: Any) -> AppConfig:
@@ -65,6 +66,13 @@ async def thread_store(tmp_path: Path) -> AsyncIterator[ThreadMetaStore]:
 async def audit_store(tmp_path: Path) -> AsyncIterator[AuditStore]:
     """落在临时目录里的审计日志存储。"""
     async with open_audit_store(tmp_path / "audit.db") as store:
+        yield store
+
+
+@pytest.fixture
+async def usage_store(tmp_path: Path) -> AsyncIterator[UsageStore]:
+    """落在临时目录里的 token 用量存储。"""
+    async with open_usage_store(tmp_path / "usage.db") as store:
         yield store
 
 

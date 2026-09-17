@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 
 from application.events import AgentEvent, AgentEventType
 from application.interrupt_codec import INTERRUPT_NODE, decode_interrupt
+from application.usage import TokenUsage, UsageAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,24 @@ class LangGraphEventTranslator:
         self._preview_limit = tool_result_preview_limit
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._last_node: str | None = None
+        self._usage = UsageAccumulator()
 
     # ---------------------------------------------------------------- 输入
+
+    @property
+    def usage(self) -> TokenUsage:
+        """本轮累计的 token 用量；未取到任何用量时为零值。
+
+        WHY 由翻译器持有累计器：用量随消息分片到达，与「工具参数分片」是
+        同一条流上的两个派生量，放在同一处才能保证「流走完就能读到用量」，
+        而不必让调用方再去遍历一次事件。
+        """
+        return self._usage.total
+
+    @property
+    def has_usage(self) -> bool:
+        """是否曾从流中取到用量字段。"""
+        return not self._usage.empty
 
     def feed(self, mode: str, chunk: Any) -> list[AgentEvent]:
         """消费一个流增量。
@@ -149,8 +166,13 @@ class LangGraphEventTranslator:
         return []
 
     def _on_ai_chunk(self, message: AIMessageChunk) -> list[AgentEvent]:
-        """翻译模型输出分片：文本增量与工具调用参数分片。"""
+        """翻译模型输出分片：文本增量、工具调用参数分片与 token 用量。"""
         events: list[AgentEvent] = []
+
+        # WHY 每个分片都尝试读用量：provider 上报位置不统一（有的只在最后一
+        # 片给全量，有的每片给累计值），逐片交给累计器判定比挑某一片可靠。
+        if not self._usage.add_raw(message):
+            logger.debug("模型分片未携带用量字段：node=%s", self._last_node)
 
         text = getattr(message, "text", None)
         if text:

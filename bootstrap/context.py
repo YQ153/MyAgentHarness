@@ -13,11 +13,13 @@ if TYPE_CHECKING:
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
     from application.thread_service import ThreadService
+    from application.usage_service import UsageService
     from config import AppConfig
     from runtime.api_key_store import APIKeyStore
     from runtime.audit_store import AuditStore
     from runtime.device_flow_store import DeviceFlowStore
     from runtime.thread_store import ThreadMetaStore
+    from runtime.usage_store import UsageStore
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,8 @@ class AppContext:
         runs: 运行推进服务。
         catalog: 可切换模型的只读目录。
         health: 健康检查与运行指标服务。
+        usage_store: Token 用量存储。
+        usage: 用量统计服务。
     """
 
     config: AppConfig
@@ -53,3 +57,5 @@ class AppContext:
     runs: RunService
     catalog: ModelCatalog
     health: HealthService
+    usage_store: UsageStore
+    usage: UsageService

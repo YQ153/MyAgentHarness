@@ -288,6 +288,21 @@ class AppConfig(BaseSettings):
     大小成正比，而与超期总量无关。
     """
 
+    # ---------------- 用量统计 ----------------
+    usage_default_window_days: int = Field(default=7, ge=1, le=3650)
+    """/api/usage 的默认统计窗口天数。
+
+    WHY 做成配置：不同团队的结算周期不同（按天看成本、按月看预算），
+    硬编码一个窗口会让多数组调用都要显式传参。
+    """
+
+    usage_max_window_days: int = Field(default=90, ge=1, le=3650)
+    """/api/usage 允许查询的最大窗口天数。
+
+    WHY 需要上限：窗口越大扫描的记录越多，无上限的接口可以被用来发起
+    一次全表聚合，进而拖慢同一数据库上的会话读写。
+    """
+
     # 认证端点限流
     auth_rate_limit_window_seconds: int = Field(default=60, ge=1)
     auth_rate_limit_max_attempts: int = Field(default=10, ge=1)

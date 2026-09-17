@@ -108,8 +108,10 @@ async def test_stop_mid_run_ends_with_stopped_done(test_config, thread_store):
     assert result == {"thread_id": "t1", "stopped": True, "reason": "requested"}
 
     events = await collector
-    # 停止不是错误：以 DONE(reason=stopped) 收尾，而非挂起或 ERROR
-    assert [event.event for event in events] == [AgentEventType.DONE]
+    # 停止不是错误：以 DONE(reason=stopped) 收尾，而非挂起或 ERROR。
+    # WHY 序列里多出 USAGE：停止只截断「还没产出的内容」，已经消耗的 token
+    # 是既成事实，必须照常上报，否则成本统计会系统性偏低。
+    assert [event.event for event in events] == [AgentEventType.USAGE, AgentEventType.DONE]
     assert events[-1].payload["thread_id"] == "t1"
     assert events[-1].payload["reason"] == "stopped"
 
@@ -131,7 +133,11 @@ async def test_stop_preserves_already_produced_events(test_config, thread_store)
 
     events = await collector
     # 已产出的 TOKEN 不丢失；未产出的部分不再等待
-    assert [event.event for event in events] == [AgentEventType.TOKEN, AgentEventType.DONE]
+    assert [event.event for event in events] == [
+        AgentEventType.TOKEN,
+        AgentEventType.USAGE,
+        AgentEventType.DONE,
+    ]
     assert events[0].payload["text"] == "第一段输出"
     assert events[-1].payload["reason"] == "stopped"
 
