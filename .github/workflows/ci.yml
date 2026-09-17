@@ -47,16 +47,6 @@ env:
   # Belt and braces for the encoding issue described above.
   PYTHONUTF8: "1"
 
-  # Coverage gate. Basis: a local full run on Windows with the source-package
-  # scope used below measured 72% (5821 statements, 1648 missed). The buffer is
-  # deliberate: runtime/sandbox/_winjob.py and the Job Object branches of
-  # runtime/host_shell.py can only execute on the Windows runner, so the Linux
-  # track is structurally lower for the same source tree. This is a regression
-  # guard, not a quality target -- tighten it to the first CI-measured value once
-  # the two-track numbers exist (they are attached to every run as
-  # coverage-<os>.xml).
-  COVERAGE_FAIL_UNDER: "65"
-
 jobs:
   test:
     name: test / ${{ matrix.os }}
@@ -66,8 +56,27 @@ jobs:
       # Do not stop the matrix on the first failure: the result of the other
       # platform is information we specifically want, not collateral damage.
       fail-fast: false
+      # Per-platform coverage gates, because the two tracks cannot be compared
+      # directly over the same source tree:
+      #   ubuntu  69.09% -- measured by CI on the first green run (5821 stmts /
+      #           1799 missed). Structurally lower: runtime/sandbox/_winjob.py
+      #           (225 stmts) is a Windows Job Object module and stays at 0% here,
+      #           and the runner has no WSL for runtime/sandbox/wsl_runner.py.
+      #           Partly offset by runtime/host_shell.py, whose POSIX branch is
+      #           covered far better on Linux (79%) than its Windows branch is on
+      #           Windows (51%).
+      #   windows 72.00% -- measured on a Windows machine with the same scope.
+      #           3 points of headroom on purpose: the CI runner has no WSL, so
+      #           wsl_runner.py is reached through a different set of paths than
+      #           on a developer machine that has one.
+      # Both are regression guards, not quality targets: raise them as the suite
+      # grows, never lower them just to turn a red build green.
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            coverage_fail_under: "68"
+          - os: windows-latest
+            coverage_fail_under: "69"
 
     steps:
       - name: Checkout
@@ -103,7 +112,7 @@ jobs:
           --cov=text_utils
           --cov-report=term
           --cov-report=xml
-          --cov-fail-under=${{ env.COVERAGE_FAIL_UNDER }}
+          --cov-fail-under=${{ matrix.coverage_fail_under }}
 
       - name: Enforce layered-architecture contracts
         # The 6 contracts in .importlinter: interfaces must not reach runtime
