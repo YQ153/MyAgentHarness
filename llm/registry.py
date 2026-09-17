@@ -332,28 +332,28 @@ def _is_available(spec: ModelSpec) -> bool:
     return bool(os.getenv(spec.base_url_env, "").strip())
 
 
-def build_default_registry(config: AppConfig) -> ModelRegistry:
-    """从配置构造注册表。
+def default_specs(config: AppConfig) -> list[ModelSpec]:
+    """返回全部候选模型定义（**含**因未配置而不会被注册的那些）。
 
-    DeepSeek 恒定注册（它是默认模型，也保证注册表非空）；OpenAI / Anthropic /
-    Ollama 按配置是否提供密钥（或地址）条件注册。新增 provider 只需在此追加
-    一条 ``ModelSpec``，其余代码无需改动。
+    WHY 单独暴露候选集：``build_default_registry`` 的返回值只包含「已注册」的
+    结果，于是「某个 provider 因为没配密钥被跳过」在返回值里不可见——要报告
+    这个原因，调用方只能自己复制一份可用性判定规则，而复制出来的规则迟早与
+    ``_is_available`` 分叉（表现是「脚本说没配、应用却说已注册」）。候选集与
+    注册过滤共用同一处定义，跳过原因就永远与真实注册规则一致。
 
-    前置条件：调用方必须已注册 HarnessProfile（见 ``agent.profiles``），
-    通常由装配层或 ``agent.graph.get_registry`` 完成。本函数刻意不自行注册，
-    以避免 ``llm`` 包反向依赖 ``agent`` 形成包级循环。
+    顺序有语义：**第一条恒定为注册项**（默认模型，也是注册表非空的保证），
+    其余按 ``_is_available`` 条件注册。
+
+    Args:
+        config: 应用配置，提供各 provider 的模型名与默认地址。
+
+    Returns:
+        候选 ``ModelSpec`` 列表；第一条恒定注册，其余条件注册。
     """
     if config is None:
         raise ValueError("config 不能为 None")
 
-    for env_name, value in (
-        ("DEEPSEEK_API_KEY", config.deepseek_api_key),
-        ("OPENAI_API_KEY", config.openai_api_key),
-        ("ANTHROPIC_API_KEY", config.anthropic_api_key),
-    ):
-        _ensure_env(env_name, value)
-
-    specs = [
+    return [
         ModelSpec(
             name="deepseek-flash",
             provider="deepseek",
@@ -365,9 +365,6 @@ def build_default_registry(config: AppConfig) -> ModelRegistry:
             base_url_env="DEEPSEEK_API_BASE",
             base_url_default=config.deepseek_api_base,
         ),
-    ]
-
-    optional_specs = (
         ModelSpec(
             name="openai",
             provider="openai",
@@ -400,9 +397,37 @@ def build_default_registry(config: AppConfig) -> ModelRegistry:
             base_url_env="OLLAMA_BASE_URL",
             base_url_default=config.ollama_base_url,
         ),
-    )
+    ]
 
-    for spec in optional_specs:
+
+def build_default_registry(config: AppConfig) -> ModelRegistry:
+    """从配置构造注册表。
+
+    候选集由 ``default_specs`` 给出；其中 DeepSeek 恒定注册（它是默认模型，
+    也保证注册表非空），OpenAI / Anthropic / Ollama 按配置是否提供密钥
+    （或地址）条件注册。新增 provider 只需在 ``default_specs`` 追加一条
+    ``ModelSpec``，其余代码无需改动。
+
+    前置条件：调用方必须已注册 HarnessProfile（见 ``agent.profiles``），
+    通常由装配层或 ``agent.graph.get_registry`` 完成。本函数刻意不自行注册，
+    以避免 ``llm`` 包反向依赖 ``agent`` 形成包级循环。
+    """
+    if config is None:
+        raise ValueError("config 不能为 None")
+
+    for env_name, value in (
+        ("DEEPSEEK_API_KEY", config.deepseek_api_key),
+        ("OPENAI_API_KEY", config.openai_api_key),
+        ("ANTHROPIC_API_KEY", config.anthropic_api_key),
+    ):
+        _ensure_env(env_name, value)
+
+    candidates = default_specs(config)
+    # WHY 取第一条恒定注册：即便它的密钥还没配也要在册，否则注册表为空会让
+    # 构造直接抛 ValueError、应用起不来；配置问题留给 probe_config 与首次请求
+    # 去暴露，那是能被用户看懂的位置。
+    specs = candidates[:1]
+    for spec in candidates[1:]:
         if _is_available(spec):
             specs.append(spec)
         else:

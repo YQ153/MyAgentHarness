@@ -34,7 +34,6 @@ from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.principal import Principal
 from application.run_service import RunService
-from application.thread_id import normalize_thread_id
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
@@ -51,6 +50,7 @@ from interfaces.web.schemas import (
     ThreadUpdateRequest,
 )
 from interfaces.web.sse import SSE_HEADERS, encode_sse
+from thread_utils import normalize_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ def get_memory_service(request: Request) -> MemoryService:
 def _validate_thread_id(thread_id: str) -> str:
     """校验路径参数中的会话 ID。
 
-    WHY 复用存储层的 ``normalize_thread_id``：会话 ID 的合法性规则只有一份定义，
+    WHY 复用中立模块的 ``normalize_thread_id``：会话 ID 的合法性规则只有一份定义，
     路由层只负责把 ``ValueError`` 翻译成 400，不再自己维护一套判断。
     """
     try:

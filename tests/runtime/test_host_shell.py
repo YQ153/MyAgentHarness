@@ -7,10 +7,13 @@ WHY 需要真跑进程：本模块存在的全部理由就是「超时/中止时
 from __future__ import annotations
 
 import sys
+import threading
 import time
+from typing import Any
 
 import pytest
 
+from runtime.execution_registry import abort_scope, bound_scope
 from runtime.host_shell import HostShellExecutor
 
 _HANG_SECONDS = 30
@@ -175,3 +178,61 @@ def test_timeout_kills_grandchild_process(tmp_path):
     if handle:
         kernel32.CloseHandle(handle)
     assert not handle, "孙进程在超时后仍然存活——进程树回收失效"
+
+
+# ------------------------------------------------------------------ 中止（stop）
+
+
+def test_abort_scope_kills_running_command(tmp_path):
+    """真跑进程：``abort_scope`` 必须让正在执行的命令立刻结束。
+
+    WHY 必须真起进程：登记处的单测只能证明「abort 被调到了」，而「进程真的没了」
+    与「``run()`` 立刻返回」是这条修复的全部意义所在，非真进程不可验证。本用例把
+    ``scripts/smoke_stop_kill.py`` 的真机结论固化进回归套件——此前那条结论只存在于
+    一次手工验证里，回归时无人守。
+
+    WHY 轮询登记而不是先等「命令已启动」的标记文件：``Popen`` 与
+    ``execution_registry.register`` 是先后两步，而子进程可能更早写下标记；先等标记
+    会测到「来不及登记」而不是「中止生效」。轮询 ``abort_scope`` 同时完成了
+    「等登记」与「下中止」两件事。
+    """
+    scope = "host-shell-abort"
+    outcome: dict[str, Any] = {}
+
+    def _work() -> None:
+        try:
+            # 作用域在工作线程内绑定，复刻真实链路：RunService 的 bound_scope 经
+            # LangGraph 的 copy_context 带进执行工具的那个线程。
+            with bound_scope(scope):
+                outcome["value"] = HostShellExecutor().run(
+                    _python(f"import time; time.sleep({_HANG_SECONDS})"),
+                    cwd=tmp_path,
+                    env={},
+                    timeout=60,
+                )
+        except BaseException as exc:  # noqa: BLE001 - 记录后交主线程断言
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_work, daemon=True)
+    started = time.monotonic()
+    worker.start()
+
+    aborted = 0
+    deadline = started + 20
+    while aborted == 0 and time.monotonic() < deadline:
+        aborted = abort_scope(scope)
+        if aborted == 0:
+            time.sleep(0.05)
+
+    assert aborted == 1, "命令没有登记到作用域，或中止没有送达"
+    worker.join(timeout=20)
+    assert not worker.is_alive(), "abort_scope 之后命令仍未结束——进程树没有被终止"
+    # 命令自身寿命 30 秒；若这里等到了它自然结束，说明中止根本没生效。
+    assert time.monotonic() - started < 25
+
+    assert "error" not in outcome, f"执行抛出异常：{outcome.get('error')!r}"
+    # 中止不是超时：进程被杀后等待立即返回，退出原因不应是 timeout。
+    assert outcome["value"].timed_out is False
+    # 登记表必须已清空——两条实现都在 finally 里反登记，残留会让下一次 stop
+    # 去碰一棵早就结束的进程树。
+    assert abort_scope(scope) == 0

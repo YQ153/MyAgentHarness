@@ -27,54 +27,30 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 
 from text_utils import build_title, collapse_whitespace
+from thread_utils import normalize_thread_id
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# WHY 硬上限放在存储层：即便调用方漏做校验，也不允许超长文本灌进数据库。
-MAX_THREAD_ID_CHARS = 128
 _MAX_TITLE_CHARS = 200
 _MAX_LIMIT = 200
 _MAX_TURN_DELTA = 100
 
 
-def normalize_thread_id(thread_id: str) -> str:
-    """校验会话 ID 并返回规范化结果。
-
-    WHY 做成模块级公开函数：会话 ID 的合法性校验此前在路由层、服务层与存储层
-    各写了一遍，三处的规则（是否 strip、长度上限多少、非字符串如何处理）随时
-    可能漂移。这里作为唯一实现，上层只负责把 ``ValueError`` 转成各自的语义
-    （HTTP 400 / 事件流错误帧）。
-
-    Args:
-        thread_id: 待校验的会话 ID。
-
-    Returns:
-        去除首尾空白后的会话 ID。
-
-    Raises:
-        ValueError: 非字符串、为空或超出长度上限。
-    """
-    if not isinstance(thread_id, str):
-        raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
-    normalized = thread_id.strip()
-    if not normalized:
-        raise ValueError("thread_id 不能为空")
-    if len(normalized) > MAX_THREAD_ID_CHARS:
-        raise ValueError(
-            f"thread_id 过长（{len(normalized)} > {MAX_THREAD_ID_CHARS}）"
-        )
-    return normalized
-
 def normalize_search_query(query: str | None) -> str | None:
     """校验并归一标题搜索关键字。
 
-    WHY 放在模块级并公开：与 ``normalize_thread_id`` 同理——搜索关键字的合法性
-    只有一份定义，应用层（决定回 400 还是 500）与存储层（拼接 LIKE 模式）各自
-    调用，避免「服务层放行、存储层拒绝」这种口径不一致；也让服务层的校验不依赖
-    「存储实现恰好也会校验」这一巧合。
+    WHY 放在模块级并公开：与 ``thread_utils.normalize_thread_id`` 同理——搜索
+    关键字的合法性只有一份定义，应用层（决定回 400 还是 500）与存储层（拼接
+    LIKE 模式）各自调用，避免「服务层放行、存储层拒绝」这种口径不一致；也让
+    服务层的校验不依赖「存储实现恰好也会校验」这一巧合。
+
+    WHY 留在存储层而不随 ``normalize_thread_id`` 一起下沉：它的上限直接源自标题
+    字段的入库硬上限（``_MAX_TITLE_CHARS``），存在理由是「被搜到的标题必落在 LIKE
+    模式长度内」——这是存储查询的约束；且它只被应用层与存储层使用，接口层不碰，
+    当前的依赖方向已合法，没有需要消除的门面。
 
     WHY 需要长度上限：搜索串会被拼进 LIKE 模式，超长输入除了无意义地扫描全表外
     没有任何作用；上限取与标题硬上限一致，保证能被搜到的标题一定在模式长度之内。

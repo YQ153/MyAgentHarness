@@ -28,9 +28,9 @@ from runtime.audit_store import AuditStore
 from runtime.thread_store import (
     ThreadMetaStore,
     normalize_search_query,
-    normalize_thread_id,
 )
 from text_utils import collapse_whitespace
+from thread_utils import normalize_thread_id
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
