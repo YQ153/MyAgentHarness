@@ -1,0 +1,123 @@
+# MyAgentHarness CI
+#
+# Responsibility: turn "605 tests" and "6 layered-architecture contracts" from a
+# human discipline into a rule that blocks the commit. Both used to be run by
+# hand on one developer's machine, which means they were skipped whenever it was
+# inconvenient -- exactly when a regression would slip through.
+#
+# WHY a two-track matrix (ubuntu + windows): the riskiest code in this repo is
+# process handling -- runtime/host_shell.py, runtime/sandbox/_winjob.py and the
+# cancellation path that has to kill a whole process tree. Those paths behave
+# differently per platform, and a Windows-only defect (for example: execute()
+# blocking on a pipe read because a grandchild inherited the write end) can
+# never be observed on a Linux runner. A single-OS pipeline would have looked
+# green while the shipped platform was broken.
+#
+# WHY actions are pinned to a commit SHA (with the release tag in a comment):
+# a tag is mutable and can be repointed at new code without review, a SHA cannot.
+# The comment keeps the pin auditable and easy to upgrade.
+#
+# WHY .importlinter is ASCII-only (see the file header): Windows Python reads
+# configuration with the locale encoding, so non-ASCII comments used to make
+# lint-imports crash with UnicodeDecodeError. PYTHONUTF8 is still exported below
+# as a second line of defence, not as the primary fix.
+
+name: CI
+
+on:
+  # 主干分支实际为 main（仓库已由 master 更名）；PR 与手动触发不限分支。
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded push has no value once a newer one exists: keep the newest run and
+# cancel the stale ones instead of queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The pipeline only reads the repository. Declaring it explicitly keeps a
+# compromised step (or a future added step) from inheriting write access it
+# never needed.
+permissions:
+  contents: read
+
+env:
+  # Belt and braces for the encoding issue described above.
+  PYTHONUTF8: "1"
+
+  # Coverage gate. Basis: a local full run on Windows with the source-package
+  # scope used below measured 72% (5821 statements, 1648 missed). The buffer is
+  # deliberate: runtime/sandbox/_winjob.py and the Job Object branches of
+  # runtime/host_shell.py can only execute on the Windows runner, so the Linux
+  # track is structurally lower for the same source tree. This is a regression
+  # guard, not a quality target -- tighten it to the first CI-measured value once
+  # the two-track numbers exist (they are attached to every run as
+  # coverage-<os>.xml).
+  COVERAGE_FAIL_UNDER: "65"
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Do not stop the matrix on the first failure: the result of the other
+      # platform is information we specifically want, not collateral damage.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # Pinned to the toolchain that generated uv.lock, so the CI resolver
+          # and the committed lock file cannot disagree about semantics.
+          version: "0.9.17"
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Sync dependencies (locked)
+        # --locked makes a stale lock file a build failure instead of something
+        # CI silently repairs while the developer never notices.
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run tests with coverage
+        # Scope is the application source packages only. Measuring the whole tree
+        # would fold 100%-covered test files into the denominator and report a
+        # flattering number for production code that nobody exercises.
+        run: >-
+          uv run pytest -q
+          --cov=agent
+          --cov=application
+          --cov=bootstrap
+          --cov=interfaces
+          --cov=llm
+          --cov=runtime
+          --cov=config
+          --cov=text_utils
+          --cov-report=term
+          --cov-report=xml
+          --cov-fail-under=${{ env.COVERAGE_FAIL_UNDER }}
+
+      - name: Enforce layered-architecture contracts
+        # The 6 contracts in .importlinter: interfaces must not reach runtime
+        # directly, llm must not depend on agent, runtime is a leaf, etc.
+        # Adding a stray `from runtime import ...` to the interface layer must
+        # fail here rather than be discovered during a later refactor.
+        run: uv run lint-imports
+
+      - name: Upload coverage report
+        # Runs even when tests failed, because the coverage of a failing run is
+        # still the evidence needed to decide the gate value.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.xml
+          if-no-files-found: ignore

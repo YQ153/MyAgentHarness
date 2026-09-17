@@ -5,8 +5,11 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-# 测试覆盖率产物：每次跑 pytest 都会重新生成，入库只会制造噪音
+# 测试与静态检查的缓存/产物：每次运行都会重新生成，入库只会制造噪音
 .coverage
+coverage.xml
+.pytest_cache/
+.import_linter_cache/
 
 # 虚拟环境
 .venv/
