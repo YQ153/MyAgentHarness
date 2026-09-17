@@ -11,6 +11,7 @@ import asyncio
 import pytest
 
 from runtime.audit_retention import AuditRetentionWorker
+from runtime.audit_store import expiry_cutoff
 
 
 class FakeAuditStore:
@@ -18,10 +19,12 @@ class FakeAuditStore:
 
     def __init__(self, *, fail_times: int = 0) -> None:
         self.calls: list[int] = []
+        self.cutoffs: list[str] = []
         self._fail_times = fail_times
 
-    async def purge_expired(self, *, retention_days: int) -> int:
+    async def purge_expired(self, *, retention_days: int, cutoff: str | None = None) -> int:
         self.calls.append(retention_days)
+        self.cutoffs.append(cutoff or "")
         if len(self.calls) <= self._fail_times:
             raise RuntimeError("审计库暂时不可用")
         return len(self.calls)
@@ -66,6 +69,8 @@ async def test_prune_once_delegates_retention_days():
 
     assert await worker.prune_once() == 1
     assert store.calls == [30]
+    # 截止时间由清理任务现算并透传，保证归档与删除用的是同一把尺子
+    assert store.cutoffs == [expiry_cutoff(30)]
 
 
 async def test_start_runs_immediately_and_then_periodically():

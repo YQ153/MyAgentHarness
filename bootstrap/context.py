@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
     from agent.graph import AgentFactory
+    from application.health import HealthService
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
     from application.thread_service import ThreadService
@@ -38,6 +39,7 @@ class AppContext:
         threads: 会话元数据服务。
         runs: 运行推进服务。
         catalog: 可切换模型的只读目录。
+        health: 健康检查与运行指标服务。
     """
 
     config: AppConfig
@@ -50,3 +52,4 @@ class AppContext:
     threads: ThreadService
     runs: RunService
     catalog: ModelCatalog
+    health: HealthService

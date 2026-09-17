@@ -63,6 +63,17 @@ class StopResponse(BaseModel):
     )
 
 
+class HealthResponse(BaseModel):
+    """存活探测结果。
+
+    WHY 不带任何依赖状态：存活探测的语义是「进程还在不在」，一旦掺入数据库
+    之类的依赖判断，一次依赖抖动就会让编排系统重启一个其实健康的进程。
+    """
+
+    status: Literal["ok"] = Field(description="进程存活标识，恒为 ok")
+    uptime_seconds: float = Field(description="进程已运行秒数")
+
+
 class ThreadResponse(BaseModel):
     """新会话的标识。"""
 
@@ -95,6 +106,7 @@ __all__ = [
     "DecisionPayload",
     "DeleteResponse",
     "EditedAction",
+    "HealthResponse",
     "HistoryMessage",
     "ModelInfo",
     "ResumeRequest",

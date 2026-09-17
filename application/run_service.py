@@ -122,6 +122,12 @@ class RunService:
         self._running: dict[str, RunHandle] = {}
         self._running_guard = threading.Lock()
 
+        # WHY 累计运行数与 HITL 挂起集合与运行登记表共用一把锁：三者都是
+        # 「本次运行的即时状态」，若各自加锁，指标采集会读到互相矛盾的组合
+        # （例如累计运行数已加一，但槽位尚未登记）。
+        self._started_runs = 0
+        self._hitl_pending: set[str] = set()
+
         logger.info(
             "RunService 就绪：mode=%s recursion_limit=%s",
             config.execution_mode.value,
@@ -258,6 +264,10 @@ class RunService:
         # 首条消息可能还未登记元数据，允许当前主体认领该会话。
         await self._ensure_ownership(normalized, principal, allow_claim=True)
 
+        # WHY 新一轮用户输入会作废此前悬着的审批请求：用户既已改口，那个
+        # 审批卡就不再代表当前意图；留着它只会让「待审批数」无限增长。
+        self.clear_hitl_pending(normalized)
+
         # WHY 在进入图之前取图：这一步会解析模型别名并真正初始化模型，
         # 把配置与密钥错误暴露在事件流开始之前。
         graph = self._graph_factory.get(model_name)
@@ -343,6 +353,10 @@ class RunService:
         graph = self._graph_factory.get(model_name)
 
         await self._ensure_ownership(normalized, principal)
+
+        # WHY 恢复即意味着那一次审批已被应答：挂起登记必须在此刻清除，
+        # 否则「待审批数」只会单调递增，失去作为运行治理指标的意义。
+        self.clear_hitl_pending(normalized)
 
         actor_id = principal.user_id if principal else "anonymous"
         logger.info("会话 %s 恢复执行 actor=%s", normalized, actor_id)
@@ -490,6 +504,7 @@ class RunService:
         try:
             async for mode, chunk in self._stream_graph(graph, payload, handle):
                 for event in translator.feed(mode, chunk):
+                    self._track_event(event, handle)
                     yield event
 
             # 流结束后冲出最后一批未发送的工具调用
@@ -508,6 +523,18 @@ class RunService:
         except Exception as exc:
             logger.exception("会话 %s 运行失败", handle.thread_id)
             yield AgentEvent(AgentEventType.ERROR, {"message": str(exc)})
+
+    def _track_event(self, event: AgentEvent, handle: RunHandle) -> None:
+        """按事件类型维护运行治理所需的派生状态。
+
+        WHY 单独成方法：``_iterate`` 是事件流的热路径，把状态维护内联进去
+        会让「翻译 → 转发」的主线被治理逻辑淹没；独立后新增一种需要跟踪的
+        事件类型只改这一处。
+        """
+        if event.event is AgentEventType.INTERRUPT:
+            # 中断意味着本轮运行已暂停等待人工决策，此刻登记挂起，
+            # 由 resume 或下一轮用户输入清除。
+            self.mark_hitl_pending(handle.thread_id)
 
     async def _stream_graph(
         self,
@@ -585,6 +612,9 @@ class RunService:
                 cancel_event=asyncio.Event(),
             )
             self._running[thread_id] = handle
+            # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，
+            # 放在 stream / resume 里会漏掉其中一条路径。
+            self._started_runs += 1
         return handle
 
     def release_run_slot(self, thread_id: str) -> None:
@@ -618,6 +648,54 @@ class RunService:
         """当前运行中的会话 ID 快照（供指标暴露）。"""
         with self._running_guard:
             return tuple(self._running)
+
+    @property
+    def started_runs(self) -> int:
+        """进程启动以来累计发起的运行次数。
+
+        WHY 做成指标：单看「运行中」只能知道当下忙不忙，累计值才能回答
+        「这台实例跑过多少轮」，是容量规划与异常检测的最小数据集。
+        """
+        with self._running_guard:
+            return self._started_runs
+
+    def mark_hitl_pending(self, thread_id: str) -> None:
+        """登记该会话有一个等待人工审批的中断。
+
+        WHY 由服务持有而不是让指标端点去遍历图状态：遍历需要对每个会话
+        调一次 ``aget_state``，成本随会话数线性增长；而中断事件在事件流里
+        已经出现过一次，登记是零成本的。
+
+        Args:
+            thread_id: 已规范化的会话 ID。
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id 必须是非空字符串")
+        with self._running_guard:
+            self._hitl_pending.add(thread_id)
+
+    def clear_hitl_pending(self, thread_id: str) -> None:
+        """清除该会话的待审批登记；会话本就没有挂起时是 no-op。
+
+        Args:
+            thread_id: 会话 ID。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id 必须是非空字符串")
+        with self._running_guard:
+            self._hitl_pending.discard(thread_id)
+
+    def pending_hitl_thread_ids(self) -> tuple[str, ...]:
+        """当前等待人工审批的会话 ID 快照。
+
+        WHY 需要这份登记：HITL 挂起的运行既不占运行槽位（图已经暂停），
+        也不是错误，只有单独记录才能被指标与后续的挂起 TTL 治理看到。
+        """
+        with self._running_guard:
+            return tuple(self._hitl_pending)
 
     # ------------------------------------------------------------------ 元数据
 

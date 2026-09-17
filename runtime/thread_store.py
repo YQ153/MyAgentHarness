@@ -355,6 +355,36 @@ class ThreadMetaStore:
             logger.warning("会话元数据不存在，无需删除：thread=%s", normalized_id)
         return deleted
 
+    # ------------------------------------------------------------------ 探测
+
+    async def ping(self) -> bool:
+        """探测数据库连通性。
+
+        WHY 需要一条与业务无关的语句：就绪探测不能依赖任何业务表的存在与
+        内容，否则「表还没建好」与「连接已断开」会混为一谈；``SELECT 1``
+        只验证连接可用，是探测的最小充分条件。
+
+        Returns:
+            ``True`` 表示连接可用。
+
+        Raises:
+            RuntimeError: 查询未返回结果行（连接已不可用）。
+            aiosqlite.Error: 数据库层异常，原样向上抛出，由调用方决定降级策略。
+        """
+        async with self._lock:
+            try:
+                async with self._conn.execute("SELECT 1") as cursor:
+                    row = await cursor.fetchone()
+            except Exception:
+                logger.exception("数据库连通性探测失败")
+                raise
+
+        if row is None:
+            # WHY 这里必须炸：连通性探测没有结果行意味着连接已失效，静默返回
+            # True 会让就绪探针把不可用的实例放进负载均衡。
+            raise RuntimeError("数据库连通性探测未返回结果行")
+        return True
+
     # ------------------------------------------------------------------ 读取
 
     async def get(self, thread_id: str) -> dict[str, Any] | None:

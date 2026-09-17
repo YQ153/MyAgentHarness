@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 from agent.graph import AgentFactory, get_registry
 from agent.profiles import ensure_profiles_registered
+from application.health import HealthService
 from application.model_catalog import ModelCatalog
 from application.run_service import RunService
 from application.thread_service import ThreadService
@@ -60,6 +61,17 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
     ):
         graph_factory = AgentFactory(config, checkpointer=checkpointer)
 
+        # WHY 注册表只构造一次：目录与就绪探测都只需要读它的规格清单，
+        # 构造两份既浪费一次规格解析，也让两处看到不同的默认模型视图。
+        registry = get_registry(config)
+        catalog = ModelCatalog(registry)
+        runs = RunService(
+            config,
+            thread_store=thread_store,
+            graph_factory=graph_factory,
+            audit_store=audit_store,
+        )
+
         context = AppContext(
             config=config,
             checkpointer=checkpointer,
@@ -75,13 +87,17 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
                 graph_factory=graph_factory,
                 audit_store=audit_store,
             ),
-            runs=RunService(
+            runs=runs,
+            catalog=catalog,
+            # WHY 健康检查复用同一个 run_service 实例：它的运行登记与挂起审批
+            # 集合就是指标的真相来源，另建一份只会读到永远为 0 的计数。
+            health=HealthService(
                 config,
                 thread_store=thread_store,
-                graph_factory=graph_factory,
+                run_service=runs,
                 audit_store=audit_store,
+                catalog=catalog,
             ),
-            catalog=ModelCatalog(get_registry(config)),
         )
 
         logger.info(

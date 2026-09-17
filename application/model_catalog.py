@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from application.dto import ModelInfo
 
 if TYPE_CHECKING:
-    from llm.registry import ModelRegistry
+    from llm.registry import ModelConfigProbe, ModelRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -58,3 +58,18 @@ class ModelCatalog:
         if not isinstance(name, str) or not name:
             return False
         return name in set(self._registry.names())
+
+    def probe(self, name: str | None = None) -> ModelConfigProbe:
+        """探测某个模型别名的配置是否可用于发起请求。
+
+        WHY 经由目录转发而不是让调用方直接持有注册表：注册表是 ``llm`` 层的
+        实现细节，目录才是应用层对模型能力的门面；这样探测逻辑只存在于一处，
+        调用方也无需为一次只读探测引入对 ``llm`` 的依赖。
+
+        Args:
+            name: 模型别名；``None`` 表示探测默认模型。
+
+        Returns:
+            探测结果，含是否可用与不可用原因。
+        """
+        return self._registry.probe_config(name)

@@ -7,6 +7,9 @@ dependencies = [
     "langgraph>=1.2.11",
     "langchain>=1.4.0",
     "langchain-deepseek>=1.1.0",
+    # 多 Provider 支持：按密钥存在性条件注册，未配置 Key 时不会加载对应后端
+    "langchain-openai>=1.6.2",
+    "langchain-anthropic>=1.7.2",
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.53.0",
     "pydantic-settings>=2.15.0",

@@ -103,6 +103,24 @@ class AppConfig(BaseSettings):
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
     default_model: str = "deepseek-flash"
+
+    openai_api_key: str = ""
+    """OpenAI 的 API Key；留空则不注册 ``openai`` 别名。"""
+
+    openai_api_base: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+
+    anthropic_api_key: str = ""
+    """Anthropic 的 API Key；留空则不注册 ``anthropic`` 别名。"""
+
+    anthropic_api_base: str = "https://api.anthropic.com"
+    anthropic_model: str = "claude-3-5-sonnet-latest"
+
+    ollama_base_url: str = "http://localhost:11434"
+    """本地 Ollama 服务地址；仅在显式设置 ``OLLAMA_BASE_URL`` 时注册该别名。"""
+
+    ollama_model: str = "llama3.1"
+
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     llm_timeout: float = Field(default=60.0, gt=0.0)
     llm_max_retries: int = Field(default=2, ge=0)
@@ -244,6 +262,30 @@ class AppConfig(BaseSettings):
 
     WHY 与保留天数分开配置：保留期决定「删什么」，间隔决定「多久扫一次」；
     小部署希望每天清一次，大表则可能需要更频繁地分批清理。
+    """
+
+    audit_archive_enabled: bool = True
+    """清理超期审计事件前是否先导出归档文件。
+
+    WHY 默认开启：保留期一到就删，等于把「过期」和「可丢弃」划了等号——
+    合规审计经常需要回溯保留期之前的记录。关闭后行为退化为「只删不导出」。
+
+    WHY 归档失败要拦住删除（fail-closed）：目录不可写时若照删不误，数据就是
+    静默丢失且无从补救；宁可让审计表继续增长并打出 ERROR 日志，也不能丢记录。
+    """
+
+    audit_archive_dir: Path = Field(default=Path("./.data/audit-archive"))
+    """超期审计事件的归档目录。
+
+    归档文件按批次写成 JSONL，运维可将其搬到对象存储后自行清理本目录。
+    """
+
+    audit_archive_batch_size: int = Field(default=500, ge=1, le=5000)
+    """单次归档批次的条数。
+
+    WHY 分批而不是一次读完：超期记录可能有几十万条，一次性载入内存会让
+    后台清理任务把进程内存顶上去；分批读取 + 分批落盘使峰值内存与批次
+    大小成正比，而与超期总量无关。
     """
 
     # 认证端点限流

@@ -91,3 +91,42 @@ class DeleteResult(BaseModel):
     def deleted(self) -> bool:
         """元数据是否确实被移除（用于接口层的布尔语义兼容）。"""
         return self.outcome is DeleteOutcome.DELETED
+
+
+class CheckResult(BaseModel):
+    """单项依赖探测的结果。
+
+    WHY 不只用布尔值：探测失败时运维需要知道「是数据库连不上，还是默认模型
+    没配密钥」，只有布尔值会让排查回到翻日志的老路。
+    """
+
+    name: str = Field(description="检查项标识，如 database / model")
+    ok: bool = Field(description="该项是否通过")
+    detail: str = Field(default="", description="失败原因；通过时为空串")
+
+
+class ReadinessReport(BaseModel):
+    """就绪探测汇总。
+
+    WHY 所有检查项都跑完再汇总而不是首个失败即返回：运维看到的是「哪几项
+    不健康」，一次请求拿到全貌远快于逐个试错。
+    """
+
+    ready: bool = Field(description="是否可对外提供服务")
+    checks: list[CheckResult] = Field(description="各项检查结果")
+
+
+class MetricsSnapshot(BaseModel):
+    """运行指标的瞬时快照。
+
+    WHY 只暴露计数而不暴露会话 ID：指标端点通常不设鉴权（探活与采集系统在
+    调用），计数足以支撑容量观察，ID 清单则会把用户的会话活动范围泄漏出去。
+    """
+
+    running_threads: int = Field(description="当前运行中的会话数")
+    started_runs: int = Field(description="进程启动以来累计发起的运行次数")
+    pending_hitl: int = Field(description="等待人工审批的会话数")
+    audit_events: int | None = Field(
+        default=None, description="审计事件总数；``None`` 表示本次采集失败"
+    )
+    uptime_seconds: float = Field(description="进程已运行秒数")

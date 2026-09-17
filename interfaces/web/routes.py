@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -29,6 +28,7 @@ from application.run_service import RunService
 from application.thread_id import normalize_thread_id
 from application.thread_service import ThreadService
 from interfaces.web.auth import get_principal, require_permission
+from interfaces.web.deps import require_state
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
@@ -54,28 +54,17 @@ def get_threads(request: Request) -> ThreadService:
     WHY 单例：图与 checkpointer 都是有状态的重量对象，每个请求新建会导致
     连接池耗尽，也会让同一 thread 在并发请求中读到不一致的状态。
     """
-    return _require_state(request, "threads", "会话服务")
+    return require_state(request, "threads", "会话服务")
 
 
 def get_runs(request: Request) -> RunService:
     """取出运行服务单例。"""
-    return _require_state(request, "runs", "运行服务")
+    return require_state(request, "runs", "运行服务")
 
 
 def get_catalog(request: Request) -> ModelCatalog:
     """取出模型目录单例。"""
-    return _require_state(request, "catalog", "模型目录")
-
-
-def _require_state(request: Request, attr: str, label: str) -> Any:
-    """从应用状态取服务，缺失时返回 500。"""
-    service = getattr(request.app.state, attr, None)
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{label}未初始化",
-        )
-    return service
+    return require_state(request, "catalog", "模型目录")
 
 
 def _validate_thread_id(thread_id: str) -> str:
@@ -174,6 +163,7 @@ async def get_history(
 async def delete_thread(
     thread_id: str,
     threads: ThreadService = Depends(get_threads),
+    runs: RunService = Depends(get_runs),
     principal: Principal = Depends(require_permission("thread:delete")),
 ) -> DeleteResponse:
     """删除会话。"""
@@ -192,6 +182,10 @@ async def delete_thread(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
+
+    # WHY 同步清理挂起审批登记：会话已被删除，若留着那条登记，「待审批数」
+    # 会永久多算一个永不存在的会话——指标一旦失真就没人再信它。
+    runs.clear_hitl_pending(normalized)
 
     return DeleteResponse(
         thread_id=result.thread_id,

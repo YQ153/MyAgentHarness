@@ -9,6 +9,7 @@ from __future__ import annotations
 import httpx
 
 from config import AppConfig
+from runtime.audit_archive import AuditArchive
 from runtime.audit_retention import AuditRetentionWorker
 from runtime.audit_store import AuditStore
 from runtime.rate_limiter import RateLimiter
@@ -52,6 +53,9 @@ def build_audit_retention_worker(config: AppConfig, audit_store: AuditStore) -> 
     Returns:
         尚未启动的清理任务；由调用方（Web lifespan）``start()``。
 
+    WHY 归档器在这里构造：``audit_archive_enabled`` 关掉时传 ``None``，
+    清理任务退化为「只删不导出」，无需在 runtime 层再判断开关。
+
     Raises:
         ValueError: ``config`` 或 ``audit_store`` 为 ``None``。
     """
@@ -60,8 +64,16 @@ def build_audit_retention_worker(config: AppConfig, audit_store: AuditStore) -> 
     if audit_store is None:
         raise ValueError("audit_store 不能为 None")
 
+    archive = (
+        AuditArchive(config.audit_archive_dir)
+        if config.audit_archive_enabled
+        else None
+    )
+
     return AuditRetentionWorker(
         audit_store,
         retention_days=config.audit_retention_days,
         interval_seconds=config.audit_retention_interval_seconds,
+        archive=archive,
+        batch_size=config.audit_archive_batch_size,
     )
