@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -227,6 +228,45 @@ def parse_list_config(value: object, *, field: str, separators: tuple[str, ...])
     raise ValueError(msg)
 
 
+def is_loopback_host(host: str | None) -> bool:
+    """判断监听地址是否只对本机可达。
+
+    WHY 用 ``ipaddress`` 而不是字符串白名单：``127.0.0.53``、``::1`` 与
+    ``[::1]`` 都是回环，逐个枚举必然漏；漏掉一个的后果是把本来安全的绑定
+    报成「暴露」，而这类误报出现几次之后，告警就会被当成噪音忽略——真正
+    危险的那次会一起被忽略。
+
+    Args:
+        host: 监听地址或主机名，允许 ``None``（未配置）。
+
+    Returns:
+        True 表示可判定为回环（IP 回环段，或 ``localhost``）；
+        ``None`` / 空白 / 无法解析的主机名一律返回 False——无法证明是本机时
+        按「可能对外」处理，宁可误报不可漏报。
+
+    Raises:
+        ValueError: ``host`` 既非 ``None`` 也非字符串。
+    """
+    if host is None:
+        return False
+    if not isinstance(host, str):
+        msg = f"host 必须是字符串或 None，实际：{type(host).__name__}"
+        logger.error("%s", msg)
+        raise ValueError(msg)
+
+    candidate = host.strip()
+    if not candidate:
+        return False
+    # ``[::1]`` 是 URL 里的 IPv6 字面量写法，直接交给 ip_address 会解析失败
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1].strip()
+
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return candidate.lower() == "localhost"
+
+
 class AppConfig(BaseSettings):
     """应用配置。
 
@@ -242,18 +282,21 @@ class AppConfig(BaseSettings):
     )
 
     # ---------------- 模型 ----------------
-    deepseek_api_key: str = ""
+    # 密钥类字段一律 repr=False：AppConfig 对象会出现在 pytest 断言失败输出、
+    # 日志与异常上报里，默认 repr 会把明文密钥一并带出去——这条路径不报错、
+    # 不告警，泄露发生时没有任何提示（回归见 tests/test_config_repr.py）。
+    deepseek_api_key: str = Field(default="", repr=False)
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
     default_model: str = "deepseek-flash"
 
-    openai_api_key: str = ""
+    openai_api_key: str = Field(default="", repr=False)
     """OpenAI 的 API Key；留空则不注册 ``openai`` 别名。"""
 
     openai_api_base: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
 
-    anthropic_api_key: str = ""
+    anthropic_api_key: str = Field(default="", repr=False)
     """Anthropic 的 API Key；留空则不注册 ``anthropic`` 别名。"""
 
     anthropic_api_base: str = "https://api.anthropic.com"
@@ -484,7 +527,7 @@ class AppConfig(BaseSettings):
     ``oidc``：启用 OIDC RP 认证，对接 Authentik 等自托管 IdP。
     """
 
-    auth_session_secret: str = ""
+    auth_session_secret: str = Field(default="", repr=False)
     """本地会话 Cookie 签名密钥；auth_mode != disabled 时必须提供且不少于 32 字节。"""
 
     auth_cookie_name: str = "harness_session"
@@ -496,7 +539,7 @@ class AppConfig(BaseSettings):
 
     # API Key 模式
     auth_api_key_header: str = "X-API-Key"
-    auth_api_key_dev: str = ""
+    auth_api_key_dev: str = Field(default="", repr=False)
     """开发用 API Key；生产环境应使用可轮换的 key store，禁止长期单 key。"""
 
     # OIDC Device Flow
@@ -570,7 +613,7 @@ class AppConfig(BaseSettings):
     oidc_issuer: str = ""
     """IdP 的 issuer URL，例如 https://auth.example.com/application/o/myagentharness/。"""
     oidc_client_id: str = ""
-    oidc_client_secret: str = ""
+    oidc_client_secret: str = Field(default="", repr=False)
     oidc_redirect_uri: str = ""
     oidc_scope: str = "openid profile email harness:threads:read harness:threads:write"
 
@@ -691,6 +734,49 @@ class AppConfig(BaseSettings):
         if isinstance(value, str):
             return value.strip() or None
         return value
+
+    def warn_if_unauthenticated_exposure(self, effective_host: str | None = None) -> bool:
+        """绑定非回环地址且未启用认证时，输出 ERROR 级告警。
+
+        WHY 告警而不是拒绝启动：本项目默认绑定 ``127.0.0.1``，硬拒绝会让
+        「改绑内网地址做联调」这类正当场景被误伤；要消除的只是「静默」——
+        一旦服务对非本机可达且没有任何认证，任何能访问该地址的客户端都能
+        直接使用 ``execute`` 等工具，操作者必须有机会看见这件事。
+
+        WHY 接受 ``effective_host`` 覆盖：``python main.py web --host`` 的
+        命令行参数优先于配置，若只读 ``self.host``，加一个 ``--host 0.0.0.0``
+        就能绕过本检查——检查必须盯住「最终真正绑定的地址」。
+
+        Args:
+            effective_host: 实际生效的监听地址；``None`` 表示取 ``self.host``。
+
+        Returns:
+            True 表示已发出告警（非回环 + 未启用认证）；False 表示无需告警
+            （绑定回环，或已启用认证）。
+
+        Raises:
+            ValueError: ``effective_host`` 既非 ``None`` 也非字符串。
+        """
+        if effective_host is not None and not isinstance(effective_host, str):
+            msg = f"effective_host 必须是字符串或 None，实际：{type(effective_host).__name__}"
+            logger.error("%s", msg)
+            raise ValueError(msg)
+
+        if self.auth_mode != "disabled":
+            # 已启用认证就不属于「未认证暴露」；此处若也告警，告警会失去指向性
+            return False
+
+        bind_host = self.host if effective_host is None else effective_host
+        if is_loopback_host(bind_host):
+            return False
+
+        logger.error(
+            "未认证暴露风险：监听地址 %r 不是本机回环，且 AUTH_MODE=disabled——"
+            "任何能访问该地址的客户端都可直接使用本服务（含 execute 工具）；"
+            "请改绑 127.0.0.1，或设置 AUTH_MODE=apikey|oidc",
+            bind_host,
+        )
+        return True
 
     def ensure_directories(self) -> None:
         """创建运行时必需的目录并记录真实落点。
