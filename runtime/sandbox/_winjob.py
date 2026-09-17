@@ -468,13 +468,31 @@ def _create_suspended_process(
 def _build_command_line(command: str, env: Mapping[str, str]) -> str:
     """拼接经 shell 执行的命令行。
 
-    WHY 只加 ``/d`` 不加外层引号：``/d`` 跳过注册表中的 AutoRun，避免宿主
-    配置悄悄注入命令；而不额外包裹引号是为了与 ``subprocess(shell=True)``
-    的行为保持一致——``local`` 档位正是这么跑的，命令解析语义一旦出现差异，
-    同一条命令在两个档位下表现不同，排查成本极高。
+    形态固定为 ``"<comspec>" /d /s /c "<command>"``：
+
+    - ``/d`` 跳过注册表中的 AutoRun，避免宿主配置悄悄注入命令；
+    - 外层引号 + ``/s`` 是让命令**原样**交给 cmd 的唯一可靠组合。cmd 对
+      ``/c`` 后的字符串有一套引号裁剪规则：当首字符是引号、且引号数量不
+      满足「仅两个且中间无特殊字符」时，它会剥掉首尾引号。于是
+      ``"C:\\Program Files\\x.exe" -c "a b"`` 这类「可执行路径带引号、
+      参数也带引号」的命令会被截成 ``C:\\...x.exe" -c "a b``，报
+      「不是内部或外部命令」。加 ``/s`` 并整体包一层引号后，cmd 只剥掉
+      我们加的这层，命令内部引号得以保留。
+
+      WHY 必须加这层：``local`` 档位走 ``subprocess(shell=True)``，而
+      CPython 拼出的正是 ``comspec /c "<command>"``（同样带外层引号）。
+      沙箱侧不加就会出现「同一条命令 local 能跑、sandbox 跑不了」的
+      档位间语义差异——那正是本函数要避免的东西。
+
+    Args:
+        command: 待执行的 shell 命令原文。
+        env: 已清洗的环境变量，用于取 ``COMSPEC``。
+
+    Returns:
+        可直接传给 ``CreateProcessW`` 的命令行。
     """
     comspec = env.get("COMSPEC") or "cmd.exe"
-    return f'"{comspec}" /d /c {command}'
+    return f'"{comspec}" /d /s /c "{command}"'
 
 
 def _build_env_block(env: Mapping[str, str]) -> ctypes.c_void_p:
