@@ -455,7 +455,11 @@ class AppConfig(BaseSettings):
     """需要加载的自定义工具模块（点分路径）。
 
     模块需提供 ``TOOLS``（工具或可调用对象列表）或 ``register_tools(registry)``
-    二者之一。WHY 走配置而不是在内核里 import：新增一个工具不应该修改内核
+    二者之一；钩子也可以声明第二个参数 ``register_tools(registry, config)``，
+    此时会拿到本配置对象——需要按配置决定「注册哪些工具、用什么阈值」的模块
+    必须用这种写法（``.env`` 里的值只进配置对象、不进 ``os.environ``，模块自己
+    去读环境变量是读不到的）。
+    WHY 走配置而不是在内核里 import：新增一个工具不应该修改内核
     代码，否则「工具集」就成了和内核同样的变更风险等级。
 
     WHY 加载失败要直接报错（而非跳过）：模块名写错与工具缺失一样，都会被
@@ -512,6 +516,50 @@ class AppConfig(BaseSettings):
     让审计表体积随对话量线性膨胀，反而冲淡真正需要留痕的扩展工具调用；
     而内置命令执行本身已由 HITL 审批留痕。排障内置工具行为时可临时打开。
     """
+
+    # ---------------- 联网工具（内置检索与抓取） ----------------
+    web_search_provider: Literal["none", "tavily", "searxng"] = "none"
+    """检索 provider。
+
+    WHY 默认 ``none`` 而不是某个真实 provider：联网检索会把用户的查询词
+    发给第三方，默认打开等于替用户做了这个决定。
+
+    ``tavily``：托管检索服务，需要密钥；``searxng``：自建元搜索，需要地址、
+    不需要密钥（与 ``ollama`` 同属「显式提供地址即可用」）。
+    """
+
+    web_search_api_key: str = Field(default="", repr=False)
+    """检索服务密钥；``searxng`` 不需要。"""
+
+    web_search_base_url: str = ""
+    """检索服务地址；留空时用 provider 的官方地址（``searxng`` 必须显式提供）。"""
+
+    web_search_timeout_seconds: float = Field(default=15.0, gt=0)
+    """单次检索请求的超时秒数。"""
+
+    web_search_max_results: int = Field(default=5, ge=1, le=20)
+    """检索返回的结果条数上限。
+
+    WHY 必须有上限：检索结果会整体进入上下文，条数不设限时一次检索就可能
+    挤掉对话历史；上限也直接决定上游计费量。
+    """
+
+    web_fetch_timeout_seconds: float = Field(default=20.0, gt=0)
+    """单次网页抓取请求的超时秒数。"""
+
+    web_fetch_max_chars: int = Field(default=20_000, ge=500, le=500_000)
+    """抓取正文的字符上限（超出部分截断并在输出中显式标注）。"""
+
+    web_fetch_max_redirects: int = Field(default=3, ge=0, le=10)
+    """允许跟随的 HTTP 重定向上限。
+
+    WHY 必须限制：每一跳都是一次新的出站请求，而下一跳的地址由**上一次响应
+    的 Location 头**决定——不设上限就等于把「还能访问哪些地址」的控制权交给
+    远端，而逐跳校验正是 SSRF 防线中最容易被绕过的一环。
+    """
+
+    web_user_agent: str = ""
+    """出站请求的 User-Agent；留空时用内置默认值。"""
 
     # ---------------- HTTP 服务 ----------------
     host: str = "127.0.0.1"

@@ -76,6 +76,29 @@ async def usage_store(tmp_path: Path) -> AsyncIterator[UsageStore]:
         yield store
 
 
+_HOST_ENV_LEAKS = ("CUSTOM_TOOL_MODULES", "MCP_SERVERS")
+"""会被 shell 导出、且会改变装配结果的列表型变量。"""
+
+
+@pytest.fixture(autouse=True)
+def _isolated_extension_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """清掉本机可能导出的扩展工具变量。
+
+    WHY 必须清：``make_config`` 的 ``_env_file`` 只挡 ``.env``，**挡不住真实环境
+    变量**。一旦 ``CUSTOM_TOOL_MODULES`` 被导出（例如为了试跑联网工具而
+    ``CUSTOM_TOOL_MODULES=web_tools`` 跑一条命令，或直接写进 shell 配置），
+    所有断言「没有扩展工具」的用例都会成片假失败——那种失败看起来像代码坏了，
+    实际只是本机环境不同。
+
+    WHY 用夹具而不是在 ``make_config`` 里给这些字段钉默认值：pydantic-settings 中
+    init 参数的优先级**高于**环境变量，钉死会让「验证环境变量解析」的那组用例
+    永远读不到自己设的值。删变量则两边都成立：用例内 ``setenv`` 照样生效，
+    其余用例拿到干净环境。
+    """
+    for name in _HOST_ENV_LEAKS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_request_context() -> Iterator[None]:
     """每个用例前后清理审计请求上下文。

@@ -12,6 +12,7 @@ WHY 需要「注册」而不是直接拼一个 list 传给 ``create_deep_agent``
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import threading
 from collections.abc import Callable, Iterable, Sequence
@@ -274,19 +275,53 @@ class ToolRegistry:
         return f"ToolRegistry(tools={len(self)})"
 
 
+def _accepts_config(hook: Callable[..., Any]) -> bool:
+    """判断注册钩子是否接受第二个位置参数（``config``）。
+
+    WHY 按签名判断而不是「先按两参调用、失败了再退回一参」：后者会把钩子
+    内部真实的 ``TypeError`` 误判成「这个钩子只收一个参数」，于是错误被
+    吞掉、工具静默缺失——这正是注册器要消灭的那类失败。
+
+    Args:
+        hook: 模块提供的 ``register_tools`` 可调用对象。
+
+    Returns:
+        ``True`` 表示应传入 ``config``。
+    """
+    try:
+        parameters = list(inspect.signature(hook).parameters.values())
+    except (TypeError, ValueError):
+        # 少数内建/扩展对象没有可读签名；保守按「不收 config」处理，
+        # 与本次扩展之前的行为一致，不会把原本能跑的模块变成加载失败。
+        return False
+
+    positional = [
+        item
+        for item in parameters
+        if item.kind in (item.POSITIONAL_ONLY, item.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) >= 2:
+        return True
+    return any(item.kind is item.VAR_POSITIONAL for item in parameters)
+
+
 def load_custom_tool_modules(
     modules: Sequence[str],
     registry: ToolRegistry,
+    *,
+    config: Any = None,
 ) -> list[str]:
     """按点分路径导入自定义工具模块并注册其中的工具。
 
     模块需提供下列二者之一：
     - ``TOOLS``：工具或可调用对象的可迭代对象；
-    - ``register_tools(registry)``：自行调用注册器的函数。
+    - ``register_tools(registry, config)``：自行调用注册器的函数。
+      第二个参数可省略（写成 ``register_tools(registry)``），此时不传配置。
 
     Args:
         modules: 模块点分路径列表。
         registry: 目标注册器。
+        config: 应用配置；仅当钩子声明了第二个位置参数时传入。
 
     Returns:
         成功加载的模块名列表。
@@ -299,6 +334,17 @@ def load_custom_tool_modules(
     WHY 导入失败直接抛出而不是跳过：模块名写错、依赖未装这类问题只会
     表现为「Agent 少了某个能力」，而少了哪个能力往往要等到某次对话失败
     才被发现；在启动期失败反而最便宜。
+
+    WHY 要能把配置传进去（2026-09-18 扩展）：此前的入口只给注册器，而
+    ``.env`` 里的值只进配置对象、不进 ``os.environ``，于是「需要密钥或阈值
+    的模块」根本读不到自己的配置——只能各自去读环境变量或重解析 ``.env``，
+    两条路都会绕开 ``config.py`` 这个唯一解析点。触发这个缺口的首个用例是
+    联网工具：它既要求「配置进 config.py」，又要求「密钥缺失时不注册」，
+    而这两个要求都以「模块能看到配置」为前提。
+
+    WHY 用签名判断而不是固定传两参：既有模块写的是
+    ``register_tools(registry)``，多传一个参数会让它们全部变成加载失败——
+    扩展点必须加法演进，不能要求所有已部署的模块跟着改。
     """
     if registry is None:
         raise ValueError("registry 不能为 None")
@@ -318,7 +364,14 @@ def load_custom_tool_modules(
         declared = getattr(module, "TOOLS", None)
 
         if callable(register_hook):
-            register_hook(registry)
+            if _accepts_config(register_hook):
+                # WHY 记录「拿到了配置」：模块按条件不注册任何工具是合法结果
+                # （缺密钥就该缺席），此时新增 0 个工具是预期而非故障，日志要
+                # 能区分这两种情况。
+                logger.debug("自定义工具模块 %s 接受配置参数", dotted)
+                register_hook(registry, config)
+            else:
+                register_hook(registry)
         elif isinstance(declared, Iterable):
             for item in declared:
                 registry.register(item, source=ToolSource.CUSTOM)

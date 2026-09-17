@@ -111,6 +111,8 @@ jobs:
           --cov=config
           --cov=text_utils
           --cov=thread_utils
+          --cov=web_safety
+          --cov=web_tools
           --cov-report=term
           --cov-report=xml
           --cov-fail-under=${{ matrix.coverage_fail_under }}

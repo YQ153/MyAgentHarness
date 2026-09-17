@@ -76,7 +76,7 @@ async def build_tool_bundle(config: AppConfig) -> ToolBundle:
 
     registry = ToolRegistry()
 
-    custom_modules = load_custom_tool_modules(config.custom_tool_modules, registry)
+    custom_modules = load_custom_tool_modules(config.custom_tool_modules, registry, config=config)
 
     mcp_statuses: tuple[MCPServerStatus, ...] = ()
     if config.active_mcp_servers():

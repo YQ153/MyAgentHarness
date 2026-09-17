@@ -204,6 +204,15 @@ JSON 数组（元素是对象，没有分隔符能表达）。
 | `MCP_LOAD_TIMEOUT_SECONDS` | `15` | 单台 MCP server 拉取工具清单的超时（秒） |
 | `MCP_FAIL_FAST` | `false` | 某台 server 加载失败时是否阻断启动；默认降级并写 ERROR 日志 |
 | `TOOL_AUDIT_BUILTIN` | `false` | 是否把内置工具（`read_file` / `execute` 等）的调用也写入审计 |
+| `WEB_SEARCH_PROVIDER` | `none` | 检索 provider：`none` / `tavily` / `searxng`；取值决定检索工具是否注册 |
+| `WEB_SEARCH_API_KEY` | 空 | `tavily` 的密钥；缺失时检索工具不注册（清单里不会出现「点了才报缺密钥」的条目） |
+| `WEB_SEARCH_BASE_URL` | 空 | 检索服务地址；`searxng` 必填（如 `http://127.0.0.1:8888`），`tavily` 留空用官方地址 |
+| `WEB_SEARCH_TIMEOUT_SECONDS` | `15` | 单次检索请求超时（秒） |
+| `WEB_SEARCH_MAX_RESULTS` | `5` | 检索结果条数上限（结果会整体进入上下文） |
+| `WEB_FETCH_TIMEOUT_SECONDS` | `20` | 单次抓取请求超时（秒） |
+| `WEB_FETCH_MAX_CHARS` | `20000` | 抓取正文的字符上限，超出部分截断并显式标注 |
+| `WEB_FETCH_MAX_REDIRECTS` | `3` | 跟随重定向的跳数上限；**每一跳都复检出站安全** |
+| `WEB_USER_AGENT` | 空 | 出站请求的 User-Agent；留空用内置默认值 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Web 监听地址与端口 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
 
@@ -216,6 +225,16 @@ JSON 数组（元素是对象，没有分隔符能表达）。
   （也接受 JSON 数组写法）。被导入的模块需提供 `TOOLS`（工具或可调用对象列表）
   或 `register_tools(registry)` 函数，二者之一。普通函数按类型注解生成参数
   schema，无需额外包装。
+  钩子也可以声明第二个参数 `register_tools(registry, config)` 从而拿到配置对象——
+  需要按配置决定「注册哪些工具、用什么阈值」的模块**必须**用这种写法：`.env` 里的值
+  只进配置对象、不进 `os.environ`，模块自己去读环境变量是读不到的。
+- **内置联网工具**：仓库自带 `web_tools` 模块（检索 + 抓取），**默认不加载**，
+  需要显式列入：`CUSTOM_TOOL_MODULES=web_tools`。
+  - `web_search` 只在 `WEB_SEARCH_PROVIDER` 已选且所需配置齐全时注册；
+  - `web_fetch` 加载即可用，但**只接受 http/https 的公网地址**：内网、回环、链路本地、
+    组播地址与云元数据端点一律拒绝（防 SSRF），重定向逐跳复检且不超过设定跳数；
+  - 信任边界：抓取的地址由模型给出，属不可信输入；`WEB_SEARCH_BASE_URL` 由运营方填写，
+    属受信配置（自建 SearXNG 跑在 `127.0.0.1` 是正当用法，不会被拦）。
 - **MCP 服务器**：`MCP_SERVERS` 是一个 JSON 数组，每项至少要有 `name`
   （仅允许 `[A-Za-z0-9_-]`，且必须唯一）与 `transport`：
 
