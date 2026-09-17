@@ -20,6 +20,7 @@ from application.errors import (
 )
 from application.events import AgentEventType
 from application.run_service import RunService
+from runtime import execution_registry as registry_module
 from tests.application.test_run_service import (
     FakeGraphFactory,
     SlowGraph,
@@ -66,6 +67,20 @@ class RecordingAuditStore:
 def _text_chunk(text: str) -> tuple[str, Any]:
     """构造一条 messages 流分片（与 LangGraph 的 (mode, (message, meta)) 形状一致）。"""
     return ("messages", (AIMessageChunk(content=text), {"langgraph_node": "model"}))
+
+
+@pytest.fixture(autouse=True)
+def _clear_execution_registry():
+    """每个用例结束后清空执行登记处。
+
+    WHY 必须清：登记处是**进程级**字典（终止请求来自事件循环线程、终止动作落在
+    工作线程，二者只能靠进程级共享状态相遇），而本文件的图替身只登记、不像
+    ``host_shell`` 那样在自己的 ``finally`` 里反登记。不清就会串味：前一个用例
+    遗留的句柄会被后一个用例的 ``abort_scope`` 命中，表现为计数断言莫名变多。
+    """
+    yield
+    with registry_module._guard:  # noqa: SLF001 - 测试专用清理
+        registry_module._registry.clear()  # noqa: SLF001
 
 
 # ------------------------------------------------------------------ 幂等语义
@@ -204,3 +219,74 @@ async def test_stop_audits_run_cancelled(test_config, thread_store):
     assert run_cancelled[0]["actor_id"] == "anonymous"
 
     await _drain(generator)
+
+
+# ------------------------------------------------------------------ 工具执行中段取消（D-4）
+
+
+class RecordingAbortHandle:
+    """最小可中止句柄：只记录被要求终止的次数。
+
+    WHY 不用真进程：本用例验证的是「stop → abort_scope → 句柄被终止」这条接线；
+    进程树是否真的消失、登记表是否被清理，由 ``tests/runtime/test_host_shell.py``
+    的真进程用例负责。两层分工明确，任一层坏掉都会被对应的用例抓住。
+    """
+
+    def __init__(self) -> None:
+        self.abort_calls = 0
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+
+
+class BlockingToolGraph:
+    """复刻「同步工具正在执行」：登记可中止句柄后长时间挂起。
+
+    WHY 走 ``execution_registry.register`` 这个真实入口：真实场景里 ``execute``
+    是同步工具，由 LangGraph 的 ``run_in_executor(copy_context)`` 调度到工作线程，
+    登记渠道正是这个函数。用同一入口复刻，才能验证作用域确实由 RunService 的
+    ``bound_scope`` 绑定——若测试自己造一个作用域，那么「绑错了会话」这类缺陷
+    照样能通过。
+    """
+
+    def __init__(self, delay: float = 30.0) -> None:
+        self.handle = RecordingAbortHandle()
+        self.registered = False
+        self._delay = delay
+
+    async def astream(
+        self,
+        payload: Any,
+        config: dict[str, Any] | None = None,
+        stream_mode: Any = None,
+        context: Any = None,
+    ) -> Any:
+        self.registered = registry_module.register(self.handle)
+        await asyncio.sleep(self._delay)
+        yield  # noqa: WPS328 不可达，仅为构造异步生成器
+
+
+async def test_stop_aborts_command_running_mid_tool(test_config, thread_store):
+    """工具执行中段的停止：已登记的命令句柄必须被真正中止。
+
+    WHY 这条断言在 T7 之前不可能成立：那时 ``stop`` 只置位取消标志，对工作线程里
+    正在跑的同步 ``execute`` 毫无影响——真机实测中命令会继续活完自己的寿命，
+    而 UI 已经复位，用户以为停了（见开发计划 T2 风险验证）。
+    """
+    graph = BlockingToolGraph()
+    service = _make_service(test_config, thread_store, graph)
+    collector = asyncio.ensure_future(_drain(await service.stream("t1", "run a tool")))
+    # 等图的第一轮迭代跑过登记那一步，用例前提才成立
+    await asyncio.sleep(0.05)
+    assert graph.registered is True, "句柄没有登记进作用域：RunService 的 bound_scope 接线失效"
+    assert graph.handle.abort_calls == 0
+
+    result = await service.stop("t1")
+
+    assert result == {"thread_id": "t1", "stopped": True, "reason": "requested"}
+    assert graph.handle.abort_calls == 1, "stop 没有把终止通知送到正在执行的命令"
+
+    events = await collector
+    assert events[-1].event is AgentEventType.DONE
+    assert events[-1].payload["reason"] == "stopped"
+    assert service.is_running("t1") is False
