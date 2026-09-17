@@ -549,12 +549,19 @@
 <pre><code>CompositeBackend(
     default = 上述三选一的 Backend,          # 工作区文件，与用户磁盘一致
     routes  = {"/memories/": StoreBackend(   # 跨会话长期记忆
-                  namespace=lambda rt: ("memories",),
+                  namespace=namespace_of_runtime,   # ("memories", &lt;user_id&gt;)
                   store=store)},
 )</code></pre>
 <p>
   WHY 必须拆分：长期记忆要跨会话存活，工作文件要与用户磁盘一致，两者生命周期不同，
-  单一 Backend 无法同时满足。命名空间固定为 <code>("memories",)</code> 以隔离其他业务数据。
+  单一 Backend 无法同时满足。命名空间以 <code>"memories"</code> 为根前缀隔离其他业务数据，
+  第二段是<strong>本轮运行的主体标识</strong>——最初这里写死为 <code>("memories",)</code>，
+  于是鉴权开启后所有用户共用一个记忆池：B 用户的 Agent 能读到 A 用户写下的内容。
+  主体经 LangGraph 的 <code>Runtime.context</code> 传入（见 <code>agent/run_context.py</code>），
+  而非 ContextVar：隐式环境态会让绕过服务层直接调图的代码静默落进别人的记忆池。
+  主体标识含 deepagents 不允许的字符（<code>|</code>、<code>/</code>、<code>*</code> 等）时，
+  改用 sha256 前 32 位作为组件，否则 <code>StoreBackend._validate_namespace</code>
+  会在工具调用期抛错，表现为「Agent 写不了记忆」。
 </p>
 
 <h3>6.3 <code>agent/guardrails.py</code>：安全边界</h3>
@@ -635,7 +642,7 @@
   checkpointer 就没有会话恢复能力，没有 thread_store 则会话清单永远是空的——两者都属于
   必须满足的前置条件。依赖在装配层（<code>interfaces/web/app.py</code> 的 lifespan 与
   <code>interfaces/cli.py</code> 的 <code>run_cli</code>）一次性构造后注入，服务自身
-  不再自行 <code>build_store</code> / <code>get_registry</code>。
+  不再自行 <code>open_store</code> / <code>get_registry</code>。
 </p>
 
 <h4><code>ThreadService</code> 公开方法</h4>
@@ -787,16 +794,29 @@
 <h3>8.2 <code>runtime/store.py</code>：长期记忆</h3>
 
 <p>
-  <code>build_store()</code>（<code>:16</code>）返回 <code>InMemoryStore</code>。
-  WHY 用内存实现：<code>/memories/</code> 承载的是跨会话的用户偏好与项目约定，体量极小；
-  引入外部存储会带来新的部署依赖与并发语义，收益不抵成本。
-  若后续需要多实例共享，替换此处实现即可——<code>StoreBackend</code> 只依赖 <code>BaseStore</code> 抽象。
+  <code>open_store()</code> 以异步上下文的方式提供
+  <code>langgraph.store.sqlite.aio.AsyncSqliteStore</code>，与检查点共用
+  <code>DB_PATH</code> 指向的同一个 SQLite 文件。WHY 用 SQLite 实现而不是
+  <code>InMemoryStore</code>：后者的生命周期与进程一致，重启即失，而文档与
+  <code>/memories/</code> 路由承诺的是「跨会话记忆」；而 SQLite 版 Store 由
+  <code>langgraph-checkpoint-sqlite</code> 附带，本项目已依赖该包，因此是零新增依赖的替换。
 </p>
 
-<div class="box danger">
-  <span class="t">数据易失性</span>
-  <code>InMemoryStore</code> 的生命周期与应用进程一致：<strong>进程重启后长期记忆内容丢失</strong>。
-  与之相对，会话消息本身由 SQLite 检查点持久化，重启后可续聊。
+<p>
+  两个必须显式设置的 PRAGMA：<code>journal_mode=WAL</code>（库级持久属性，但本模块
+  不应假设初始化顺序）与 <code>busy_timeout=5000</code>（<strong>连接级</strong>属性，
+  缺了它会在与审计 / 用量表并发写入时立刻抛 <code>database is locked</code>，而
+  Agent 写记忆恰好发生在运行中途）。必须用 <code>AsyncSqliteStore</code> 而非同步版：
+  图内的文件工具走异步 backend，而该实现的同步接口在事件循环里会直接抛
+  <code>InvalidStateError</code>。
+</p>
+
+<div class="box">
+  <span class="t">管理口径</span>
+  管理接口（<code>application/memory_service.py</code> + <code>GET/DELETE /api/memories</code>）
+  直接读写同一个 store 实例，命名空间同样按主体收敛，因此面板与 Agent 看到的是同一份数据。
+  存储层的键是<strong>去掉 <code>/memories</code> 挂载点</strong>的相对路径
+  （<code>/notes.md</code>），对外统一还原成 <code>/memories/notes.md</code>。
 </div>
 
 <h3>8.3 <code>runtime/thread_store.py</code>：会话元数据表</h3>
@@ -1240,8 +1260,8 @@ StreamingResponse(text/event-stream)
     <tr><td>会话消息与图状态</td><td><code>.data/agent.db</code>（SQLite）</td><td>持久，进程重启后可续聊</td></tr>
     <tr><td>工作文件（模型读写）</td><td><code>workspace/</code></td><td>持久，与用户磁盘一致</td></tr>
     <tr><td>会话元数据（标题 / 时间 / 轮次）</td><td><code>.data/agent.db</code> 的 <code>thread_meta</code> 表</td><td>持久，与检查点同库</td></tr>
-    <tr><td>长期记忆（<code>/memories/</code>）</td><td><code>InMemoryStore</code></td><td><strong>进程级</strong>，重启即失</td></tr>
-    <tr><td>长期记忆（<code>AGENTS.md</code>）</td><td><code>workspace/AGENTS.md</code></td><td>持久，作为 <code>memory</code> 参数加载</td></tr>
+    <tr><td>长期记忆（<code>/memories/</code>，Agent 自写）</td><td><code>.data/agent.db</code> 的 Store 表</td><td>持久，<strong>按主体隔离命名空间</strong></td></tr>
+    <tr><td>长期记忆（<code>AGENTS.md</code>，人工维护）</td><td><code>workspace/AGENTS.md</code></td><td>持久，作为 <code>memory</code> 参数加载</td></tr>
   </tbody>
 </table>
 
@@ -1275,8 +1295,14 @@ StreamingResponse(text/event-stream)
 </table>
 
 <p class="lede">
-  另有 <code>SKILL_DIRS</code>（默认 <code>./workspace/skills</code>）在代码中声明为列表字段
-  但没有对应的 <code>.env.example</code> 条目，属于可继续补充的文档缺口。
+  另有 <code>SKILL_DIRS</code>（默认 <code>./workspace/skills</code>）：已补进
+  <code>.env.example</code>，并按路径分隔符解析多目录（Windows <code>;</code>、
+  POSIX <code>:</code>，与 <code>PATH</code> 同口径）——路径本身可能含逗号，
+  按逗号切会把一个目录拆成两个不存在的目录，症状是「技能没加载」。
+  <code>SANDBOX_ENV_ALLOWLIST</code>、<code>CUSTOM_TOOL_MODULES</code> 用逗号分隔，
+  四个列表型字段统一由 <code>config.parse_list_config</code> 解析：
+  <code>pydantic-settings</code> 对 <code>list[...]</code> 默认按 JSON 解码，
+  不接管解析的话分隔符写法会在加载期抛一条与配置无关的 JSON 错误。
 </p>
 
 <!-- ============================================================ -->
@@ -1294,7 +1320,7 @@ StreamingResponse(text/event-stream)
     <tr>
       <td><code>langgraph</code></td><td>&gt;=1.2.11</td>
       <td>图执行与流式事件（<code>astream</code>）、状态读取（<code>aget_state</code>）、
-      <code>Command</code> 恢复、<code>interrupt</code> 机制、<code>InMemoryStore</code></td>
+      <code>Command</code> 恢复、<code>interrupt</code> 机制、<code>Runtime.context</code>（记忆归属透传）</td>
     </tr>
     <tr>
       <td><code>langchain</code></td><td>&gt;=1.4.0</td>
@@ -1415,7 +1441,9 @@ StreamingResponse(text/event-stream)
 <ul>
   <li><strong>模型供应商单一</strong>：注册表当前只注册 <code>deepseek-flash</code>，其余 provider 未接入。</li>
   <li><strong><code>sandbox</code> 档位未实现</strong>：需接入外部沙盒实现后才能启用。</li>
-  <li><strong>长期记忆非持久化</strong>：<code>InMemoryStore</code> 随进程消失；仅 <code>AGENTS.md</code> 是持久的。</li>
+  <li><strong>长期记忆无跨主体管理入口</strong>：记忆已持久化并按主体隔离，但
+    <code>GET/DELETE /api/memories</code> 只作用于调用者自己的那一份，管理员也无法
+    查看或清理他人记忆——跨主体读取需要独立的授权与审计设计，本期未做。</li>
   <li><strong>检查点单机</strong>：SQLite 不适合多副本部署，横向扩展需替换为共享存储（如 PostgreSQL 检查点）。</li>
   <li><strong>图缓存键不含 checkpointer</strong>：同一进程内切换 checkpointer 的场景需先改缓存键策略。</li>
   <li><strong>无鉴权与会话隔离</strong>：Web 端点没有身份认证，任何能访问端口的人都能创建与操作会话。
@@ -1432,9 +1460,13 @@ StreamingResponse(text/event-stream)
   <li>为 Web 增加鉴权，并让会话清单按用户维度隔离。</li>
   <li>实现 <code>sandbox</code> Backend（基于 <code>BaseSandbox</code> 或外部沙盒），
     在保持审批语义的前提下开放命令执行。</li>
-  <li>把 <code>InMemoryStore</code> 替换为持久化实现，使 <code>/memories/</code> 跨进程存活。</li>
+  <li><del>把 <code>InMemoryStore</code> 替换为持久化实现，使 <code>/memories/</code> 跨进程存活。</del>
+    已完成：换成 <code>AsyncSqliteStore</code>（与检查点同库），命名空间按主体收敛，
+    并补上记忆面板与 <code>memory_delete</code> 审计。</li>
   <li>解除 <code>llm.registry</code> → <code>agent.profiles</code> 的反向依赖，消除双向引用。</li>
-  <li>把 <code>SKILL_DIRS</code> 补进 <code>.env.example</code>，并考虑使用路径分隔符解析多目录。</li>
+  <li><del>把 <code>SKILL_DIRS</code> 补进 <code>.env.example</code>，并考虑使用路径分隔符解析多目录。</del>
+    已完成：<code>SKILL_DIRS</code> 按 <code>os.pathsep</code> 解析多目录并已写入
+    <code>.env.example</code>；<code>SANDBOX_ENV_ALLOWLIST</code> 的逗号写法同步生效。</li>
 </ol>
 
 <footer>

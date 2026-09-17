@@ -19,7 +19,7 @@
 | 人工审批（HITL） | 高危工具调用前暂停并请求确认，支持**批准 / 改写 / 拒绝 / 代答**四种决策 |
 | 会话持久化 | 基于 SQLite 异步检查点，进程重启后可续聊；刷新页面不丢上下文 |
 | 会话清单 | 独立元数据表登记标题、创建/活动时间与对话轮数；只收录**真正发过消息**的会话，Web 侧栏可切换历史 |
-| 长期记忆 | 加载 `workspace/AGENTS.md` 作为跨会话记忆 |
+| 长期记忆 | 两层：`workspace/AGENTS.md`（人工维护，随部署走）+ `/memories/`（Agent 自写，**按用户隔离**并落 SQLite，重启不丢）；Web 端「记忆」面板可查看与删除 |
 | 模型切换 | 每次请求可指定模型别名，也可走配置里的默认模型 |
 | 执行护栏 | 单次运行的模型调用次数、递归深度、shell 超时与输出长度均有上限 |
 
@@ -159,6 +159,11 @@ python scripts/smoke_sandbox.py
 
 全部配置集中在 `config.py`，通过 `.env` 或环境变量覆盖：
 
+列表型变量支持**分隔符**与 **JSON 数组**两种写法：`SKILL_DIRS` 用路径分隔符
+（Windows `;`、POSIX `:`，与 `PATH` 同口径——路径本身可能含逗号），
+`SANDBOX_ENV_ALLOWLIST` / `CUSTOM_TOOL_MODULES` 用逗号；`MCP_SERVERS` 只接受
+JSON 数组（元素是对象，没有分隔符能表达）。
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | 空 | DeepSeek 密钥，缺失时模型无法就绪 |
@@ -176,7 +181,7 @@ python scripts/smoke_sandbox.py
 | `SANDBOX_MAX_PROCESSES` | `64` | 活动进程数上限，防 fork bomb |
 | `SANDBOX_MAX_MEMORY_MB` | `2048` | 单进程内存上限（MB） |
 | `SANDBOX_CPU_PERCENT` | `50` | CPU 占用硬上限百分比（Windows Job Object） |
-| `SANDBOX_ENV_ALLOWLIST` | `PATH,SYSTEMROOT,...` | 传入子进程的环境变量白名单，其余一律不传 |
+| `SANDBOX_ENV_ALLOWLIST` | `PATH,SYSTEMROOT,...` | 传入子进程的环境变量白名单（逗号分隔），其余一律不传 |
 | `SANDBOX_NETWORK_MODE` | `none` | `none` 仅剔除代理类变量；进程级断网需管理员权限，本期不做 |
 | `SANDBOX_REQUIRE_APPROVAL` | `true` | 沙箱档位下是否仍需人工审批 |
 | `SHELL_TIMEOUT` | `120` | `local` 档位 shell 执行超时（秒） |
@@ -185,12 +190,53 @@ python scripts/smoke_sandbox.py
 | `RECURSION_LIMIT` | `100` | 图递归深度上限 |
 | `WORKSPACE` | `./workspace` | 文件工具的根目录（活动边界） |
 | `MEMORY_FILE` | `./workspace/AGENTS.md` | 长期记忆文件 |
-| `DB_PATH` | `./.data/agent.db` | SQLite 数据库（检查点表 + 会话元数据表） |
+| `DB_PATH` | `./.data/agent.db` | SQLite 数据库（检查点 + 会话元数据 + 审计 + 用量 + **长期记忆**） |
+| `SKILL_DIRS` | `./workspace/skills` | 技能目录，按顺序查找；多目录用路径分隔符（Windows `;` / POSIX `:`） |
 | `THREAD_TITLE_MAX_CHARS` | `24` | 会话列表标题的字符上限，超出以省略号截断 |
 | `AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期记录由定期任务删除 |
 | `AUDIT_RETENTION_INTERVAL_SECONDS` | `86400` | 审计保留清理任务的执行间隔（秒） |
+| `CUSTOM_TOOL_MODULES` | 空 | 自定义工具模块（点分路径，逗号分隔） |
+| `MCP_ENABLED` | `true` | MCP 总开关；未配置任何 server 时取何值都不建连 |
+| `MCP_SERVERS` | 空 | MCP 服务器清单（JSON 数组，见下节） |
+| `MCP_TOOL_NAME_PREFIX` | `true` | 为 MCP 工具名加 `服务器名_` 前缀，让同名冲突在注册期显式报错 |
+| `MCP_LOAD_TIMEOUT_SECONDS` | `15` | 单台 MCP server 拉取工具清单的超时（秒） |
+| `MCP_FAIL_FAST` | `false` | 某台 server 加载失败时是否阻断启动；默认降级并写 ERROR 日志 |
+| `TOOL_AUDIT_BUILTIN` | `false` | 是否把内置工具（`read_file` / `execute` 等）的调用也写入审计 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Web 监听地址与端口 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
+
+### 工具扩展（自定义工具 / MCP）
+
+工具集在**启动期**装配完成，装配失败会让进程起不来（除 MCP 降级外）——
+带着一个「少了工具」的 Agent 继续服务，只会把失败推迟到某次具体对话。
+
+- **自定义工具**：`CUSTOM_TOOL_MODULES=myapp.tools.weather,myapp.tools.others`
+  （也接受 JSON 数组写法）。被导入的模块需提供 `TOOLS`（工具或可调用对象列表）
+  或 `register_tools(registry)` 函数，二者之一。普通函数按类型注解生成参数
+  schema，无需额外包装。
+- **MCP 服务器**：`MCP_SERVERS` 是一个 JSON 数组，每项至少要有 `name`
+  （仅允许 `[A-Za-z0-9_-]`，且必须唯一）与 `transport`：
+
+```jsonc
+// stdio：必须提供 command；env 不继承宿主环境，需要什么就写什么，
+// 避免宿主机的 *_API_KEY 被第三方进程读走
+[{"name": "filesystem", "transport": "stdio", "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
+
+// sse / streamable_http / websocket：必须提供 url，headers 常用于承载令牌
+[{"name": "remote", "transport": "streamable_http",
+  "url": "https://mcp.example.com/mcp",
+  "headers": {"Authorization": "Bearer xxx"}}]
+```
+
+- **冲突处理**：自定义工具与 deepagents 内置工具同名，或两台服务器提供同名工具
+  时，注册期直接抛错而不是静默覆盖（后者会让内置工具「消失」，表现为
+  「Agent 突然不会读文件了」）。
+- **失败降级**：每台 MCP server 单独拉取、单独记录状态。任一台挂掉不会牵连
+  其余服务器；默认不阻断启动，失败原因通过 `GET /api/tools` 暴露。
+- **审计**：工具调用落 `tool_call` 审计，含 `tool` / `source` / `server` /
+  `status` / `elapsed_ms` 与截断后的 `args_preview`；未等到结果的调用记为
+  `interrupted`，工具报错记为 `error`。内置工具默认不落库。
 
 ---
 
@@ -201,6 +247,9 @@ Web 形态对外提供以下接口（均以 `/api` 为前缀）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/models` | 列出可切换的模型（不含任何密钥信息） |
+| `GET` | `/api/tools` | 列出生效工具（内置 + 自定义 + MCP）及每台 MCP 服务器的加载状态（需 `tool:read`） |
+| `GET` | `/api/memories` | 列出**当前主体自己**的长期记忆（需 `memory:read`） |
+| `DELETE` | `/api/memories/{path}` | 删除一条长期记忆（需 `memory:delete`）；删除不存在的条目仍返回 200 |
 | `POST` | `/api/threads` | 申请一个会话 ID；**不落库**，会话在首条消息被接受时才创建 |
 | `GET` | `/api/threads` | 列出全部会话（最近活动在前，支持 `limit` / `offset`） |
 | `GET` | `/api/threads/{thread_id}` | 读取会话历史，用于刷新后恢复上下文 |
@@ -233,6 +282,21 @@ SSE 事件类型：
 | `error` | 运行期错误 |
 | `done` | 本轮运行结束 |
 
+### 长期记忆：Agent 记住了什么，用户说了算
+
+Agent 通过 `write_file` 写进 `/memories/` 的内容会**跨会话保留**，并进入后续每一轮
+上下文；这与 `AGENTS.md`（人工维护、随部署分发）是两层不同的东西。
+
+- **存储**：落在 `DB_PATH` 指向的 SQLite（`langgraph-checkpoint-sqlite` 自带的 Store），
+  进程重启后仍在。浏览器端的「记忆」按钮打开面板，可查看正文并逐条删除，
+  删除会写 `memory_delete` 审计事件。
+- **隔离**：命名空间按主体收敛（`("memories", <user_id>)`），认证关闭时统一落在
+  `__anonymous__`。因此**跨用户不可见**，管理员在面板里同样只看得到自己的那一份。
+- **路径口径**：面板返回的 `path` 形如 `/memories/notes.md`，删除时把它直接拼在
+  `/api/memories` 后面即可（服务层同时接受相对挂载点的 `notes.md`）。
+- **上限**：单次最多返回 200 条、单条正文最多 4000 字符，超出时响应里的
+  `truncated` 为 `true`——截断与「记忆本来就这么少」必须能区分开。
+
 ---
 
 ## 八、目录结构
@@ -259,10 +323,17 @@ MyAgentHarness/
 
 - 若你在此前的版本下打开或刷新过页面，库里可能残留 `title=''` 且 `turn_count=0` 的空会话，
   需一次性手工清理：`DELETE FROM thread_meta WHERE title = '' AND turn_count = 0;`
-- 模型侧目前只接入 **DeepSeek** 一家供应商（其余 provider 未在注册表中注册）。
+- 模型侧**恒定注册 DeepSeek**，OpenAI / Anthropic / Ollama 按「是否提供密钥或地址」
+  条件注册（未配置则不出现在下拉框），避免把配置错误转嫁给终端用户；运行时故障
+  转移（调用失败自动切换供应商）尚未实现。
 - `sandbox` 档位已实现 Tier 0（进程沙箱）与 Tier 1（WSL 发行版）：两者都只做资源与
   进程树管控，**不是安全边界**，必须与人工审批配合使用；进程级网络隔离在 Windows 上
   需要管理员权限建防火墙规则，本期未做。Tier 1 另有两条越出沙箱的通路：发行版经
   `/mnt` 可读写宿主文件，且 WSL interop 允许从 Linux 侧启动 Windows 程序。
 - `docker` 沙箱档位尚未实现，显式指定会直接报错（不静默降级）。
-- 检查点为单机 SQLite，多副本部署需另行替换为共享存储（如 PostgreSQL 检查点）。
+- 检查点为单机 SQLite，多副本部署需另行替换为共享存储（如 PostgreSQL 检查点）；
+  长期记忆与它共用同一个文件，多副本部署时需一并替换。
+- 长期记忆按主体隔离，但**没有**「管理员查看/清理他人记忆」的入口：跨主体读取属于
+  另一类授权与审计设计，本期只做「自己看自己删」。主体标识含命名空间不允许的字符
+  （例如某些 IdP 的 `sub` 形如 `auth0|abc`）时会改用 sha256 前 32 位作为命名空间
+  组件，此时无法从命名空间反推主体，排障需对照日志里的告警。
