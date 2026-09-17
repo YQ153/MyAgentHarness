@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 
@@ -90,8 +91,12 @@ class TestResolvePathUnderRace:
         with pytest.raises(ValueError, match="Path traversal not allowed"):
             backend._resolve_path("/../etc/passwd")
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="C:/... 在 POSIX 上不是绝对路径而是普通相对目录名，会被解析到根内，越界前提不成立",
+    )
     def test_absolute_windows_path_outside_root_blocked(self, tmp_path: Path, race_resolve: None) -> None:
-        """根外绝对路径（如 ``C:/Windows``）仍被拒绝。"""
+        """根外绝对路径（如 ``C:/Windows``）仍被拒绝（Windows 盘符语义）。"""
         root = tmp_path / "workspace"
         root.mkdir()
         backend = _SafeBackend(root_dir=str(root), virtual_mode=True)
@@ -174,8 +179,12 @@ class TestWriteUnderRace:
 
 
 class TestToVirtualPath:
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="扩展前缀是 Windows 专有概念，POSIX 的 resolve() 既不产生也不保留它，该分支不可达",
+    )
     def test_prefixed_path_converted_without_error(self, tmp_path: Path) -> None:
-        """带前缀的真实路径能转换为虚拟路径，不再触发 ValueError。
+        """带前缀的真实路径能转换为虚拟路径，不再触发 ValueError（Windows 专有前缀）。
 
         输入本身带 ``\\\\?\\`` 前缀时，真实 ``resolve()`` 会保留前缀
         （``had_prefix=True``），无需打桩即可覆盖该分支。
@@ -191,8 +200,12 @@ class TestToVirtualPath:
 
         assert virtual == "/sub/file.txt"
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="同一输入的 POSIX 语义不同：ValueError 来自「不在根内」而非扩展前缀，会因错误原因通过",
+    )
     def test_official_to_virtual_path_fails_on_prefix(self, tmp_path: Path) -> None:
-        """对照实验：官方实现遇到前缀路径会抛 ValueError。"""
+        """对照实验：官方实现遇到前缀路径会抛 ValueError（Windows 专有前缀）。"""
         root = tmp_path / "workspace"
         root.mkdir()
         target = root / "sub" / "file.txt"
