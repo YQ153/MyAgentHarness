@@ -316,7 +316,7 @@
 │   ├── profiles.py         HarnessProfile 注册（提示词、子 Agent 开关）
 │   └── __init__.py         导出 build_agent / AgentFactory
 ├── application/            应用层：会话编排与对外协议
-│   ├── thread_service.py   ★ 会话服务：new_thread_id / list_threads / history / delete_thread
+│   ├── thread_service.py   ★ 会话服务：new_thread_id / list_threads / history / rename_thread / set_archived / delete_thread
 │   ├── run_service.py      ★ 运行服务：stream / resume（并发互斥与事件产出）
 │   ├── model_catalog.py    ★ 模型目录：list_models
 │   ├── event_translator.py ★ LangGraph 流增量 → AgentEvent
@@ -358,10 +358,10 @@
     <tr><td><code>agent/backends.py</code></td><td><code>build_backend()</code></td><td>校验工作区存在性；<code>sandbox</code> 档位显式抛 <code>NotImplementedError</code> 而非静默降级</td></tr>
     <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>:360</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>:76</code> 提供登记、轮次累加、列表与删除</td></tr>
     <tr><td><code>application/run_service.py</code></td><td><code>RunService.stream()</code> / <code>resume()</code></td><td>普通协程，<strong>在进入流之前</strong>完成校验与模型初始化；返回产出 <code>AgentEvent</code> 的异步迭代器</td></tr>
-    <tr><td><code>application/thread_service.py</code></td><td><code>ThreadService.history()</code> / <code>delete_thread()</code></td><td>删除返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分不存在 / 部分成功 / 失败</td></tr>
+    <tr><td><code>application/thread_service.py</code></td><td><code>ThreadService.history()</code> / <code>rename_thread()</code> / <code>set_archived()</code> / <code>delete_thread()</code></td><td>删除返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分不存在 / 部分成功 / 失败</td></tr>
     <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>:160</code></td><td>主循环 + <code>_run_turn()</code> <code>:133</code> 中断循环 + <code>ask_human()</code> <code>:80</code> 决策采集</td></tr>
     <tr><td><code>interfaces/web/app.py</code></td><td><code>create_app()</code> <code>:53</code></td><td>路由注册必须在静态挂载之前，否则 API 被 <code>/</code> 吞掉</td></tr>
-    <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>7 个端点，2 个以 SSE 返回</td></tr>
+    <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>13 个端点，2 个以 SSE 返回</td></tr>
   </tbody>
 </table>
 
@@ -650,8 +650,10 @@
   <thead><tr><th>方法</th><th>职责</th></tr></thead>
   <tbody>
     <tr><td><code>new_thread_id()</code></td><td><strong>只发号、不落库</strong>：会话的诞生时刻是「首条消息被接受」（见 <code>RunService.stream()</code>），因此此刻返回的 ID 在数据库中并不存在。仍由服务端发号是为了保留 <code>uuid4</code> 的不可预测性——端点无鉴权，客户端可自选 ID 就意味着能覆盖他人会话</td></tr>
-    <tr><td><code>list_threads()</code></td><td>返回 <code>ThreadListResult</code>；只查元数据表，不逐个读图状态</td></tr>
+    <tr><td><code>list_threads()</code></td><td>返回 <code>ThreadListResult</code>；只查元数据表，不逐个读图状态。支持标题关键字与「含已归档」；关键字在服务层先归一——依赖「存储实现恰好会校验」会让非法关键字从 400 变成 500，或者在换实现后静默全表匹配</td></tr>
     <tr><td><code>history()</code></td><td>用 <code>aget_state()</code> 读取历史；不存在的会话返回空列表，<strong>查询失败则抛错</strong>（不再把故障伪装成空列表）</td></tr>
+    <tr><td><code>rename_thread()</code></td><td>先查再改（与删除同源：无权访问时不能通过响应差异泄露会话是否存在），落 <code>thread_rename</code> 审计</td></tr>
+    <tr><td><code>set_archived()</code></td><td>归档 / 恢复（软删除），落 <code>thread_archive</code> 审计；<strong>不</strong>清理检查点、<strong>不</strong>改动用量——真正销毁数据仍然是 <code>delete_thread()</code></td></tr>
     <tr><td><code>delete_thread()</code></td><td>先删元数据再删检查点；返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分 <code>deleted</code> / <code>not_found</code> / <code>partial</code> / <code>failed</code></td></tr>
   </tbody>
 </table>
@@ -834,12 +836,26 @@
   <thead><tr><th>列</th><th>类型</th><th>说明</th></tr></thead>
   <tbody>
     <tr><td><code>thread_id</code></td><td>TEXT PRIMARY KEY</td><td>会话标识</td></tr>
-    <tr><td><code>title</code></td><td>TEXT</td><td>标题；空串表示尚未产生首轮对话</td></tr>
+    <tr><td><code>title</code></td><td>TEXT</td><td>标题；空串表示尚未产生首轮对话。自动标题按 <code>thread_title_max_chars</code> 截断，手动改名按 <code>thread_rename_max_chars</code> <strong>报错</strong>（不静默截断用户输入）</td></tr>
     <tr><td><code>created_at</code></td><td>TEXT</td><td>创建时间（ISO8601 UTC）</td></tr>
     <tr><td><code>updated_at</code></td><td>TEXT</td><td>最近活动时间，建有索引，清单即按此列倒序</td></tr>
     <tr><td><code>turn_count</code></td><td>INTEGER</td><td>用户对话轮数；恢复执行不重复计数</td></tr>
+    <tr><td><code>archived</code></td><td>INTEGER</td><td>软删除标记（0/1）。归档只是从默认清单里收起来：不影响历史、用量与正在运行的任务。<strong>改名与归档都不改 <code>updated_at</code></strong>——它们是清单操作而不是对话活动，刷新时间会把用户的列表顺序打乱</td></tr>
+    <tr><td><code>archived_at</code></td><td>TEXT</td><td>归档时刻；取消归档时清空，避免留下「已恢复但仍有归档时间」的矛盾记录</td></tr>
   </tbody>
 </table>
+
+<h4>清单过滤与搜索（<code>thread_store.py</code> 的 <code>_build_filters</code>）</h4>
+<p>
+  <code>list_threads()</code> 与 <code>count()</code> 共用同一个过滤条件构造器：
+  此前 owner 条件已在两处各写一遍，归档与搜索再加进来就是四份，而「总数与条数
+  口径不一致」的表现是<strong>「显示还有下一页却翻不到东西」</strong>。
+  搜索匹配标题，且对 <code>%</code> 与 <code>_</code> 做了 LIKE 转义——不转义时
+  搜「50%」会命中<strong>所有</strong>标题，现象是「结果变多了」，几乎不可能
+  联想到转义。老库升级路径由 <code>_MIGRATIONS</code> 的
+  <code>ALTER TABLE ... ADD COLUMN archived INTEGER NOT NULL DEFAULT 0</code>
+  承担：SQLite 会为既有行填默认值，因此升级后历史会话的可见性与升级前一致。
+</p>
 
 <h4>时间为什么存字符串（<code>:55</code>）</h4>
 <p>
@@ -1162,8 +1178,19 @@ uvicorn.run() → 触发 _lifespan：
     </tr>
     <tr>
       <td>列出会话</td>
-      <td><code>GET /api/threads</code></td>
-      <td>只读元数据表，按 <code>updated_at</code> 倒序分页返回，不触碰任何图状态</td>
+      <td><code>GET /api/threads?query=&amp;include_archived=</code></td>
+      <td>只读元数据表，按 <code>updated_at</code> 倒序分页返回，不触碰任何图状态；
+      <code>query</code> 只匹配<strong>标题</strong>——正文存在检查点的 msgpack BLOB 里，
+      逐条反序列化检索是另一个量级的成本，这条边界写在接口与文档上，比让它表现成
+      「搜索偶尔很慢」更诚实</td>
+    </tr>
+    <tr>
+      <td>重命名 / 归档</td>
+      <td><code>PATCH /api/threads/{id}</code></td>
+      <td>局部更新：<code>title</code> 与 <code>archived</code> 至少给一项，空请求体直接 400
+      （避免产出「返回成功但什么都没改」这种无法归因的结果）。权限走
+      <code>thread:update</code>——归档可逆、改名无破坏性，与「把数据删掉」不是同一风险量级。
+      两项同时给时在同一次请求内顺序执行，省掉「改成功了但归档失败了」的中间态</td>
     </tr>
     <tr>
       <td>读取历史</td>
@@ -1444,6 +1471,11 @@ StreamingResponse(text/event-stream)
   <li><strong>长期记忆无跨主体管理入口</strong>：记忆已持久化并按主体隔离，但
     <code>GET/DELETE /api/memories</code> 只作用于调用者自己的那一份，管理员也无法
     查看或清理他人记忆——跨主体读取需要独立的授权与审计设计，本期未做。</li>
+  <li><strong>会话搜索只覆盖标题</strong>：正文存在检查点的 msgpack BLOB 里，检索需要
+    逐条反序列化；要让正文可搜必须另建索引（会话导出 / 导入同样未做）。</li>
+  <li><strong>归档与删除都不中断正在运行的任务</strong>：运行持有自己的图与检查点句柄，
+    删掉元数据后它仍会跑到结束并把事件推给发起方——需要「删除即停止」的场景得由
+    调用方先调 <code>stop</code>。</li>
   <li><strong>检查点单机</strong>：SQLite 不适合多副本部署，横向扩展需替换为共享存储（如 PostgreSQL 检查点）。</li>
   <li><strong>图缓存键不含 checkpointer</strong>：同一进程内切换 checkpointer 的场景需先改缓存键策略。</li>
   <li><strong>无鉴权与会话隔离</strong>：Web 端点没有身份认证，任何能访问端口的人都能创建与操作会话。
