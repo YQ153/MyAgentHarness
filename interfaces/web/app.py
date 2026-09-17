@@ -15,7 +15,12 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from bootstrap.core import build_app_context
-from bootstrap.web import build_audit_retention_worker, build_http_client, build_rate_limiter
+from bootstrap.web import (
+    build_audit_retention_worker,
+    build_http_client,
+    build_rate_limiter,
+    build_run_governance_worker,
+)
 from config import AppConfig
 from interfaces.web.auth import router as auth_router
 from interfaces.web.health import router as health_router
@@ -50,10 +55,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             logger.exception("device flow 过期记录清理失败，不影响服务启动")
 
-        # WHY 整个启动段都包在 try/finally 里：http_client 与清理任务都在
+        # WHY 整个启动段都包在 try/finally 里：http_client 与后台任务都在
         # yield 之前创建，若构造阶段抛错而不进 finally，这两者会连同已装配的
         # 连接一起泄漏。
         retention_worker = None
+        governance_worker = None
         try:
             # WHY 只在 Web 形态启动保留清理：CLI 是一次性进程，跑一个常驻清理
             # 协程既无收益也会拖慢退出。清理任务会先立即执行一次，再进入周期。
@@ -64,6 +70,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # WHY 不阻断启动：审计清理是运维旁路能力，失败时保留全量日志
                 # 远好于让服务起不来；失败原因已记日志，可另行告警。
                 logger.exception("审计保留清理任务启动失败，审计日志将不再自动归档清理")
+
+            # WHY 运行治理同样只在长驻形态启动：运行超时与审批挂起 TTL 都是
+            # 「随时间推移才会触发」的收口，一次性进程跑不到那一刻。
+            governance_worker = build_run_governance_worker(config, context.runs)
+            try:
+                governance_worker.start()
+            except Exception:
+                logger.exception("运行治理任务启动失败，超时运行与超期审批将不再自动收口")
 
             # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
             # 保持既有路由代码不变。
@@ -81,8 +95,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
             yield
         finally:
-            # WHY 先停清理任务再关连接：清理任务持有 audit_store 连接，
+            # WHY 先停后台任务再关连接：清理任务持有 audit_store 连接，
             # 顺序颠倒会让它在关闭的连接上执行 DELETE。
+            # WHY 治理任务先于清理任务停止：治理会写审计事件，若先停下清理
+            # 任务无所谓，但若先关掉连接就会让最后一轮巡检半途报错。
+            if governance_worker is not None:
+                try:
+                    await governance_worker.stop()
+                except Exception:
+                    logger.exception("运行治理任务停止失败")
             if retention_worker is not None:
                 try:
                     await retention_worker.stop()

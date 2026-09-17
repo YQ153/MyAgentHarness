@@ -22,6 +22,7 @@ from tests.application.test_run_service import (
     FakeGraphFactory,
     _drain,
 )
+from tests.conftest import make_config
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,8 @@ async def test_metrics_starts_at_zero(test_config, thread_store, audit_store):
     assert snapshot.running_threads == 0
     assert snapshot.started_runs == 0
     assert snapshot.pending_hitl == 0
+    assert snapshot.timed_out_runs == 0
+    assert snapshot.expired_hitl == 0
     assert snapshot.audit_events == 0
     assert snapshot.uptime_seconds >= 0.0
 
@@ -242,6 +245,34 @@ async def test_metrics_counts_running_and_pending(test_config, thread_store, aud
     settled = await service.metrics()
     assert settled.running_threads == 0
     assert settled.started_runs == 2
+
+    # 治理计数：本用例没有超时也没有过期，两项都必须是 0——否则说明指标
+    # 把「运行过」当成了「被取消过」。
+    assert settled.timed_out_runs == 0
+    assert settled.expired_hitl == 0
+
+
+async def test_metrics_reports_governance_counts(tmp_path, thread_store, audit_store):
+    """WHY 必须让治理计数进指标：只看「运行中会话数」时，一个超时阈值配得
+    过小的实例会表现为「运行数永远是 0」，看起来比健康实例更健康。"""
+    service, runs = _make_health(
+        make_config(tmp_path, run_max_seconds=1, hitl_pending_ttl_seconds=1),
+        thread_store,
+        graph=ScriptedGraph(),
+        audit_store=audit_store,
+    )
+
+    inflight = await runs.stream("t1", "hang 长任务")
+    await asyncio.sleep(1.05)
+    runs.mark_hitl_pending("t2")
+    await asyncio.sleep(1.05)
+    await runs.enforce_governance()
+
+    snapshot = await service.metrics()
+    assert snapshot.timed_out_runs == 1
+    assert snapshot.expired_hitl == 1
+
+    await _drain(inflight)
 
 
 async def test_metrics_audit_events_none_when_store_missing(test_config, thread_store):

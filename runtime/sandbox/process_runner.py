@@ -13,13 +13,11 @@
 from __future__ import annotations
 
 import logging
-import os
-import signal
-import subprocess
 import sys
 from typing import TYPE_CHECKING
 
 from config import SandboxTier
+from runtime.host_shell import HostShellExecutor
 from runtime.sandbox.errors import SandboxError, SandboxPolicyError
 from runtime.sandbox.models import CommandRequest, CommandResult, SandboxPolicy
 
@@ -153,45 +151,19 @@ class ProcessSandboxRunner:
         request: CommandRequest,
         env: Mapping[str, str],
     ) -> tuple[str, str, int | None, bool]:
-        """POSIX 分支：自成进程组，超时向整组发送 ``SIGKILL``。"""
-        # noqa 说明：shell=True 是本档位的设计前提——命令来自 LLM 的自由文本。
-        with subprocess.Popen(  # noqa: S602
-            request.command,
-            shell=True,
-            cwd=str(request.cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        ) as process:
-            try:
-                stdout, stderr = process.communicate(timeout=request.timeout)
-            except subprocess.TimeoutExpired:
-                self._terminate_group(process, request.timeout)
-                # WHY 再收一次：进程被杀后缓冲区里已有输出仍要交还模型，
-                # 否则超时命令的「死前现场」全部丢失，排查无从下手。
-                try:
-                    stdout, stderr = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    stdout, stderr = "", ""
-                return stdout or "", stderr or "", _TIMEOUT_EXIT_CODE, True
-            return stdout or "", stderr or "", process.returncode, False
+        """POSIX 分支：委托给宿主机执行器（自成进程组 + 超时杀整组）。
 
-    def _terminate_group(self, process: subprocess.Popen[str], timeout: int) -> None:
-        """终止整个进程组。
-
-        WHY 用 ``killpg`` 而非 ``process.kill()``：后者只杀直接子进程，命令
-        fork 出的孙进程会残留；``start_new_session`` 已让子进程自成一组的
-        组号等于其 pid，据此整组消灭。
+        WHY 复用 ``HostShellExecutor``：Tier 0 与 local 档位在 POSIX 上的诉求
+        完全一致（超时杀整组、回收残余输出、关闭管道），各写一份迟早会在
+        「关管道」这类细节上分叉，而分叉的方向一定是「更难排查的残留」。
         """
-        logger.warning("命令执行超时（%ss），终止整个进程组", timeout)
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (OSError, ProcessLookupError, PermissionError) as exc:
-            logger.warning("终止进程组失败，回退为终止主进程：%s", exc)
-            process.kill()
+        result = HostShellExecutor().run(
+            request.command,
+            cwd=request.cwd,
+            env=env,
+            timeout=request.timeout,
+        )
+        return result.stdout, result.stderr, result.exit_code, result.timed_out
 
 
 def _clip(text: str, limit: int) -> tuple[str, bool]:

@@ -57,3 +57,23 @@ class PermissionDeniedError(RuntimeError):
     def __init__(self, permission: str) -> None:
         super().__init__(f"缺少权限：{permission}")
         self.permission = permission
+
+
+class InterruptExpiredError(RuntimeError):
+    """待审批的中断已超过挂起 TTL，本次审批不再被接受。
+
+    WHY 必须拒绝而不是照常恢复：审批卡对应的执行现场已经停留了远超预期的时间，
+    期间工作区文件、外部状态乃至模型对任务的理解都可能变了，用户「补一个批准」
+    的真实意图往往已不是当时那次调用；让它执行反而更危险。
+
+    对应 HTTP 409 Conflict：资源（那次中断）已不在可应答状态，
+    客户端应重新发起对话而不是重试本请求。
+    """
+
+    def __init__(self, thread_id: str, ttl_seconds: int) -> None:
+        super().__init__(
+            f"会话 {thread_id} 的审批请求已超过 {ttl_seconds} 秒未处理，"
+            f"本次审批已失效，请重新发起对话"
+        )
+        self.thread_id = thread_id
+        self.ttl_seconds = ttl_seconds

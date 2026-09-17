@@ -6,13 +6,19 @@ WHY 单独成模块：这些资源只有 Web 形态需要，放在 ``build_app_c
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import httpx
 
 from config import AppConfig
 from runtime.audit_archive import AuditArchive
 from runtime.audit_retention import AuditRetentionWorker
 from runtime.audit_store import AuditStore
+from runtime.interval_worker import IntervalWorker
 from runtime.rate_limiter import RateLimiter
+
+if TYPE_CHECKING:
+    from application.run_service import RunService
 
 
 def build_http_client() -> httpx.AsyncClient:
@@ -76,4 +82,36 @@ def build_audit_retention_worker(config: AppConfig, audit_store: AuditStore) -> 
         interval_seconds=config.audit_retention_interval_seconds,
         archive=archive,
         batch_size=config.audit_archive_batch_size,
+    )
+
+
+def build_run_governance_worker(config: AppConfig, run_service: RunService) -> IntervalWorker:
+    """按配置构造运行治理的定期巡检任务。
+
+    巡检内容（超时取消、审批挂起过期）由 ``RunService.enforce_governance``
+    决定；这里只负责「多久做一次」与「怎么让它在事件循环里跑起来」。
+
+    WHY 与审计清理同在此装配：两者都是只有长驻进程需要的后台协程，放在
+    ``bootstrap.core`` 会让 CLI 这种一次性进程背上常驻协程与退出等待。
+
+    Args:
+        config: 应用配置，提供巡检间隔。
+        run_service: 运行服务，提供 ``enforce_governance``。
+
+    Returns:
+        尚未启动的巡检任务；由调用方（Web 生命周期）``start()``。
+
+    Raises:
+        ValueError: ``config`` 或 ``run_service`` 为 ``None``。
+    """
+    if config is None:
+        raise ValueError("config 不能为 None")
+    if run_service is None:
+        raise ValueError("run_service 不能为 None")
+
+    return IntervalWorker(
+        run_service.enforce_governance,
+        interval_seconds=config.run_governance_interval_seconds,
+        name="run-governance",
+        detail=f"，运行上限 {config.run_max_seconds} 秒，审批 TTL {config.hitl_pending_ttl_seconds} 秒",
     )

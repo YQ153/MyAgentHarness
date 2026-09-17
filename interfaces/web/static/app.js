@@ -116,7 +116,12 @@
       } catch (err) {
         /* 响应体不是 JSON 时保持默认文案 */
       }
-      throw new Error(detail);
+      // WHY 带上状态码：同一句 detail 文案可能来自不同语义的失败（例如
+      // 「审核已过期」是 409、「未认证」是 401），调用方需要据此决定是
+      // 「提示后重试」还是「作废当前 UI 状态」，只有文案不足以判断。
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
     }
     return response;
   }
@@ -313,6 +318,17 @@
     scrollToBottom();
   }
 
+  /**
+   * 追加一条中性提示（非错误）。
+   *
+   * WHY 与错误分开：运行被系统终止（超时、审批过期）不是故障，用「错误：」
+   * 前缀会让用户以为服务坏了，从而反复重试——而重试恰恰解决不了超时。
+   */
+  function appendNotice(message) {
+    els.messages.appendChild(el('div', 'msg notice', message));
+    scrollToBottom();
+  }
+
   function appendToolCard(payload) {
     const card = el('div', 'tool');
     const head = el('div', 'tool-head');
@@ -502,7 +518,14 @@
       cardEl.remove();
       await handleStream(response);
     } catch (err) {
-      appendError(err.message);
+      // WHY 审批过期要作废旧卡片：那一次中断已经被服务端作废，卡片留着会让
+      // 用户以为「再点一次批准」还有用，而实际上服务端只会再回一次 409。
+      if (err.status === 409) {
+        cardEl.remove();
+        appendNotice(err.message || '该审批已失效，请重新发起对话');
+      } else {
+        appendError(err.message);
+      }
     } finally {
       setRunning(false);
     }
@@ -572,9 +595,15 @@
       case 'done':
         state.assistantEl = null;
         state.toolNodes = [];
-        // 用户主动停止：流正常关闭但内容不完整，给出可见反馈而不是静默截断
+        // 非正常收尾：流关闭但内容不完整，给出可见反馈而不是静默截断。
+        // WHY 区分两种原因：用户自己按的停止他知道，而超时是系统替他终止的，
+        // 若不点明「超时」，用户只会看到半截输出并以为界面卡了。
         if (data.reason === 'stopped') {
-          els.messages.appendChild(el('div', 'msg notice', '本轮已停止'));
+          appendNotice('本轮已停止');
+        } else if (data.reason === 'timeout') {
+          appendNotice('本轮已因超时被系统终止，请缩短任务或拆分为多轮');
+        } else if (data.reason) {
+          appendNotice(`本轮已结束（${data.reason}）`);
         }
         scrollToBottom();
         // WHY 结束时刷新清单：标题与最近活动时间正是在本轮结束时刷新的，

@@ -122,9 +122,14 @@ class HealthService:
     async def metrics(self) -> MetricsSnapshot:
         """采集运行指标快照。
 
+        WHY 把治理计数（超时取消、审批过期）纳入指标：它们正是「系统是否在
+        自动收口异常运行」的唯一证据。若只看「运行中会话数」，一个超时阈值
+        配得过小的实例表现为「运行数永远是 0」，看起来比健康的实例更健康。
+
         Returns:
-            运行中会话数、累计运行数、等待审批数、审计事件总数与进程运行时长；
-            审计存储不可用或查询失败时 ``audit_events`` 为 ``None``。
+            运行中会话数、累计运行数、等待审批数、被超时取消的运行数、
+            被作废的超期审批数、审计事件总数与进程运行时长；审计存储不可用
+            或查询失败时 ``audit_events`` 为 ``None``。
         """
         audit_events: int | None = None
         if self._audit_store is not None:
@@ -140,6 +145,8 @@ class HealthService:
             running_threads=len(self._run_service.running_thread_ids()),
             started_runs=self._run_service.started_runs,
             pending_hitl=len(self._run_service.pending_hitl_thread_ids()),
+            timed_out_runs=self._run_service.timed_out_runs,
+            expired_hitl=self._run_service.expired_hitl,
             audit_events=audit_events,
             uptime_seconds=self.uptime_seconds,
         )

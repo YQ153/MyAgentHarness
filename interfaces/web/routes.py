@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from application.dto import ModelInfo, UsageSummary
 from application.errors import (
+    InterruptExpiredError,
     NotFoundError,
     OwnershipError,
     PermissionDeniedError,
@@ -337,6 +338,14 @@ async def resume_agent(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except InterruptExpiredError as exc:
+        # WHY 必须排在 RuntimeError 之前：它是 RuntimeError 的子类，顺序颠倒
+        # 时「审批已过期」会被当成未捕获的服务异常回成 500，用户看到的就不是
+        # 「请重新发起」而是「服务器内部错误」。
+        logger.info("拒绝已过期的审批：thread=%s", normalized)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc

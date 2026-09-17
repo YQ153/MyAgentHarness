@@ -212,6 +212,33 @@ class AppConfig(BaseSettings):
     max_model_calls_per_run: int = Field(default=60, gt=0)
     recursion_limit: int = Field(default=100, gt=0)
 
+    # ---------------- 运行治理 ----------------
+    run_max_seconds: int = Field(default=900, ge=0)
+    """单轮运行的最长秒数；超时由后台巡检协程强制取消。
+
+    WHY 必须有：模型调用卡在网络层、工具死循环、用户忘记点停止，都会让一轮
+    运行无限期占用槽位——该会话此后无法再发起任何对话，只能重启进程。
+
+    WHY 允许 ``0``：CLI 的一次性长任务与联调场景需要关闭它，而「不限制」是
+    一个显式选择，不应靠把阈值调到极大来变相实现。
+    """
+
+    hitl_pending_ttl_seconds: int = Field(default=1800, ge=0)
+    """人工审批挂起的最长等待秒数；超期未决策的中断被标记过期。
+
+    WHY 必须有：审批卡一旦无人处理就永久挂起——它既不占运行槽位（图已暂停），
+    也不算错误，只有 TTL 能让「等待审批数」这个指标重新可信。
+
+    WHY 允许 ``0``：与 ``run_max_seconds`` 同理，仅用于本地联调。
+    """
+
+    run_governance_interval_seconds: int = Field(default=30, ge=1)
+    """运行治理协程的巡检间隔（秒）。
+
+    WHY 与两个阈值分开配置：阈值决定「判什么为超时 / 过期」，间隔决定「多久
+    扫一次」；间隔即超时判定的最大误差，短间隔更精确但更频繁地取运行快照。
+    """
+
     # ---------------- HTTP 服务 ----------------
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)

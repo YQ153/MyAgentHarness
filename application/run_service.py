@@ -16,7 +16,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from application.audit_context import audit_client_info
-from application.errors import NotFoundError, OwnershipError, PermissionDeniedError, ThreadBusyError
+from application.dto import GovernanceReport
+from application.errors import (
+    InterruptExpiredError,
+    NotFoundError,
+    OwnershipError,
+    PermissionDeniedError,
+    ThreadBusyError,
+)
 from application.event_translator import LangGraphEventTranslator
 from application.events import AgentEvent, AgentEventType
 from application.interrupt_codec import build_resume_command
@@ -25,6 +32,7 @@ from application.principal import Principal
 from application.runnable import build_runnable_config
 from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
+from runtime.execution_registry import abort_scope, bound_scope
 from runtime.thread_store import ThreadMetaStore, normalize_thread_id
 from runtime.usage_store import UsageStore
 from text_utils import build_title
@@ -36,6 +44,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STREAM_MODES = ["messages", "updates"]
+
+STOP_REASON_STOPPED = "stopped"
+"""DONE 事件的停止原因：用户主动停止。"""
+
+STOP_REASON_TIMEOUT = "timeout"
+"""DONE 事件的停止原因：运行超过 ``run_max_seconds`` 被治理协程强制取消。
+
+WHY 与 ``stopped`` 区分：两者对前端都是「流已关闭、内容不完整」，但责任方
+不同——一个是用户按了停止，一个是系统判定超时；混成一个值会让用户在没有
+任何操作的情况下看到「已停止」，从而误判界面出了 bug。
+"""
+
+SYSTEM_ACTOR = "system"
+"""后台治理动作的审计主体标识。
+
+WHY 不用空串：审计表的 ``actor_id`` 为空表示「未知」，而后台治理确实是
+系统做出的决定，二者在事后追溯时含义完全不同。
+"""
 
 
 @dataclass(frozen=True, eq=False)
@@ -60,6 +86,8 @@ class RunHandle:
     """本轮使用的模型别名；``None`` 表示默认模型（落用量时按配置解析）。"""
     owner_id: str = ""
     """会话所有者；用量记录按它聚合，认证关闭时为空串。"""
+    stop_reason: str | None = None
+    """停止原因；``None`` 表示尚未收到停止请求，取值见模块级常量。"""
 
     @property
     def stop_requested(self) -> bool:
@@ -71,8 +99,25 @@ class RunHandle:
         """已运行时长（秒）。"""
         return time.monotonic() - self.started_at
 
-    def request_stop(self) -> None:
-        """请求停止本次运行；重复调用幂等。"""
+    def request_stop(self, reason: str = STOP_REASON_STOPPED) -> None:
+        """请求停止本次运行；重复调用时首次的原因生效。
+
+        WHY 保留首次原因：超时强制取消之后用户再点停止（或反过来），
+        先到达的那个才是运行的真实终止原因；覆盖它会让审计与前端
+        「已超时」的结论被后来的操作改写。
+
+        WHY 用 ``object.__setattr__`` 而不是把整个句柄改成可变：句柄的
+        ``thread_id`` / ``started_at`` 一旦可写，运行登记就失去了可信度；
+        这里只为「一次性记录原因」破一个口子，比整体降级为可变更安全。
+
+        Args:
+            reason: 停止原因；取 ``STOP_REASON_STOPPED`` 或
+                ``STOP_REASON_TIMEOUT``。
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason 必须是非空字符串")
+        if self.stop_reason is None:
+            object.__setattr__(self, "stop_reason", reason.strip())
         self.cancel_event.set()
 
 
@@ -132,11 +177,23 @@ class RunService:
         self._running: dict[str, RunHandle] = {}
         self._running_guard = threading.Lock()
 
-        # WHY 累计运行数与 HITL 挂起集合与运行登记表共用一把锁：三者都是
+        # WHY 累计运行数与 HITL 挂起登记与运行登记表共用一把锁：三者都是
         # 「本次运行的即时状态」，若各自加锁，指标采集会读到互相矛盾的组合
         # （例如累计运行数已加一，但槽位尚未登记）。
         self._started_runs = 0
-        self._hitl_pending: set[str] = set()
+        self._hitl_pending: dict[str, float] = {}
+        """会话 ID → 挂起登记时刻（``time.monotonic``），用于 TTL 判定。"""
+        self._hitl_expired: dict[str, float] = {}
+        """会话 ID → 被判定超期的时刻；用于拒绝过期审批与指标展示。
+
+        WHY 与 ``_hitl_pending`` 分开存：过期是「曾经挂起且已作废」的历史事实，
+        而挂起是当下状态。合成一个字典就要用哨兵值区分二者，届时每个读取点
+        都要记得判断哨兵——漏一处就会出现「已过期的审批被放行」。
+        """
+        self._timed_out_runs = 0
+        """进程启动以来被运行超时强制取消的运行数。"""
+        self._expired_hitl = 0
+        """进程启动以来被判定超期作废的审批挂起数。"""
 
         logger.info(
             "RunService 就绪：mode=%s recursion_limit=%s",
@@ -350,6 +407,7 @@ class RunService:
             PermissionDeniedError: 缺少 hitl:approve 权限。
             NotFoundError: 会话不存在。
             OwnershipError: 无权访问该会话。
+            InterruptExpiredError: 该会话的审批挂起已超过 TTL，本次恢复被拒绝。
             RuntimeError: 模型初始化或装配失败。
         """
         # WHY 审批需要独立权限：这一调用会让此前被拦下的高危工具真正执行，
@@ -363,6 +421,14 @@ class RunService:
         graph = self._graph_factory.get(model_name)
 
         await self._ensure_ownership(normalized, principal)
+
+        # WHY 在清除登记之前先判过期：过期标记正是「这次挂起已作废」的唯一
+        # 凭据，若先把登记清掉，判定就永远为假，TTL 形同虚设，而用户却拿到了
+        # 一次「看似成功」的恢复。
+        if self.is_hitl_expired(normalized):
+            ttl = self._config.hitl_pending_ttl_seconds
+            logger.warning("会话 %s 的审批已超期（TTL=%s 秒），拒绝恢复", normalized, ttl)
+            raise InterruptExpiredError(normalized, ttl)
 
         # WHY 恢复即意味着那一次审批已被应答：挂起登记必须在此刻清除，
         # 否则「待审批数」只会单调递增，失去作为运行治理指标的意义。
@@ -442,11 +508,16 @@ class RunService:
         # WHY 同步置位后再做任何 await：判重与置位之间不插入等待，
         # 单事件循环内天然原子，并发重复请求只有一次会生效并落审计。
         handle.request_stop()
+        # WHY 同步终止子进程树（T7-f）：置位只让事件循环侧停止产出事件，
+        # 真正跑着的 shell 命令在工作线程里，它只认自己的超时——不显式终止，
+        # 「已停止」就只是接口层确认，UI 复位后命令最长还能活一个 SANDBOX_TIMEOUT。
+        aborted = abort_scope(normalized)
         logger.info(
-            "会话 %s 收到停止请求：actor=%s 已运行 %.1f 秒",
+            "会话 %s 收到停止请求：actor=%s 已运行 %.1f 秒，终止在跑命令 %d 个",
             normalized,
             actor_id,
             handle.elapsed_seconds,
+            aborted,
         )
         await self._audit(
             event_type="run_cancelled",
@@ -457,6 +528,134 @@ class RunService:
             details={"elapsed_seconds": round(handle.elapsed_seconds, 3)},
         )
         return {"thread_id": normalized, "stopped": True, "reason": "requested"}
+
+    async def enforce_governance(self) -> GovernanceReport:
+        """巡检一次运行治理：强制取消超时运行、作废超期未决策的审批挂起。
+
+        由后台协程按 ``run_governance_interval_seconds`` 调用；也允许运维在
+        测试中手动触发一次。
+
+        WHY 把两件事放在一次巡检里：它们共享同一份「运行即时状态」的快照，
+        也共享同一条审计口径（动作主体都是系统）；分成两个协程就要两把锁的
+        快照语义，反而更容易出现「刚判定超时、同一轮又判它挂起过期」的
+        自相矛盾记录。
+
+        Returns:
+            本次巡检的结果（超时数、过期数、巡检到的运行/挂起数）。
+
+        Raises:
+            RuntimeError: 阈值配置非法（由配置校验兜底，理论不可达）。
+        """
+        limit = self._config.run_max_seconds
+        ttl = self._config.hitl_pending_ttl_seconds
+        if not isinstance(limit, int) or limit < 0:
+            raise RuntimeError("run_max_seconds 配置非法")
+        if not isinstance(ttl, int) or ttl < 0:
+            raise RuntimeError("hitl_pending_ttl_seconds 配置非法")
+
+        now = time.monotonic()
+        running_snapshot = self.run_handles()
+        pending_snapshot = self.pending_hitl_thread_ids()
+        report = GovernanceReport(
+            checked_runs=len(running_snapshot),
+            checked_hitl=len(pending_snapshot),
+        )
+
+        report.timed_out_runs = await self._enforce_run_timeouts(running_snapshot, limit, now)
+        report.expired_hitl = await self._expire_stale_hitl(pending_snapshot, ttl)
+
+        if report.timed_out_runs or report.expired_hitl:
+            logger.info(
+                "运行治理巡检：超时取消 %d 个运行，作废 %d 个超期审批",
+                report.timed_out_runs,
+                report.expired_hitl,
+            )
+        return report
+
+    async def _enforce_run_timeouts(
+        self,
+        running_snapshot: dict[str, RunHandle],
+        limit: int,
+        now: float,
+    ) -> int:
+        """强制取消超过 ``run_max_seconds`` 的运行，返回被取消的数量。"""
+        if limit <= 0:
+            return 0
+
+        cancelled = 0
+        for thread_id, handle in running_snapshot.items():
+            if handle.stop_requested or (now - handle.started_at) < limit:
+                continue
+            # WHY 二次确认句柄仍在册：快照到此刻之间该运行可能已自然结束，
+            # 若直接置位，就会对一个已废弃的句柄记一次超时审计。
+            if self.run_handle(thread_id) is not handle:
+                continue
+
+            elapsed = handle.elapsed_seconds
+            handle.request_stop(STOP_REASON_TIMEOUT)
+            # WHY 超时同样要终止子进程树：超时往往正是命令卡住造成的，
+            # 只取消 future 会让那棵进程树继续活到它自己的超时。
+            aborted = abort_scope(thread_id)
+            with self._running_guard:
+                self._timed_out_runs += 1
+            cancelled += 1
+            logger.warning(
+                "会话 %s 运行超过 %d 秒（实际 %.1f 秒），已强制取消，终止在跑命令 %d 个",
+                thread_id,
+                limit,
+                elapsed,
+                aborted,
+            )
+            await self._audit(
+                event_type="run_timeout",
+                actor_id=SYSTEM_ACTOR,
+                target_id=thread_id,
+                action="timeout",
+                outcome="success",
+                details={
+                    "elapsed_seconds": round(elapsed, 3),
+                    "max_seconds": limit,
+                },
+            )
+        return cancelled
+
+    async def _expire_stale_hitl(
+        self,
+        pending_snapshot: tuple[str, ...],
+        ttl: int,
+    ) -> int:
+        """作废挂起超过 ``hitl_pending_ttl_seconds`` 的审批，返回作废数量。
+
+        WHY 用「当前挂起时长」而不是传入的统一 ``now`` 再减：判定与作废之间
+        隔着一次 await（写审计），期间用户完全可能应答；以服务内的实时时长
+        为准，可以让刚刚被应答的会话不会被误判。
+        """
+        if ttl <= 0:
+            return 0
+
+        expired = 0
+        for thread_id in pending_snapshot:
+            age = self.hitl_pending_age(thread_id)
+            if age is None or age < ttl:
+                continue
+            # WHY 以 expire_hitl_pending 的返回值为准：用户可能刚好在这一刻
+            # 应答（resume 会先清登记），此时本次巡检应当让位，而不是把一次
+            # 已经生效的审批再标记成过期。
+            if not self.expire_hitl_pending(thread_id):
+                continue
+            expired += 1
+            await self._audit(
+                event_type="hitl_expired",
+                actor_id=SYSTEM_ACTOR,
+                target_id=thread_id,
+                action="expire",
+                outcome="success",
+                details={
+                    "pending_seconds": round(age, 3),
+                    "ttl_seconds": ttl,
+                },
+            )
+        return expired
 
     # ------------------------------------------------------------------ 内部
 
@@ -481,13 +680,18 @@ class RunService:
         """
         thread_id = handle.thread_id
         try:
-            async for event in self._iterate(graph, payload, handle):
-                if event.event is AgentEventType.USAGE:
-                    # WHY 在这里落库而不是在 _iterate 里：写库是带副作用的动作，
-                    # 而 _iterate 只负责翻译流。让「产出事件」与「持久化」分层，
-                    # 事件流本身在无存储的环境下（CLI、测试）依然完整。
-                    await self._record_usage(handle, event.payload)
-                yield event
+            # WHY 把本次运行绑定到执行登记处的作用域：同步工具节点由
+            # LangGraph 用 ``run_in_executor(copy_context)`` 调度到工作线程，
+            # contextvar 是唯一能在不改上游协议的前提下把「会话身份」带进
+            # 命令执行器的通道；有了它，stop 才能顺着会话找到那棵进程树。
+            with bound_scope(thread_id):
+                async for event in self._iterate(graph, payload, handle):
+                    if event.event is AgentEventType.USAGE:
+                        # WHY 在这里落库而不是在 _iterate 里：写库是带副作用的动作，
+                        # 而 _iterate 只负责翻译流。让「产出事件」与「持久化」分层，
+                        # 事件流本身在无存储的环境下（CLI、测试）依然完整。
+                        await self._record_usage(handle, event.payload)
+                    yield event
         finally:
             # WHY 同步释放：客户端断开连接时这里可能正处于 GeneratorExit，
             # 任何 await 都可能破坏生成器的关闭流程。
@@ -503,9 +707,11 @@ class RunService:
         # 前端就不需要在两处分别处理结束条件。
         done_payload: dict[str, Any] = {"thread_id": thread_id}
         if handle.stop_requested:
-            # 用户主动停止不是错误：前端据此复位输入框并提示「已停止」，
-            # 而不是把半截输出渲染成错误。
-            done_payload["reason"] = "stopped"
+            # WHY 用句柄上记录的原因而不是写死 "stopped"：超时由后台协程置位，
+            # 用户停止由 stop() 置位，两者都必须让前端看到「不是正常收尾」，
+            # 但提示语不同（「已停止」vs「已超时终止」）。取不到原因时
+            # 退化为 "stopped"，避免出现没有 reason 的半截语义。
+            done_payload["reason"] = handle.stop_reason or STOP_REASON_STOPPED
         logger.info("会话 %s 本轮结束", thread_id)
         yield AgentEvent(AgentEventType.DONE, done_payload)
 
@@ -697,6 +903,16 @@ class RunService:
         with self._running_guard:
             return thread_id in self._running
 
+    def run_handles(self) -> dict[str, RunHandle]:
+        """当前全部运行句柄的快照（会话 ID → 句柄）。
+
+        WHY 需要整表快照而不是逐个查 ``run_handle``：运行治理要在同一时刻
+        判断「哪些运行超时」，逐个查询会让每个判断落在不同时刻，从而把扫描
+        期间才启动的运行也算进本轮结论里。
+        """
+        with self._running_guard:
+            return dict(self._running)
+
     def running_thread_ids(self) -> tuple[str, ...]:
         """当前运行中的会话 ID 快照（供指标暴露）。"""
         with self._running_guard:
@@ -713,22 +929,33 @@ class RunService:
             return self._started_runs
 
     def mark_hitl_pending(self, thread_id: str) -> None:
-        """登记该会话有一个等待人工审批的中断。
+        """登记该会话有一个等待人工审批的中断，并记录挂起起始时刻。
 
         WHY 由服务持有而不是让指标端点去遍历图状态：遍历需要对每个会话
         调一次 ``aget_state``，成本随会话数线性增长；而中断事件在事件流里
         已经出现过一次，登记是零成本的。
 
+        WHY 重复登记不刷新起始时刻：同一轮运行里中断事件可能出现多次
+        （多个待审批工具），若每次都重置，TTL 就永远走不完；以首次登记
+        为准才能让「挂起太久」这个判断成立。
+
         Args:
             thread_id: 已规范化的会话 ID。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
         """
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise ValueError("thread_id 必须是非空字符串")
         with self._running_guard:
-            self._hitl_pending.add(thread_id)
+            # 新一轮中断作废上一次的过期标记：既然又等上了，说明用户确实
+            # 在跟这个会话交互，此前的过期结论不再适用。
+            self._hitl_expired.pop(thread_id, None)
+            if thread_id not in self._hitl_pending:
+                self._hitl_pending[thread_id] = time.monotonic()
 
     def clear_hitl_pending(self, thread_id: str) -> None:
-        """清除该会话的待审批登记；会话本就没有挂起时是 no-op。
+        """清除该会话的待审批登记与过期标记；本就没有挂起时是 no-op。
 
         Args:
             thread_id: 会话 ID。
@@ -739,7 +966,49 @@ class RunService:
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise ValueError("thread_id 必须是非空字符串")
         with self._running_guard:
-            self._hitl_pending.discard(thread_id)
+            self._hitl_pending.pop(thread_id, None)
+            self._hitl_expired.pop(thread_id, None)
+
+    def expire_hitl_pending(self, thread_id: str) -> bool:
+        """把该会话的挂起审批标记为过期并释放占位。
+
+        Args:
+            thread_id: 会话 ID。
+
+        Returns:
+            是否真的作废了一次挂起；``False`` 表示该会话此刻没有挂起
+            （已被用户应答或已被并发清理过），调用方据此跳过后续处理。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id 必须是非空字符串")
+        with self._running_guard:
+            started_at = self._hitl_pending.pop(thread_id, None)
+            if started_at is None:
+                return False
+            self._hitl_expired[thread_id] = time.monotonic()
+            self._expired_hitl += 1
+        logger.info(
+            "会话 %s 的审批挂起已超期作废：等待 %.1f 秒",
+            thread_id,
+            time.monotonic() - started_at,
+        )
+        return True
+
+    def is_hitl_expired(self, thread_id: str) -> bool:
+        """该会话是否有一个已作废（超期）的审批挂起。"""
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id 必须是非空字符串")
+        with self._running_guard:
+            return thread_id in self._hitl_expired
+
+    def hitl_pending_age(self, thread_id: str) -> float | None:
+        """该会话的审批已挂起秒数；未挂起时为 ``None``。"""
+        with self._running_guard:
+            started_at = self._hitl_pending.get(thread_id)
+        return None if started_at is None else time.monotonic() - started_at
 
     def pending_hitl_thread_ids(self) -> tuple[str, ...]:
         """当前等待人工审批的会话 ID 快照。
@@ -749,6 +1018,18 @@ class RunService:
         """
         with self._running_guard:
             return tuple(self._hitl_pending)
+
+    @property
+    def timed_out_runs(self) -> int:
+        """进程启动以来被运行超时强制取消的运行次数。"""
+        with self._running_guard:
+            return self._timed_out_runs
+
+    @property
+    def expired_hitl(self) -> int:
+        """进程启动以来因超期未决策而作废的审批挂起次数。"""
+        with self._running_guard:
+            return self._expired_hitl
 
     # ------------------------------------------------------------------ 元数据
 

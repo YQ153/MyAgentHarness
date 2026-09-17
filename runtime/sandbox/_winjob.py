@@ -20,6 +20,8 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
+from runtime import execution_registry
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -201,7 +203,7 @@ def run_in_job(
     cwd: Path,
     env: Mapping[str, str],
     timeout: int,
-    policy: SandboxPolicy,
+    policy: SandboxPolicy | None = None,
 ) -> JobResult:
     """在 Job Object 中执行一条命令。
 
@@ -210,7 +212,8 @@ def run_in_job(
         cwd: 子进程工作目录。
         env: 已清洗的环境变量（调用方负责按白名单过滤）。
         timeout: 超时秒数。
-        policy: 资源限制策略。
+        policy: 资源限制策略；``None`` 表示**只做进程树管控、不加资源上限**
+            （local 档位需要：它要的是「超时能杀整棵树」，而不是 CPU/内存限制）。
 
     Returns:
         ``JobResult``，输出为已解码的文本，不做截断。
@@ -226,6 +229,12 @@ def run_in_job(
     # 那些进程会继承日志文件句柄；若先删目录再关 Job，删除必然被 WinError 32
     # 挡下，还会把一次本已成功的执行渲染成 SandboxError。
     tmp_dir = tempfile.mkdtemp(prefix="sandbox-")
+    # WHY 把 Job 句柄登记到执行登记处：``stop`` / 运行超时发生在事件循环线程，
+    # 而这里阻塞在 WaitForSingleObject 的工作线程里，二者只能通过进程级
+    # 状态相遇。登记后，用户按下停止时 TerminateJobObject 会立即生效，
+    # 等在这里的 wait 随即返回——「已停止」才真的等于「进程已终止」。
+    abort_handle = _JobAbortHandle(job)
+    registered = execution_registry.register(abort_handle)
     try:
         return _spawn_and_wait(
             command,
@@ -236,6 +245,8 @@ def run_in_job(
             tmp_dir=Path(tmp_dir),
         )
     finally:
+        if registered:
+            execution_registry.unregister(abort_handle)
         # WHY 先显式终止进程树再关句柄：``KILL_ON_JOB_CLOSE`` 的生效时机绑定
         # 在句柄关闭上，而 ``TerminateJobObject`` 立即生效、句柄随之释放，
         # 后面删临时文件才不会被占用。
@@ -250,11 +261,45 @@ def run_in_job(
         _cleanup_dir(tmp_dir)
 
 
-def _create_job_object(policy: SandboxPolicy) -> wintypes.HANDLE:
-    """创建并配置 Job Object。"""
+class _JobAbortHandle:
+    """把 Job Object 句柄包装成「可被中止的一次执行」。
+
+    终止动作只依赖 Job 句柄，因此可以从任何线程发起——这正是「用户按停止」
+    （事件循环线程）要终止「正在跑的命令」（工作线程）所需要的性质。
+    """
+
+    def __init__(self, job: wintypes.HANDLE) -> None:
+        self._job = job
+
+    def abort(self) -> None:
+        """终止 Job 内整棵进程树；进程已退出时调用无害。"""
+        logger.warning("收到中止请求，终止命令进程树")
+        if not _kernel32.TerminateJobObject(self._job, 1):
+            # WHY 只告警：ERROR_ACCESS_DENIED 之类的失败通常意味着进程已经
+            # 退出并释放了句柄，把它当成错误向上抛会让停止动作半途失败。
+            logger.debug(
+                "TerminateJobObject 调用失败（错误码 %s），进程可能已退出",
+                ctypes.get_last_error(),  # type: ignore[attr-defined]
+            )
+            return
+        # WHY 不在此处等待进程退出：本方法是被事件循环线程调用的，任何
+        # 阻塞都会拖住整个进程；等在工作线程里的 WaitForSingleObject 会
+        # 因为进程被杀而立刻返回，收尾工作由它负责。
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅用于日志
+        return f"_JobAbortHandle(job={self._job})"
+
+
+def _create_job_object(policy: SandboxPolicy | None) -> wintypes.HANDLE:
+    """创建并配置 Job Object；``policy`` 为 ``None`` 时只保留进程树管控。"""
     job = _kernel32.CreateJobObjectW(None, None)
     if not job:
         raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+
+    if policy is None:
+        # WHY 无策略时仍要 KILL_ON_JOB_CLOSE：local 档位不设资源上限，但它
+        # 要的就是「句柄一关、整棵树不留」这一条；少了它进程树管控就不存在。
+        return _apply_limits(job, _kill_on_close_limits())
 
     limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     flags = (
@@ -272,6 +317,25 @@ def _create_job_object(policy: SandboxPolicy) -> wintypes.HANDLE:
     # 命令常出现短暂的父子进程并存，取等值会被误杀。
     limits.JobMemoryLimit = process_memory * 2
 
+    _apply_limits(job, limits)
+    _apply_cpu_limit(job, policy)
+    return job
+
+
+def _kill_on_close_limits() -> _JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+    """只含「关闭即杀」的最小限制集。"""
+    limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    limits.BasicLimitInformation.LimitFlags = (
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+    )
+    return limits
+
+
+def _apply_limits(
+    job: wintypes.HANDLE,
+    limits: _JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+) -> wintypes.HANDLE:
+    """写入限制信息；失败时关掉 Job 再抛错，避免句柄泄漏。"""
     if not _kernel32.SetInformationJobObject(
         job,
         JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
@@ -281,8 +345,6 @@ def _create_job_object(policy: SandboxPolicy) -> wintypes.HANDLE:
         code = ctypes.get_last_error()  # type: ignore[attr-defined]
         _kernel32.CloseHandle(job)
         raise ctypes.WinError(code)  # type: ignore[attr-defined]
-
-    _apply_cpu_limit(job, policy)
     return job
 
 
@@ -496,9 +558,16 @@ def _build_command_line(command: str, env: Mapping[str, str]) -> str:
 
 
 def _build_env_block(env: Mapping[str, str]) -> ctypes.c_void_p:
-    """构造 Windows 要求的 UTF-16LE 环境块（``K=V\\0...\\0``）。"""
+    """构造 Windows 要求的 UTF-16LE 环境块（``K=V\\0...\\0``）。
+
+    WHY 空环境要单独补一个 ``\\0``：环境块必须以**两个**连续空字符结尾。
+    非空时 ``K=V\\0`` 拼接后再补的那个 ``\\0`` 正好凑成两个；空环境只拼出
+    一个，长度不足 4 字节的块会被 ``CreateProcessW`` 判为非法参数——而
+    ``local`` 档位为了不泄漏宿主机密钥，传的恰恰就是空环境。
+    """
     items = "".join(f"{key}={value}\0" for key, value in env.items())
-    raw = (items + "\0").encode("utf-16-le")
+    terminator = "\0" if items else "\0\0"
+    raw = (items + terminator).encode("utf-16-le")
     buffer = ctypes.create_string_buffer(raw, len(raw))
     return ctypes.cast(buffer, ctypes.c_void_p)
 

@@ -45,6 +45,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
+
+# WHY 在 chdir 之后导入：这些模块会在导入时读配置与工作区路径，
+# 顺序颠倒会让它们以「脚本所在目录」为基准解析相对路径。
+from runtime.execution_registry import abort_scope, bound_scope  # noqa: E402
 # WHY 强制 UTF-8 输出：Windows 控制台默认 GBK，日志里的档位说明含非 GBK 字符时
 # print 会抛 UnicodeEncodeError，把一次成功的验证渲染成失败。
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -104,6 +108,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=600,
         help="父/孙进程自身的寿命秒数，默认 600；必须显著大于 --timeout",
+    )
+    parser.add_argument(
+        "--no-abort",
+        action="store_true",
+        help="对照实验：只取消 future，不调用执行登记处的进程树终止（T7 之前的行为）",
     )
     args = parser.parse_args()
     if args.timeout < 5:
@@ -238,7 +247,14 @@ def _build_backend(config: Any) -> Any:
     return build_backend(config, InMemoryStore())
 
 
-async def _measure(backend: Any, *, timeout: int, settle: int, ttl: int) -> dict[str, Any]:
+async def _measure(
+    backend: Any,
+    *,
+    timeout: int,
+    settle: int,
+    ttl: int,
+    abort: bool = True,
+) -> dict[str, Any]:
     """执行一次「启动长命令 → 取消 → 测量进程存活」的验证。
 
     Args:
@@ -246,6 +262,8 @@ async def _measure(backend: Any, *, timeout: int, settle: int, ttl: int) -> dict
         timeout: 命令超时秒数。
         settle: 取消前等待子进程出现的秒数。
         ttl: 父/孙进程自身寿命秒数，用于识别「自行退出」与「被终止」。
+        abort: 是否模拟 T7 的进程层确认（``abort_scope``）；``False`` 为
+            对照实验，只取消 future 而不终止进程树。
 
     Returns:
         含标记与各项时延的字典。
@@ -267,7 +285,11 @@ async def _measure(backend: Any, *, timeout: int, settle: int, ttl: int) -> dict
     def _execute() -> None:
         """在工作线程里跑同步 execute，并记录真实返回时刻与输出。"""
         try:
-            response = backend.execute(command, timeout=timeout)
+            # WHY 绑到执行登记处的作用域：真实链路里 ``RunService._consume``
+            # 会把本次运行绑定到会话 ID，命令执行器据此登记进程树句柄。
+            # 这里用 tag 当作用域，使下面的 ``abort_scope`` 与真实 stop 等价。
+            with bound_scope(tag):
+                response = backend.execute(command, timeout=timeout)
             state["exit_code"] = response.exit_code
             # WHY 存输出：命令若压根没起来（引号被吞、沙箱拒绝执行等），
             # 唯一线索就是这段文本；不留下来就只能看到「子进程未启动」。
@@ -316,6 +338,12 @@ async def _measure(backend: Any, *, timeout: int, settle: int, ttl: int) -> dict
         await asyncio.sleep(settle)
 
         cancelled_at = time.monotonic()
+        if abort:
+            # WHY 先终止进程树再取消 future：真实 ``stop()`` 正是这个顺序，
+            # 反过来会让「命令刚被杀、future 才取消」之间的输出丢失。
+            logger.info("模拟 RunService.stop()：按会话终止在跑的进程树")
+            aborted = abort_scope(tag)
+            logger.info("已向 %d 个在跑命令发出终止", aborted)
         logger.info("模拟 RunService.stop()：取消等待线程结果的 future")
         task.cancel()
         with suppress(asyncio.CancelledError):
@@ -474,7 +502,13 @@ def main() -> int:
         print(f"[backend] id={getattr(backend, 'id', '?')} desc={desc}")
 
         result = asyncio.run(
-            _measure(backend, timeout=args.timeout, settle=args.settle, ttl=args.ttl)
+            _measure(
+                backend,
+                timeout=args.timeout,
+                settle=args.settle,
+                ttl=args.ttl,
+                abort=not args.no_abort,
+            )
         )
     except Exception as exc:  # noqa: BLE001 验证脚本的顶层收敛：出错即判失败
         logger.exception("验证执行失败")

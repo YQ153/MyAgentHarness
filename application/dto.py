@@ -122,6 +122,20 @@ class UsageSummary(BaseModel):
     groups: list[UsageGroup] = Field(description="按维度聚合的分档明细")
 
 
+class GovernanceReport(BaseModel):
+    """一次运行治理巡检的结果。
+
+    WHY 用模型而非裸计数：巡检是后台协程调用，结果只服务于日志与测试断言，
+    但它同样是一份「服务层对外契约」——字段增删若只体现为字典键的变化，
+    调用方（指标、测试）会在运行期才炸，而这里能让类型检查提前拦住。
+    """
+
+    timed_out_runs: int = Field(default=0, description="本轮巡检中被判定超时并强制取消的运行数")
+    expired_hitl: int = Field(default=0, description="本轮巡检中被判定超期并作废的审批挂起数")
+    checked_runs: int = Field(default=0, description="本轮巡检看到的运行中会话数")
+    checked_hitl: int = Field(default=0, description="本轮巡检看到的挂起审批数")
+
+
 class CheckResult(BaseModel):
     """单项依赖探测的结果。
 
@@ -155,6 +169,12 @@ class MetricsSnapshot(BaseModel):
     running_threads: int = Field(description="当前运行中的会话数")
     started_runs: int = Field(description="进程启动以来累计发起的运行次数")
     pending_hitl: int = Field(description="等待人工审批的会话数")
+    timed_out_runs: int = Field(
+        default=0, description="进程启动以来被运行超时强制取消的运行次数"
+    )
+    expired_hitl: int = Field(
+        default=0, description="进程启动以来因超期未决策而作废的审批挂起次数"
+    )
     audit_events: int | None = Field(
         default=None, description="审计事件总数；``None`` 表示本次采集失败"
     )

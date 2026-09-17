@@ -61,6 +61,8 @@ def _metrics_snapshot(**overrides: Any) -> MetricsSnapshot:
         "running_threads": 2,
         "started_runs": 41,
         "pending_hitl": 1,
+        "timed_out_runs": 3,
+        "expired_hitl": 2,
         "audit_events": 128,
         "uptime_seconds": 3661.5,
     }
@@ -136,6 +138,8 @@ def test_metrics_returns_snapshot():
         "running_threads": 2,
         "started_runs": 41,
         "pending_hitl": 1,
+        "timed_out_runs": 3,
+        "expired_hitl": 2,
         "audit_events": 128,
         "uptime_seconds": 3661.5,
     }
