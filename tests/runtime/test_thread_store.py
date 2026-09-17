@@ -1,6 +1,6 @@
 """会话元数据存储的回归测试。
 
-覆盖面：ID 规范化、建表幂等、轮次登记（UPSERT 语义：标题/所有者只写一次）、
+覆盖面：建表幂等、轮次登记（UPSERT 语义：标题/所有者只写一次）、
 活动时间刷新、删除、按所有者过滤的列表与计数、分页参数校验，
 以及重命名、归档（软删除）、标题搜索与老库升级路径。
 """
@@ -12,37 +12,9 @@ import pytest
 
 import runtime.thread_store as thread_store_module
 from runtime.thread_store import (
-    MAX_THREAD_ID_CHARS,
     ThreadMetaStore,
-    normalize_thread_id,
     open_thread_store,
 )
-
-
-# ------------------------------------------------------------------ ID 规范化
-
-
-def test_normalize_strips_whitespace():
-    assert normalize_thread_id("  abc  ") == "abc"
-
-
-def test_normalize_rejects_empty():
-    with pytest.raises(ValueError):
-        normalize_thread_id("   ")
-
-
-def test_normalize_rejects_non_string():
-    with pytest.raises(ValueError):
-        normalize_thread_id(12345)
-
-
-def test_normalize_rejects_overlong():
-    with pytest.raises(ValueError):
-        normalize_thread_id("x" * (MAX_THREAD_ID_CHARS + 1))
-
-
-def test_normalize_accepts_max_length():
-    assert normalize_thread_id("x" * MAX_THREAD_ID_CHARS) == "x" * MAX_THREAD_ID_CHARS
 
 
 # ------------------------------------------------------------------ 写入

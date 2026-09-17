@@ -304,6 +304,7 @@
 ├── main.py                 进程入口：解析子命令 → 装载配置 → 日志 → 分发
 ├── config.py               配置中心（唯一的环境变量解析点）
 ├── text_utils.py           文本规整：空白折叠与截断（应用层与存储层共享）
+├── thread_utils.py         会话 ID 校验：跨层唯一实现（接口/应用/存储共享）
 ├── pyproject.toml          依赖声明（requires-python >= 3.14）
 ├── .env.example            配置模板
 ├── README.md               面向使用者的快速上手
@@ -954,7 +955,7 @@ ON CONFLICT(thread_id) DO UPDATE SET
   <li><code>get_threads</code> / <code>get_runs</code> / <code>get_catalog</code>：从
     <code>app.state</code> 取服务单例，未初始化时返回 500。WHY 单例：图与 checkpointer
     都是有状态的重量对象。</li>
-  <li><code>_validate_thread_id</code>：复用存储层的 <code>normalize_thread_id</code>，
+  <li><code>_validate_thread_id</code>：复用根级中立模块的 <code>normalize_thread_id</code>，
     把 <code>ValueError</code> 翻译成 400。WHY：会话 ID 的合法性规则只有一份定义，
     路由层不再自己维护一套判断。</li>
   <li>运行端点在 <code>await runs.stream(...)</code> 处捕获 <code>ValueError</code> /

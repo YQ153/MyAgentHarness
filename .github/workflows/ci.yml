@@ -110,6 +110,7 @@ jobs:
           --cov=runtime
           --cov=config
           --cov=text_utils
+          --cov=thread_utils
           --cov-report=term
           --cov-report=xml
           --cov-fail-under=${{ matrix.coverage_fail_under }}

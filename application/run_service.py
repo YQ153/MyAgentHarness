@@ -35,9 +35,10 @@ from application.runnable import build_runnable_config
 from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
 from runtime.execution_registry import abort_scope, bound_scope
-from runtime.thread_store import ThreadMetaStore, normalize_thread_id
+from runtime.thread_store import ThreadMetaStore
 from runtime.usage_store import UsageStore
 from text_utils import build_title
+from thread_utils import normalize_thread_id
 
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
