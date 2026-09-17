@@ -13,10 +13,13 @@ from contextlib import asynccontextmanager
 
 from agent.graph import AgentFactory, get_registry
 from agent.profiles import ensure_profiles_registered
+from agent.tooling import build_tool_bundle
 from application.health import HealthService
+from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.run_service import RunService
 from application.thread_service import ThreadService
+from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
 from bootstrap.context import AppContext
 from config import AppConfig
@@ -24,6 +27,7 @@ from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
 from runtime.device_flow_store import open_device_flow_store
+from runtime.store import open_store
 from runtime.thread_store import open_thread_store
 from runtime.usage_store import open_usage_store
 
@@ -61,8 +65,23 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         open_api_key_store(config.db_path) as api_key_store,
         open_device_flow_store(config.db_path) as device_flow_store,
         open_usage_store(config.db_path) as usage_store,
+        # WHY 记忆存储也走 ``async with``：它的连接生命周期必须与进程一致，
+        # 否则退出时连接留到 GC 才释放，期间该 SQLite 文件可能一直持有锁。
+        open_store(config.db_path) as store,
     ):
-        graph_factory = AgentFactory(config, checkpointer=checkpointer)
+        # WHY 工具在装配图之前装好：工具集是图的一部分，图一旦缓存就不会
+        # 再读它；放到后面会造成「首个请求没工具、之后突然有了」这种差异。
+        # WHY 装配失败要让进程起不来（除 MCP 降级外）：工具名冲突与模块
+        # 导入失败都是配置错误，带着一个「少了工具」的 Agent 继续服务，
+        # 只会把失败推迟到某次具体对话。
+        tool_bundle = await build_tool_bundle(config)
+        tool_catalog = ToolCatalog(tool_bundle)
+        graph_factory = AgentFactory(
+            config,
+            checkpointer=checkpointer,
+            store=store,
+            tools=tool_bundle.tools,
+        )
 
         # WHY 注册表只构造一次：目录与就绪探测都只需要读它的规格清单，
         # 构造两份既浪费一次规格解析，也让两处看到不同的默认模型视图。
@@ -74,6 +93,7 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             graph_factory=graph_factory,
             audit_store=audit_store,
             usage_store=usage_store,
+            tool_catalog=tool_catalog,
         )
 
         context = AppContext(
@@ -108,12 +128,18 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
                 usage_store=usage_store,
                 thread_store=thread_store,
             ),
+            tools=tool_catalog,
+            # WHY 与图共享同一个 store 实例：管理面板与 Agent 必须看到同一份
+            # 记忆——各持一份（哪怕指向同一文件）会让「面板显示已删除」与
+            # 「Agent 还记得」同时成立。
+            memories=MemoryService(config, store=store, audit_store=audit_store),
         )
 
         logger.info(
-            "核心依赖装配完成：db=%s auth_mode=%s",
+            "核心依赖装配完成：db=%s auth_mode=%s tools=%d",
             config.db_path,
             config.auth_mode,
+            len(tool_bundle.tools),
         )
         yield context
         logger.info("核心依赖已释放")

@@ -44,6 +44,7 @@ class FakeGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[Any]:
         return
         yield  # noqa: WPS328 不可达，仅为构造异步生成器
@@ -62,6 +63,7 @@ class SlowGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[Any]:
         await asyncio.sleep(10.0)
         return

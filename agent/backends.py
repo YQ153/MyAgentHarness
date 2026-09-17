@@ -19,6 +19,7 @@ from deepagents.backends import (
 from deepagents.backends.protocol import ExecuteResponse
 
 from agent.path_safety import ExtendedPathSafeBackendMixin
+from agent.run_context import namespace_of_runtime
 from agent.sandbox_backend import SandboxedFilesystemBackend
 from runtime.host_shell import HostShellExecutor
 from runtime.sandbox import build_sandbox_runner
@@ -148,11 +149,13 @@ class _ExtendedPathSafeLocalShellBackend(ExtendedPathSafeBackendMixin, LocalShel
 class _ExtendedPathSafeFilesystemBackend(ExtendedPathSafeBackendMixin, FilesystemBackend):
     """disabled 档位：混入 Windows 扩展前缀容错，理由同上。"""
 
-_MEMORY_NAMESPACE = lambda rt: ("memories",)  # noqa: E731
-"""/memories/ 路由的存储命名空间。
+_MEMORY_NAMESPACE = namespace_of_runtime
+"""/memories/ 路由的存储命名空间工厂。
 
-按固定前缀隔离，避免与其他业务的 Store 数据相互污染。
-"""
+WHY 按主体而不是全局固定前缀：Store 是共享空间，全局前缀意味着开了鉴权之后
+B 用户的 Agent 能读到 A 用户写下的记忆——跨用户泄漏，而不是「记忆没隔离」
+这种体验问题。主体由 ``AgentRunContext`` 经 LangGraph 的 ``Runtime.context``
+传进来（见 ``agent.run_context``）。"""
 
 
 def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:

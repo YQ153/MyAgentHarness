@@ -14,7 +14,13 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from application.dto import ModelInfo, UsageSummary
+from application.dto import (
+    MemoryDeleteResult,
+    MemoryListResult,
+    ModelInfo,
+    ToolListResult,
+    UsageSummary,
+)
 from application.errors import (
     InterruptExpiredError,
     NotFoundError,
@@ -23,11 +29,13 @@ from application.errors import (
     ThreadBusyError,
 )
 from application.events import AgentEvent
+from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.principal import Principal
 from application.run_service import RunService
 from application.thread_id import normalize_thread_id
 from application.thread_service import ThreadService
+from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
 from interfaces.web.auth import get_principal, require_permission
 from interfaces.web.deps import require_state
@@ -74,6 +82,16 @@ def get_usage(request: Request) -> UsageService:
     return require_state(request, "usage", "用量统计服务")
 
 
+def get_tool_catalog(request: Request) -> ToolCatalog:
+    """取出工具目录单例。"""
+    return require_state(request, "tools", "工具目录")
+
+
+def get_memory_service(request: Request) -> MemoryService:
+    """取出记忆管理服务单例。"""
+    return require_state(request, "memories", "记忆管理服务")
+
+
 def _validate_thread_id(thread_id: str) -> str:
     """校验路径参数中的会话 ID。
 
@@ -95,6 +113,23 @@ def _validate_thread_id(thread_id: str) -> str:
 async def list_models(catalog: ModelCatalog = Depends(get_catalog)) -> list[ModelInfo]:
     """列出可切换的模型。"""
     return catalog.list_models()
+
+
+@router.get("/tools", response_model=ToolListResult)
+async def list_tools(
+    catalog: ToolCatalog = Depends(get_tool_catalog),
+    principal: Principal = Depends(require_permission("tool:read")),
+) -> ToolListResult:
+    """列出当前生效的工具及其来源。
+
+    WHY 需要这个端点：MCP 服务器是在启动期静态加载的，加载失败时既没有
+    请求报错也没有界面提示——用户只会发现「助手不会做某件事」。把它做成
+    可查询的状态，才能让「装了但没生效」这类问题在首次排查时就被看见。
+
+    WHY 走 ``tool:read`` 而不是 ``system:models``：模型清单是「可选配置」，
+    工具清单是「实际具备的能力」，两者的变更来源与排查路径都不同。
+    """
+    return catalog.list_tools()
 
 
 @router.get("/usage", response_model=UsageSummary)
@@ -132,6 +167,57 @@ async def get_usage_summary(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.exception("用量聚合失败")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+
+@router.get("/memories", response_model=MemoryListResult)
+async def list_memories(
+    memories: MemoryService = Depends(get_memory_service),
+    principal: Principal = Depends(require_permission("memory:read")),
+) -> MemoryListResult:
+    """列出当前主体自己的长期记忆。
+
+    WHY 不做「管理员查看他人记忆」：记忆是个人数据（偏好、项目约定），跨主体
+    读取需要独立的授权与审计设计；管理员在本端点同样只看自己的那一份，否则
+    这个接口会变成一条绕过会话归属的旁路。
+    """
+    try:
+        return await memories.list_memories(principal)
+    except PermissionDeniedError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("读取长期记忆失败")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+
+@router.delete("/memories/{path:path}", response_model=MemoryDeleteResult)
+async def delete_memory(
+    path: str,
+    memories: MemoryService = Depends(get_memory_service),
+    principal: Principal = Depends(require_permission("memory:delete")),
+) -> MemoryDeleteResult:
+    """删除一条长期记忆。
+
+    WHY 用 ``{path:path}``：记忆路径自身含 ``/``（``/memories/notes.md``），
+    普通路径参数会在第一个分隔符处截断。路径以 ``notes.md``（相对挂载点）或
+    ``memories/notes.md``（完整虚拟路径，即 GET 返回值）传入均可，服务层统一
+    归一——前端直接把清单里的 path 拼在端点后面即可。
+
+    WHY 删除不存在的条目仍返回 200：这是一次幂等的「忘掉它」，界面刷新后
+    重放请求是正常行为；返回 404 只会让用户看到一条与真实结果无关的报错。
+    """
+    try:
+        return await memories.delete_memory(path, principal)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("删除长期记忆失败：path=%s", path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         ) from exc

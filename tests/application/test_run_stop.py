@@ -46,6 +46,7 @@ class ChunkedThenHangGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> Any:
         for chunk in self._chunks:
             yield chunk

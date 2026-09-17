@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from deepagents import create_deep_agent
@@ -17,14 +18,14 @@ from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     TodoListMiddleware,
 )
+from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.store.memory import InMemoryStore
 
 from agent.backends import build_backend
 from agent.guardrails import build_interrupt_on, build_permissions
 from agent.profiles import ensure_profiles_registered
+from agent.run_context import AgentRunContext
 from llm.registry import ModelRegistry, build_default_registry
-from runtime.store import build_store
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -60,8 +61,9 @@ def build_agent(
     config: AppConfig,
     *,
     checkpointer: BaseCheckpointSaver | None = None,
-    store: BaseStore | None = None,
+    store: BaseStore,
     model_name: str | None = None,
+    tools: Sequence[BaseTool] | None = None,
 ) -> CompiledStateGraph:
     """装配一个完整的 deep agent。
 
@@ -69,24 +71,30 @@ def build_agent(
         config: 应用配置，提供工作区、执行档位与护栏参数。
         checkpointer: 会话持久化实现；``None`` 时由调用方运行环境注入
             （例如 LangGraph Server 场景）。没有持久化则无法中断恢复。
-        store: 长期记忆存储；``None`` 时新建进程内存储。
+        store: 长期记忆存储；**必填**。持久化实现由装配层决定
+            （``runtime.store.open_store``）。
         model_name: 模型别名；``None`` 使用配置中的默认模型。
+        tools: 扩展工具（自定义工具与 MCP 工具）；``None`` 表示不扩展。
 
     Returns:
         已编译的 LangGraph 图。
 
     Raises:
+        ValueError: ``config`` 为 ``None``，或未提供 ``store``。
         RuntimeError: 模型初始化失败或装配过程出错。
     """
     if config is None:
         raise ValueError("config 不能为 None")
+    if store is None:
+        # WHY 不再自建内存兜底：静默退回内存存储会让「长期记忆」在进程重启后
+        # 悄悄消失，而开发期完全看不出来；装配层漏传时立刻失败才能被修掉。
+        raise ValueError("store 不能为 None，长期记忆与 /memories/ 路由都依赖它")
 
     registry = get_registry(config)
     resolved_name = model_name or registry.default_name
     model = registry.get(resolved_name)
 
-    effective_store: BaseStore = store if store is not None else build_store(config)
-    backend = build_backend(config, effective_store)
+    backend = build_backend(config, store)
 
     # WHY 显式补充 TodoListMiddleware：deepagents 0.7.14 的默认中间件栈不含
     # 规划能力，通用长任务必须自己挂上，否则 Agent 容易在多步任务中迷失。
@@ -104,12 +112,13 @@ def build_agent(
     ]
 
     logger.info(
-        "装配 Agent：model=%s mode=%s tier=%s skills=%d memory=%d",
+        "装配 Agent：model=%s mode=%s tier=%s skills=%d memory=%d tools=%d",
         resolved_name,
         config.execution_mode.value,
         config.sandbox_tier.value,
         len(config.skill_source_paths()),
         len(config.memory_paths),
+        len(tools or ()),
     )
 
     try:
@@ -117,6 +126,7 @@ def build_agent(
             model=model,
             system_prompt=_FALLBACK_SYSTEM_PROMPT,
             backend=backend,
+            tools=list(tools) if tools else None,
             skills=config.skill_source_paths() or None,
             memory=config.memory_paths or None,
             permissions=build_permissions(),
@@ -127,7 +137,11 @@ def build_agent(
             ),
             middleware=middleware,
             checkpointer=checkpointer,
-            store=effective_store,
+            store=store,
+            # WHY 声明 context_schema：长期记忆按主体隔离，而命名空间是图内
+            # 在调用时算出来的——主体只能经 ``Runtime.context`` 传进去。声明
+            # 类型后，多传/漏传会在调用点就被发现，而不是表现为「记忆串味」。
+            context_schema=AgentRunContext,
             name="universal-agent",
         )
     except Exception:
@@ -156,24 +170,31 @@ class AgentFactory:
         config: AppConfig,
         *,
         checkpointer: BaseCheckpointSaver | None = None,
-        store: BaseStore | None = None,
+        store: BaseStore,
+        tools: Sequence[BaseTool] | None = None,
     ) -> None:
         """构造工厂。
 
         Args:
             config: 应用配置。
             checkpointer: 会话持久化实现；``None`` 时无持久化，中断恢复不可用。
-            store: 长期记忆存储；``None`` 时新建进程内存储。
+            store: 长期记忆存储；**必填**，由装配层决定其实现在哪落盘。
+            tools: 扩展工具；``None`` 表示不扩展。
 
         Raises:
-            ValueError: ``config`` 为 ``None``。
+            ValueError: ``config`` 或 ``store`` 为 ``None``。
         """
         if config is None:
             raise ValueError("config 不能为 None")
+        if store is None:
+            raise ValueError("store 不能为 None，长期记忆与 /memories/ 路由都依赖它")
 
         self._config = config
         self._checkpointer = checkpointer
-        self._store: BaseStore = store if store is not None else build_store(config)
+        self._store: BaseStore = store
+        # WHY 元组化：工具集在装配完成后不应再被就地增删，否则同一进程里
+        # 先后装配的两张图会拿到不同的能力集。
+        self._tools: tuple[BaseTool, ...] = tuple(tools or ())
         self._cache: dict[str, CompiledStateGraph] = {}
         # WHY 用锁而非直接依赖 GIL：``get`` 可能被多个 worker 线程并发调用，
         # 重复装配会浪费一次完整的中间件栈构建，也可能突破 provider 侧限流。
@@ -214,6 +235,7 @@ class AgentFactory:
                 checkpointer=self._checkpointer,
                 store=self._store,
                 model_name=resolved_name,
+                tools=self._tools,
             )
             self._cache[resolved_name] = agent
             logger.info("已缓存 Agent 实例：model=%s", resolved_name)

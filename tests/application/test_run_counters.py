@@ -29,6 +29,7 @@ class InterruptingGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[tuple[str, Any]]:
         yield ("updates", {"__interrupt__": (_FakeInterrupt(),)})
 
@@ -47,6 +48,7 @@ class InterruptOnceGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[tuple[str, Any]]:
         self.calls += 1
         if self.calls == 1:

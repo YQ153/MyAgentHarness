@@ -623,3 +623,72 @@ button.small {
   text-align: center;
   color: var(--muted);
 }
+
+/* ---------- 长期记忆面板 ---------- */
+.memory-panel {
+  padding: 16px 18px;
+}
+
+.memory-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.memory-toolbar {
+  margin-bottom: 10px;
+}
+
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+/* 正文可能很长：撑开滚动而不是把删除按钮挤出视口 */
+.memory-item .m-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.memory-item .m-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.memory-item .m-content {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 9em;
+  overflow: hidden;
+}
+
+.memory-item .m-sub {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.memory-empty {
+  padding: 12px 0;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}

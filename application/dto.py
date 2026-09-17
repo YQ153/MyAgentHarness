@@ -179,3 +179,73 @@ class MetricsSnapshot(BaseModel):
         default=None, description="审计事件总数；``None`` 表示本次采集失败"
     )
     uptime_seconds: float = Field(description="进程已运行秒数")
+
+
+class ToolInfo(BaseModel):
+    """一个对模型可见的工具。
+
+    WHY 把内置工具一并列出：运维要回答的是「这个 Agent 究竟能做什么」，
+    只列扩展工具会让人误以为内置的文件与执行能力不存在。
+    """
+
+    name: str = Field(description="工具名，模型调用时使用")
+    source: str = Field(description="来源：builtin / custom / mcp")
+    description: str = Field(default="", description="工具描述；内置工具无描述时为空串")
+    server: str | None = Field(
+        default=None, description="来源 MCP 服务器名；非 MCP 工具为 None"
+    )
+
+
+class MCPServerInfo(BaseModel):
+    """一台 MCP 服务器的加载结果。"""
+
+    name: str = Field(description="服务器名")
+    transport: str = Field(description="传输方式：stdio / sse / streamable_http / websocket")
+    ok: bool = Field(description="工具清单是否加载成功")
+    tool_count: int = Field(default=0, description="该服务器提供的工具数")
+    error: str = Field(default="", description="失败原因摘要；成功时为空串")
+
+
+class ToolListResult(BaseModel):
+    """工具清单及其来源构成。"""
+
+    items: list[ToolInfo] = Field(description="全部生效工具，内置在前、扩展在后")
+    total: int = Field(description="工具总数")
+    custom_modules: list[str] = Field(description="已加载的自定义工具模块")
+    mcp_servers: list[MCPServerInfo] = Field(description="已配置的 MCP 服务器及其状态")
+
+
+class MemoryItem(BaseModel):
+    """一条长期记忆。
+
+    WHY 直接返回正文而不是只给路径：面板要回答的是「Agent 究竟记住了我什么」，
+    只列路径会把自查变成逐条点开；而记忆的内容本来就是用户自己产生的数据，
+    不存在「读了不该读的」这一层风险。
+    """
+
+    path: str = Field(description="记忆路径，形如 /memories/prefs.md")
+    content: str = Field(description="记忆正文；过长时被截断")
+    created_at: str = Field(default="", description="首次写入时间（ISO8601 UTC）")
+    updated_at: str = Field(default="", description="最近修改时间（ISO8601 UTC）")
+    truncated: bool = Field(default=False, description="正文是否被截断")
+
+
+class MemoryListResult(BaseModel):
+    """某主体的长期记忆清单。
+
+    WHY 带 ``truncated`` 标志：记忆条数或单条正文都可能被上限截断，而截断后
+    的清单与「记忆本来就这么少」在界面上无法区分——那会直接演变成
+    「我的记忆丢了」这类误报。
+    """
+
+    owner_id: str = Field(description="清单归属主体")
+    items: list[MemoryItem] = Field(description="按路径排序的记忆条目")
+    total: int = Field(description="本次返回的条目数")
+    truncated: bool = Field(default=False, description="是否因上限截断了条目或正文")
+
+
+class MemoryDeleteResult(BaseModel):
+    """删除一条长期记忆的结果。"""
+
+    path: str = Field(description="被删除的记忆路径")
+    deleted: bool = Field(description="是否确实移除了条目；False 表示该路径本就不存在")

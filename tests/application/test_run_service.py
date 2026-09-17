@@ -20,8 +20,9 @@ from application.errors import (
     ThreadBusyError,
 )
 from application.events import AgentEventType
+from agent.run_context import ANONYMOUS_USER_ID
 from application.principal import Principal
-from application.run_service import RunService
+from application.run_service import RunHandle, RunService
 from runtime.thread_store import ThreadMetaStore, open_thread_store
 
 from tests.conftest import make_config
@@ -38,6 +39,7 @@ class FakeGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[Any]:
         # WHY「return + 不可达 yield」：yield 的唯一作用是把本方法标记为
         # 异步生成器，调用方的 `async for` 语法才能成立。
@@ -56,6 +58,7 @@ class SlowGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[Any]:
         await asyncio.sleep(self._delay)
         return
@@ -211,6 +214,72 @@ async def test_stream_records_turn_metadata(test_config, thread_store):
     assert record["title"] == "hello world"
     # disabled 模式下所有者为空串
     assert record["owner_id"] == ""
+
+
+# ------------------------------------------------------------------ 记忆归属
+
+
+class ContextRecordingGraph:
+    """记录 ``astream`` 收到的 context，用于断言记忆归属确实进了图。"""
+
+    def __init__(self) -> None:
+        self.contexts: list[Any] = []
+
+    async def astream(
+        self,
+        payload: Any,
+        config: dict[str, Any] | None = None,
+        stream_mode: Any = None,
+        context: Any = None,
+    ) -> AsyncIterator[Any]:
+        self.contexts.append(context)
+        return
+        yield  # noqa: WPS328 不可达，仅为构造异步生成器
+
+
+async def test_stream_passes_memory_owner_into_graph_context(tmp_path, thread_store):
+    """归属必须随每轮运行进图：命名空间在图内算，缺了它记忆会落进匿名池。"""
+    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
+    graph = ContextRecordingGraph()
+    service = _make_service(config, thread_store, graph)
+
+    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
+
+    assert graph.contexts[0].user_id == "alice"
+
+
+async def test_resume_passes_memory_owner_into_graph_context(test_config, thread_store):
+    """恢复执行同样是「一轮运行」，认证关闭时归属必须与发起时同一口径。"""
+    graph = ContextRecordingGraph()
+    service = _make_service(test_config, thread_store, graph)
+    await _drain(await service.stream("t1", "hello"))
+
+    await _drain(await service.resume("t1", {"decisions": [{"type": "approve"}]}))
+
+    assert graph.contexts[-1].user_id == ANONYMOUS_USER_ID
+
+
+def test_memory_owner_falls_back_to_anonymous_in_disabled_mode():
+    """认证关闭时 owner_id 为空串，必须归一到匿名标识——否则 CLI 与 Web 各写一份。"""
+    handle = RunHandle(
+        thread_id="t1",
+        started_at=0.0,
+        cancel_event=asyncio.Event(),
+        owner_id="",
+    )
+
+    assert handle.memory_owner == ANONYMOUS_USER_ID
+
+
+def test_memory_owner_prefers_owner_id():
+    handle = RunHandle(
+        thread_id="t1",
+        started_at=0.0,
+        cancel_event=asyncio.Event(),
+        owner_id="alice",
+    )
+
+    assert handle.memory_owner == "alice"
 
 
 # ------------------------------------------------------------------ 权限与所有权

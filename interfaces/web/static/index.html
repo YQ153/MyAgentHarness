@@ -15,6 +15,8 @@
       </div>
       <div class="controls">
         <select id="model-select" title="切换模型"></select>
+        <!-- 记忆入口对所有人可见：记忆按主体收敛，认证关闭时是本地那一份 -->
+        <button id="memory-open" type="button">记忆</button>
         <div id="auth-status" class="auth-status"></div>
       </div>
     </header>
@@ -85,6 +87,27 @@
             <tbody></tbody>
           </table>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 长期记忆面板：数据来自 GET /api/memories，按主体收敛 -->
+  <div id="memory-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>我的记忆</h3>
+        <button id="memory-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <div class="memory-panel">
+        <p class="memory-hint">
+          Agent 写进 <code>/memories/</code> 的内容会跨会话保留，并进入后续每一轮
+          上下文。记错的内容在这里删掉——删除会记入审计日志。
+        </p>
+        <div class="memory-toolbar">
+          <button id="memory-refresh" type="button">刷新</button>
+        </div>
+        <div id="memory-list" class="memory-list"></div>
       </div>
     </div>
   </div>

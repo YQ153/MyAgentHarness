@@ -73,6 +73,7 @@ class ScriptedGraph:
         payload: Any,
         config: dict[str, Any] | None = None,
         stream_mode: Any = None,
+        context: Any = None,
     ) -> AsyncIterator[tuple[str, Any]]:
         text = _payload_text(payload)
         if "hang" in text:

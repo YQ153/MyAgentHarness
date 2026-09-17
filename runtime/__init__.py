@@ -2,13 +2,13 @@
 
 from runtime.checkpointer import checkpointer_context
 from runtime.rate_limiter import RateLimiter
-from runtime.store import build_store
+from runtime.store import open_store
 from runtime.thread_store import ThreadMetaStore, open_thread_store
 
 __all__ = [
     "RateLimiter",
     "ThreadMetaStore",
-    "build_store",
     "checkpointer_context",
+    "open_store",
     "open_thread_store",
 ]

@@ -7,14 +7,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from agent.run_context import ANONYMOUS_USER_ID, AgentRunContext
 from application.audit_context import audit_client_info
 from application.dto import GovernanceReport
 from application.errors import (
@@ -39,11 +41,40 @@ from text_utils import build_title
 
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
+    from application.tool_catalog import ToolCatalog
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
 
 _STREAM_MODES = ["messages", "updates"]
+
+_TOOL_ARGS_PREVIEW_CHARS = 500
+"""工具参数写入审计时的字符上限。
+
+WHY 需要截断：工具参数可以是整篇文件内容或长命令行，原样落库会让审计表
+的体积由「调用次数」变成「调用次数 × 参数体积」；而审计要回答的是「调了
+什么工具、带什么意图」，前若干字符已经足够定位。
+"""
+
+
+def _preview_args(args: Any) -> str:
+    """把工具参数压成一段可入库的短文本。
+
+    Args:
+        args: 翻译层给出的参数对象（通常是 dict，非法 JSON 时为 ``{"__raw__": ...}``）。
+
+    Returns:
+        截断后的 JSON 文本；无法序列化时退化为 ``repr``，绝不抛异常——
+        审计是旁路职责，不能因为参数里有不可序列化的对象而中断本轮运行。
+    """
+    try:
+        text = json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)
+    except Exception:
+        logger.debug("工具参数无法序列化为 JSON，退化用 repr", exc_info=True)
+        text = repr(args)
+    if len(text) > _TOOL_ARGS_PREVIEW_CHARS:
+        return text[:_TOOL_ARGS_PREVIEW_CHARS] + "…"
+    return text
 
 STOP_REASON_STOPPED = "stopped"
 """DONE 事件的停止原因：用户主动停止。"""
@@ -86,6 +117,19 @@ class RunHandle:
     """本轮使用的模型别名；``None`` 表示默认模型（落用量时按配置解析）。"""
     owner_id: str = ""
     """会话所有者；用量记录按它聚合，认证关闭时为空串。"""
+    actor_id: str = ""
+    """发起本轮运行的主体标识；工具审计按它归因，认证关闭时为 ``anonymous``。"""
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    """本轮发生的工具调用记录。
+
+    WHY 挂在句柄上而不是服务上：一轮运行的工具调用天然属于这一轮，按
+    thread_id 另建一份字典会多出一套「运行结束即清理」的生命周期管理，
+    而句柄本来就随运行释放。
+
+    WHY 用可变列表而不是 frozen 语义：记录是在同步热路径（``_track_event``）
+    里逐条追加的，落库则在流结束后统一进行；可变容器是这一写多读场景下
+    唯一不需要加锁的形态。
+    """
     stop_reason: str | None = None
     """停止原因；``None`` 表示尚未收到停止请求，取值见模块级常量。"""
 
@@ -98,6 +142,17 @@ class RunHandle:
     def elapsed_seconds(self) -> float:
         """已运行时长（秒）。"""
         return time.monotonic() - self.started_at
+
+    @property
+    def memory_owner(self) -> str:
+        """本轮运行长期记忆的归属主体。
+
+        WHY 直接复用 ``owner_id``：记忆是「这个用户的偏好」，与会话归属同源，
+        另存一份必然出现两者漂移。认证关闭时 ``owner_id`` 为空串，这里统一
+        落到匿名标识——否则空串会被当成一个独立命名空间，让同一台机器上
+        「CLI 写的记忆 Web 读不到」。
+        """
+        return self.owner_id or ANONYMOUS_USER_ID
 
     def request_stop(self, reason: str = STOP_REASON_STOPPED) -> None:
         """请求停止本次运行；重复调用时首次的原因生效。
@@ -119,6 +174,23 @@ class RunHandle:
         if self.stop_reason is None:
             object.__setattr__(self, "stop_reason", reason.strip())
         self.cancel_event.set()
+
+
+@dataclass(eq=False)
+class ToolCallRecord:
+    """一次工具调用的审计草稿。
+
+    WHY 单独成类：工具调用的开始（TOOL_CALL）与结束（TOOL_RESULT）是两个
+    不同的事件，耗时只有把它们配对后才能算出来；用一个记录对象承载这对
+    状态，比在两个字典里分别记时间戳更容易保证不漏、不串。
+    """
+
+    name: str
+    started_at: float
+    args_preview: str = ""
+    status: str = ""
+    """工具结果的 status；空串表示运行结束前都未收到结果。"""
+    elapsed_ms: int | None = None
 
 
 class _RunStoppedError(Exception):
@@ -144,6 +216,7 @@ class RunService:
         graph_factory: AgentFactory,
         audit_store: AuditStore | None = None,
         usage_store: UsageStore | None = None,
+        tool_catalog: ToolCatalog | None = None,
     ) -> None:
         """构造运行服务。
 
@@ -153,6 +226,8 @@ class RunService:
             graph_factory: 图工厂，提供已装配的 LangGraph 图。
             audit_store: 审计日志存储，可选。
             usage_store: Token 用量存储，可选；为 ``None`` 时不记录用量。
+            tool_catalog: 工具目录，用于审计时标注工具来源；``None`` 时
+                工具审计仍会记录，但来源字段为 ``None``。
 
         Raises:
             ValueError: 任一必需依赖为 ``None``。
@@ -169,6 +244,7 @@ class RunService:
         self._graph_factory = graph_factory
         self._audit_store = audit_store
         self._usage_store = usage_store
+        self._tool_catalog = tool_catalog
 
         # WHY 用 threading.Lock 保护「运行中」登记表：加解锁之间不 await，
         # 临界区极短；更重要的是释放动作必须能在 finally 里同步完成——
@@ -374,6 +450,7 @@ class RunService:
             normalized,
             model_name=model_name,
             owner_id=self._owner_id(principal),
+            actor_id=actor_id,
         )
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
@@ -455,6 +532,7 @@ class RunService:
             normalized,
             model_name=model_name,
             owner_id=self._owner_id(principal),
+            actor_id=actor_id,
         )
         return self._consume(graph, command, handle)
 
@@ -692,6 +770,12 @@ class RunService:
                         # 事件流本身在无存储的环境下（CLI、测试）依然完整。
                         await self._record_usage(handle, event.payload)
                     yield event
+
+                # WHY 只在正常收尾（含被停止）时落工具审计：客户端断开触发的
+                # ``CancelledError`` 会直接跳出本块，此时运行尚未结束、工具可能
+                # 仍在执行，写下的会是「进行中」的假记录；这类运行以 TCP 断开
+                # 结束，另有连接层日志可查。
+                await self._audit_tool_calls(handle)
         finally:
             # WHY 同步释放：客户端断开连接时这里可能正处于 GeneratorExit，
             # 任何 await 都可能破坏生成器的关闭流程。
@@ -734,6 +818,10 @@ class RunService:
 
             # 流结束后冲出最后一批未发送的工具调用
             for event in translator.flush():
+                # WHY 这里也要过一遍 _track_event：这些 TOOL_CALL 是真实发生
+                # 在流末（模型节点结束）的调用，审计与挂起登记的统计口径若
+                # 漏掉它们，就会出现「工具调用了但审计里没有」的缺口。
+                self._track_event(event, handle)
                 yield event
 
         except asyncio.CancelledError:
@@ -781,6 +869,75 @@ class RunService:
             # 中断意味着本轮运行已暂停等待人工决策，此刻登记挂起，
             # 由 resume 或下一轮用户输入清除。
             self.mark_hitl_pending(handle.thread_id)
+        elif event.event is AgentEventType.TOOL_CALL:
+            handle.tool_calls.append(
+                ToolCallRecord(
+                    name=str(event.payload.get("name") or "unknown"),
+                    started_at=time.monotonic(),
+                    args_preview=_preview_args(event.payload.get("args")),
+                )
+            )
+        elif event.event is AgentEventType.TOOL_RESULT:
+            self._close_tool_call(handle, event.payload)
+
+    @staticmethod
+    def _close_tool_call(handle: RunHandle, payload: dict[str, Any]) -> None:
+        """把工具结果配回到最近一条未结束的同名调用上。
+
+        WHY 从后往前找同名记录：并行工具调用时结果与调用的顺序并不保证
+        一致，按名字 + 未结束两个条件匹配是唯一不依赖顺序的做法；找不到
+        就丢弃这条结果的计时，而不是错误地记到别的工具上。
+        """
+        name = str(payload.get("name") or "")
+        for record in reversed(handle.tool_calls):
+            if record.status or record.elapsed_ms is not None:
+                continue
+            if name and record.name != name:
+                continue
+            record.status = str(payload.get("status") or "")
+            record.elapsed_ms = int((time.monotonic() - record.started_at) * 1000)
+            return
+
+    async def _audit_tool_calls(self, handle: RunHandle) -> None:
+        """落库本轮的工具调用审计。
+
+        WHY 在流结束后统一写而不是每次调用都写：``_track_event`` 处在事件
+        转发的热路径上，逐条 await 写库会让每一次工具调用都多一次 IO 往返；
+        先收集再批量落库，事件流的时延不受审计影响。
+
+        WHY 只审计扩展工具（默认）：内置文件操作频次高、风险已被 HITL 审批
+        覆盖，全部落库会让审计表随对话量线性膨胀；需要排查内置工具时可用
+        ``tool_audit_builtin`` 打开。
+        """
+        if self._audit_store is None or not handle.tool_calls:
+            return
+
+        actor_id = handle.actor_id or "anonymous"
+        for record in handle.tool_calls:
+            source = self._tool_catalog.source_of(record.name) if self._tool_catalog else "unknown"
+            if source == "builtin" and not self._config.tool_audit_builtin:
+                continue
+            outcome = "success"
+            if not record.status:
+                outcome = "interrupted"
+            elif record.status.lower() == "error":
+                outcome = "error"
+            await self._audit(
+                event_type="tool_call",
+                actor_id=actor_id,
+                target_id=handle.thread_id,
+                action=record.name,
+                outcome=outcome,
+                details={
+                    "tool": record.name,
+                    "source": source,
+                    "server": self._tool_catalog.server_of(record.name) if self._tool_catalog else None,
+                    "status": record.status or "interrupted",
+                    "elapsed_ms": record.elapsed_ms,
+                    "args_preview": record.args_preview,
+                },
+            )
+        handle.tool_calls.clear()
 
     async def _stream_graph(
         self,
@@ -798,6 +955,9 @@ class RunService:
             payload,
             config=build_runnable_config(self._config, handle.thread_id),
             stream_mode=_STREAM_MODES,
+            # WHY 必须显式传 context：长期记忆的命名空间在图内按主体计算，
+            # 缺了它记忆会落进匿名池——多用户部署下等于跨用户串味。
+            context=AgentRunContext(user_id=handle.memory_owner),
         )
         stop_task: asyncio.Task[bool] = asyncio.ensure_future(handle.cancel_event.wait())
         chunk_task: asyncio.Task[tuple[str, Any]] | None = None
@@ -839,6 +999,7 @@ class RunService:
         *,
         model_name: str | None = None,
         owner_id: str = "",
+        actor_id: str = "",
     ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
@@ -853,6 +1014,7 @@ class RunService:
             thread_id: 已规范化的会话 ID。
             model_name: 本轮使用的模型别名；``None`` 表示默认模型。
             owner_id: 会话所有者；认证关闭时为空串。
+            actor_id: 发起本轮运行的主体标识，用于工具审计归因。
 
         Returns:
             本次运行的句柄；停止请求与运行指标都通过它传递。
@@ -869,6 +1031,7 @@ class RunService:
                 cancel_event=asyncio.Event(),
                 model_name=model_name,
                 owner_id=owner_id,
+                actor_id=actor_id,
             )
             self._running[thread_id] = handle
             # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，

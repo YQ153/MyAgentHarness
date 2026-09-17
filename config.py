@@ -8,14 +8,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,147 @@ class SandboxTier(StrEnum):
     DOCKER = "docker"
 
 
+class MCPTransport(StrEnum):
+    """MCP 服务器的传输方式。
+
+    取值与 ``langchain-mcp-adapters`` 的 ``Connection`` 字面量一一对应，
+    HTTP 侧用 ``streamable_http`` 而非 ``http``——后者是该库早期版本的别名，
+    写成 ``http`` 会在建连阶段才报错，而配置应在加载期就拦下。
+    """
+
+    STDIO = "stdio"
+    SSE = "sse"
+    HTTP = "streamable_http"
+    WEBSOCKET = "websocket"
+
+
+class MCPServerSpec(BaseModel):
+    """单个 MCP 服务器的连接描述。
+
+    WHY 用模型而不是裸 dict：MCP 连接参数是最容易写错的一类配置（命令与
+    URL 二选一、headers/env 类型不同），用模型可以在加载期就给出「哪个字段
+    缺了」的精确报错，而不是等到建连超时才看到一条与配置无关的异常。
+
+    Attributes:
+        name: 服务器在本系统内的唯一标识，用于日志、审计与工具归属。
+        transport: 传输方式。
+        enabled: ``False`` 时保留配置但不建连——排查某个 server 的最快方式
+            是单独停掉它，而不是把整段配置删掉后再凭记忆补回。
+        command: ``stdio`` 传输下的可执行文件。
+        args: ``stdio`` 传输下的命令行参数。
+        env: ``stdio`` 传输下传给子进程的环境变量；**不继承宿主环境**，
+            避免把宿主机的 ``*_API_KEY`` 一并泄漏给第三方 MCP server。
+        cwd: ``stdio`` 子进程的工作目录。
+        url: ``sse`` / ``streamable_http`` / ``websocket`` 传输下的服务地址。
+        headers: HTTP 系传输的附加请求头（常用于承载鉴权令牌）。
+    """
+
+    model_config = {"extra": "forbid"}
+    """拼错的字段名直接报错，而不是被静默忽略后表现为「配置没生效」。"""
+
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    transport: MCPTransport = MCPTransport.STDIO
+    enabled: bool = True
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("transport", mode="before")
+    @classmethod
+    def _normalize_transport(cls, value: object) -> object:
+        """容错大小写与空白；与 ``execution_mode`` 保持同一口径。"""
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @model_validator(mode="after")
+    def _validate_transport(self) -> MCPServerSpec:
+        """按传输方式校验必需字段。
+
+        Raises:
+            ValueError: ``stdio`` 缺 ``command``，或 URL 类传输缺 ``url`` /
+                地址格式不对。
+        """
+        if self.transport is MCPTransport.STDIO:
+            if not self.command or not self.command.strip():
+                raise ValueError(f"MCP 服务器 {self.name}：stdio 传输必须提供 command")
+            return self
+
+        if not self.url or not self.url.strip():
+            raise ValueError(f"MCP 服务器 {self.name}：{self.transport.value} 传输必须提供 url")
+        scheme = self.url.split("://", 1)[0].lower()
+        expected = ("ws://", "wss://") if self.transport is MCPTransport.WEBSOCKET else ("http://", "https://")
+        if not self.url.startswith(expected):
+            raise ValueError(
+                f"MCP 服务器 {self.name}：{self.transport.value} 传输的 url 必须以 "
+                f"{' 或 '.join(expected)} 开头，实际：{scheme}://"
+            )
+        return self
+
+
+def parse_list_config(value: object, *, field: str, separators: tuple[str, ...]) -> object:
+    """把「列表型配置」的原始值解析成序列。
+
+    WHY 需要 ``NoDecode`` + 本函数：``pydantic-settings`` 对 ``list[...]`` 这类
+    复杂类型默认按 JSON 解码，``SANDBOX_ENV_ALLOWLIST=PATH,TEMP`` 会在加载期
+    抛一条与用户意图无关的 JSON 解析错误，而分隔符写法才是 shell 与 ``.env``
+    里的常规写法（``PATH`` 本身即如此）。这里同时接受两种形态：以 ``[`` 开头
+    按 JSON 解析，否则按分隔符切分。
+
+    WHY 解析权收在本函数而不是每个字段各写一份：四个列表型字段（工具模块、
+    MCP 清单、环境白名单、技能目录）需要完全一致的「空值、空白、非法类型」
+    口径，各写一份迟早会出现「某个字段把空串当成一个有效项」这类偏差。
+
+    Args:
+        value: 原始值，可能是环境变量字符串、已构造好的序列或 ``None``。
+        field: 字段名，仅用于错误信息与日志定位。
+        separators: 允许的分隔符，**第一个为主分隔符**。普通字符串列表用
+            ``,``；路径列表用 ``os.pathsep``（Windows 为 ``;``，POSIX 为 ``:``
+            ——路径本身可能含逗号，不能拿逗号当路径分隔符）。
+
+    Returns:
+        解析后的列表；``None`` 与空串都归一为空列表，空白项被剔除。
+        序列入参原样转成 ``list``，交由字段注解做元素级校验。
+
+    Raises:
+        ValueError: ``separators`` 为空；字符串以 ``[`` 开头但不是合法 JSON
+            数组；类型既非字符串也非序列。
+    """
+    if not separators:
+        msg = "separators 至少需要一个分隔符"
+        logger.error("%s：%s", field, msg)
+        raise ValueError(f"{msg}（字段：{field}）")
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError as exc:
+                msg = f"{field} 不是合法 JSON 数组：{exc}"
+                logger.error("%s", msg)
+                raise ValueError(msg) from exc
+            logger.debug("配置项 %s 按 JSON 解析出 %d 项", field, len(decoded))
+            return decoded
+        normalized = text
+        for separator in separators[1:]:
+            normalized = normalized.replace(separator, separators[0])
+        items = [item.strip() for item in normalized.split(separators[0]) if item.strip()]
+        logger.debug("配置项 %s 按分隔符 %r 解析出 %d 项", field, separators[0], len(items))
+        return items
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    msg = f"{field} 必须是字符串或序列，实际：{type(value).__name__}"
+    logger.error("%s", msg)
+    raise ValueError(msg)
+
+
 class AppConfig(BaseSettings):
     """应用配置。
 
@@ -129,7 +272,16 @@ class AppConfig(BaseSettings):
     workspace: Path = Path("./workspace")
     memory_file: Path = Path("./workspace/AGENTS.md")
     db_path: Path = Field(default=Path("./.data/agent.db"))
-    skill_dirs: list[Path] = Field(default_factory=lambda: [Path("./workspace/skills")])
+    skill_dirs: Annotated[list[Path], NoDecode] = Field(
+        default_factory=lambda: [Path("./workspace/skills")]
+    )
+    """技能目录（按顺序查找，越靠前优先级越高）。
+
+    环境变量支持两种写法：路径分隔符（Windows ``;`` / POSIX ``:``，与 ``PATH``
+    同口径）或 JSON 数组。**不用逗号**——路径本身可能含逗号，按逗号切会把
+    一个目录拆成两个不存在的目录，而失败表现为「技能没加载」这种难排查的
+    现象。
+    """
 
     # ---------------- 会话 ----------------
     thread_title_max_chars: int = Field(default=24, ge=1, le=200)
@@ -178,11 +330,17 @@ class AppConfig(BaseSettings):
     sandbox_cpu_percent: int = Field(default=50, ge=1, le=100)
     """CPU 占用硬上限百分比（Windows Job Object 生效）。"""
 
-    sandbox_env_allowlist: list[str] = Field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
+    sandbox_env_allowlist: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST)
+    )
     """允许传入子进程的环境变量白名单。
 
     WHY 白名单：宿主机环境常含 ``*_API_KEY``、云凭证、``USERPROFILE``，
     黑名单补不全；命令真正需要的变量只有固定的少数几个。
+
+    环境变量支持两种写法：逗号分隔（``SANDBOX_ENV_ALLOWLIST=PATH,TEMP``）
+    或 JSON 数组。大小写无需在意——``SandboxPolicy.sanitized_env`` 两侧都按
+    ``upper()`` 比较（Windows 环境变量名本身大小写不敏感）。
     """
 
     sandbox_network_mode: str = Field(default=NETWORK_MODE_NONE, pattern="^(none|host)$")
@@ -237,6 +395,69 @@ class AppConfig(BaseSettings):
 
     WHY 与两个阈值分开配置：阈值决定「判什么为超时 / 过期」，间隔决定「多久
     扫一次」；间隔即超时判定的最大误差，短间隔更精确但更频繁地取运行快照。
+    """
+
+    # ---------------- 工具扩展（自定义工具 / MCP） ----------------
+    custom_tool_modules: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    """需要加载的自定义工具模块（点分路径）。
+
+    模块需提供 ``TOOLS``（工具或可调用对象列表）或 ``register_tools(registry)``
+    二者之一。WHY 走配置而不是在内核里 import：新增一个工具不应该修改内核
+    代码，否则「工具集」就成了和内核同样的变更风险等级。
+
+    WHY 加载失败要直接报错（而非跳过）：模块名写错与工具缺失一样，都会被
+    用户感知为「Agent 突然不会做某件事了」，静默跳过只会让排查从加载期
+    推迟到某次具体对话失败时。
+
+    环境变量支持两种写法：逗号分隔（``CUSTOM_TOOL_MODULES=a.b,c.d``）或
+    JSON 数组（``CUSTOM_TOOL_MODULES=["a.b","c.d"]``）。
+    """
+
+    mcp_enabled: bool = True
+    """MCP 总开关。
+
+    WHY 单独留一个总开关：逐个把 server 的 ``enabled`` 置为 False 需要改
+    N 处，而排障时最常见的需求正是「先整体关掉外部工具」。未配置任何
+    server 时，本开关无论取何值都不会产生连接。
+    """
+
+    mcp_servers: list[MCPServerSpec] = Field(default_factory=list)
+    """MCP 服务器清单；环境变量写法为 JSON 数组（``MCP_SERVERS=[{...}]``）。
+
+    WHY 不把连接参数硬编码进代码：MCP server 是部署环境相关的外部进程，
+    本地与服务器上的命令路径、鉴权头都不一样；硬编码会让同一份代码在
+    两个环境里只有一个能跑。
+    """
+
+    mcp_tool_name_prefix: bool = True
+    """是否为 MCP 工具名加上 ``服务器名_`` 前缀。
+
+    WHY 默认开启：两个 server 提供同名工具时，后加载者会覆盖前者，而模型
+    只看到一个工具——这种「装了两个实际只生效一个」的失败没有任何报错。
+    加前缀后冲突在注册期就会显式暴露。
+    """
+
+    mcp_load_timeout_seconds: int = Field(default=15, ge=1)
+    """单个 MCP server 拉取工具清单的超时秒数。
+
+    WHY 必须有：stdio 型 server 启动失败时往往既不退出也不响应握手，
+    没有超时会让整个装配流程永久挂起，表现为「服务起不来但没有报错」。
+    """
+
+    mcp_fail_fast: bool = False
+    """某个 MCP server 加载失败时是否阻断启动。
+
+    WHY 默认不阻断：MCP server 多为第三方进程，让它成为本服务的可用性
+    单点并不划算；降级时仍会写 ERROR 日志并在 ``/api/tools`` 里暴露失败
+    状态，属于「显式降级」而非静默吞错。
+    """
+
+    tool_audit_builtin: bool = False
+    """是否把内置工具（读写文件、执行命令等）的调用也写入审计。
+
+    WHY 默认关闭：内置工具在一次多步任务里可能被调用几十次，全量落库会
+    让审计表体积随对话量线性膨胀，反而冲淡真正需要留痕的扩展工具调用；
+    而内置命令执行本身已由 HITL 审批留痕。排障内置工具行为时可临时打开。
     """
 
     # ---------------- HTTP 服务 ----------------
@@ -372,6 +593,23 @@ class AppConfig(BaseSettings):
         """
         return value.expanduser().resolve()
 
+    @field_validator("skill_dirs", mode="before")
+    @classmethod
+    def _parse_skill_dirs(cls, value: object) -> object:
+        """按路径分隔符切分技能目录，口径见 ``parse_list_config``。
+
+        WHY 用 ``os.pathsep`` 而不是逗号：路径本身可能含逗号，按逗号切会把
+        一个目录拆成两个不存在的目录，而症状是「技能没加载」——排障时不会
+        有人想到去查分隔符。
+        """
+        return parse_list_config(value, field="skill_dirs", separators=(os.pathsep,))
+
+    @field_validator("sandbox_env_allowlist", mode="before")
+    @classmethod
+    def _parse_env_allowlist(cls, value: object) -> object:
+        """按逗号切分环境变量白名单，口径见 ``parse_list_config``。"""
+        return parse_list_config(value, field="sandbox_env_allowlist", separators=(",",))
+
     @field_validator("skill_dirs", mode="after")
     @classmethod
     def _expand_dirs(cls, value: list[Path]) -> list[Path]:
@@ -392,6 +630,45 @@ class AppConfig(BaseSettings):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+    @field_validator("mcp_servers", mode="after")
+    @classmethod
+    def _validate_mcp_server_names(cls, value: list[MCPServerSpec]) -> list[MCPServerSpec]:
+        """服务器名必须唯一。
+
+        WHY 在加载期就判重：名字同时是日志标识、审计字段与工具前缀来源，
+        重名会让「这条工具来自哪个 server」这个问题失去答案。
+        """
+        seen: set[str] = set()
+        for spec in value:
+            if spec.name in seen:
+                raise ValueError(f"MCP 服务器名重复：{spec.name}")
+            seen.add(spec.name)
+        return value
+
+    @field_validator("custom_tool_modules", mode="before")
+    @classmethod
+    def _parse_tool_modules(cls, value: object) -> object:
+        """把配置里的模块清单解析成列表，口径见 ``parse_list_config``。
+
+        点分模块名不含逗号，因此用逗号分隔（与 ``SANDBOX_ENV_ALLOWLIST`` 同一
+        口径）；JSON 数组写法同样接受。
+        """
+        return parse_list_config(value, field="custom_tool_modules", separators=(",",))
+
+    @field_validator("custom_tool_modules", mode="after")
+    @classmethod
+    def _strip_tool_modules(cls, value: list[str]) -> list[str]:
+        """去掉空白项与多余空格。
+
+        WHY 空串要剔除：``CUSTOM_TOOL_MODULES=""`` 在 shell 里解出一个空串，
+        当模块名去 import 只会得到一条与用户意图无关的 ImportError。
+
+        非字符串项由 ``list[str]`` 的元素校验拦下（本方法之前的注解校验），
+        因此这里只需处理字符串的空白——若在此再判一次类型，那行代码永远
+        不可达，反而让人误以为有两条防线。
+        """
+        return [item.strip() for item in value if item.strip()]
 
     @field_validator("sandbox_wsl_distro", mode="before")
     @classmethod
@@ -428,6 +705,19 @@ class AppConfig(BaseSettings):
         if missing:
             logger.warning("以下技能目录不存在，已跳过：%s", [str(item) for item in missing])
         return existing
+
+    def active_mcp_servers(self) -> list[MCPServerSpec]:
+        """返回本次启动需要真正连接的 MCP 服务器。
+
+        WHY 单独提供该方法而不是让调用方自己判 ``mcp_enabled``：开关语义
+        （总开关 + 单 server 开关）只有一份定义，散到调用方后必然出现
+        「总开关关了但仍尝试建连」这类不一致。
+        """
+        if not self.mcp_enabled:
+            if self.mcp_servers:
+                logger.info("MCP 总开关已关闭，跳过 %d 个已配置的服务器", len(self.mcp_servers))
+            return []
+        return [spec for spec in self.mcp_servers if spec.enabled]
 
     def skill_source_paths(self) -> list[str]:
         """返回 deepagents ``skills`` 参数所需的 POSIX 路径列表。

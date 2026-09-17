@@ -45,6 +45,11 @@
     copyMsg: document.getElementById('copy-msg'),
     auditRefresh: document.getElementById('audit-refresh'),
     auditTableBody: document.querySelector('#audit-table tbody'),
+    memoryOpen: document.getElementById('memory-open'),
+    memoryModal: document.getElementById('memory-modal'),
+    memoryClose: document.getElementById('memory-close'),
+    memoryRefresh: document.getElementById('memory-refresh'),
+    memoryList: document.getElementById('memory-list'),
   };
 
   const state = {
@@ -54,6 +59,7 @@
     toolNodes: [],
     auth: { mode: 'disabled', principal: null },
     admin: { apikeys: [] },
+    memories: { items: [], truncated: false },
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -932,6 +938,101 @@
     els.apikeyPopup.querySelector('.modal-backdrop').addEventListener('click', closeApiKeyPopup);
   }
 
+  /* ------------------------------------------------------------------ 长期记忆面板 */
+
+  /**
+   * 把记忆路径拼成接口 URL。
+   * WHY 逐段编码：路径里可能是中文（模型常写「偏好.md」），而整体
+   * encodeURIComponent 会把分隔符 `/` 一并编码，后端就只能拿到一个被压成
+   * 单段的路径。
+   */
+  function memoryUrl(path) {
+    return `/api/memories${String(path)
+      .split('/')
+      .map((segment) => encodeURIComponent(segment))
+      .join('/')}`;
+  }
+
+  function openMemoryModal() {
+    els.memoryModal.style.display = '';
+    loadMemories();
+  }
+
+  function closeMemoryModal() {
+    els.memoryModal.style.display = 'none';
+  }
+
+  async function loadMemories() {
+    els.memoryList.innerHTML = '';
+    els.memoryList.appendChild(el('div', 'memory-empty', '加载中…'));
+    try {
+      const response = await api('/api/memories');
+      const payload = await response.json();
+      state.memories = { items: payload.items || [], truncated: !!payload.truncated };
+      renderMemories();
+    } catch (err) {
+      state.memories = { items: [], truncated: false };
+      els.memoryList.innerHTML = '';
+      els.memoryList.appendChild(el('div', 'memory-empty', `加载失败：${err.message}`));
+    }
+  }
+
+  function renderMemories() {
+    const container = els.memoryList;
+    container.innerHTML = '';
+    const items = state.memories.items;
+
+    if (!items.length) {
+      container.appendChild(
+        el('div', 'memory-empty', '还没有记忆。Agent 在对话中记下的长期偏好会出现在这里。')
+      );
+      return;
+    }
+
+    // WHY 显式提示截断：被截断的清单与「记忆本来就少」在界面上无法区分，
+    // 用户会直接理解成「我的记忆丢了」。
+    if (state.memories.truncated) {
+      container.appendChild(el('div', 'memory-empty', '条目较多，仅显示前一部分。'));
+    }
+
+    items.forEach((item) => {
+      const row = el('div', 'memory-item');
+      const main = el('div', 'm-main');
+      main.appendChild(el('div', 'm-path', item.path));
+      main.appendChild(el('div', 'm-content', item.content || '（空内容）'));
+
+      const sub = [formatTime(item.updated_at)];
+      if (item.truncated) sub.push('内容已截断');
+      main.appendChild(el('div', 'm-sub', sub.filter(Boolean).join(' · ')));
+      row.appendChild(main);
+
+      const remove = el('button', 'danger small', '删除');
+      remove.type = 'button';
+      remove.addEventListener('click', () => removeMemory(item));
+      row.appendChild(remove);
+      container.appendChild(row);
+    });
+  }
+
+  async function removeMemory(item) {
+    // WHY 二次确认：删除不可撤销（服务端只记审计、不保留副本），而记忆会进入
+    // 后续每一轮上下文——误删的代价远高于多点一次确认。
+    if (!window.confirm(`删除这条记忆？\n${item.path}`)) return;
+    try {
+      await api(memoryUrl(item.path), { method: 'DELETE' });
+      await loadMemories();
+    } catch (err) {
+      window.alert(`删除失败：${err.message}`);
+    }
+  }
+
+  function bindMemoryEvents() {
+    els.memoryOpen.addEventListener('click', openMemoryModal);
+    els.memoryClose.addEventListener('click', closeMemoryModal);
+    els.memoryRefresh.addEventListener('click', () => loadMemories());
+    els.memoryModal.querySelector('.modal-backdrop').addEventListener('click', closeMemoryModal);
+  }
+
   async function loadAuth() {
     try {
       const cfgResponse = await api('/auth/config');
@@ -961,6 +1062,7 @@
 
     bindEvents();
     bindAdminEvents();
+    bindMemoryEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
     // 让「URL 变化 → 同步界面」成为唯一入口，避免两处逻辑漂移

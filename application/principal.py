@@ -10,6 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import FrozenSet
 
+# WHY 从 agent 层取常量：匿名主体标识必须与长期记忆命名空间用的兜底标识是
+# 同一个值，否则「认证关闭」与「未带运行时」两种兜底会落进两个记忆池。
+# 方向只能是 agent → application 的反向（agent 不得依赖本包），因此常量定义
+# 放在 agent.run_context，这里引用它而不是各写一份字面量。
+from agent.run_context import ANONYMOUS_USER_ID
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -63,6 +69,9 @@ PERMISSIONS = {
     "file:execute": "execute tool in sandbox/local mode",
     "system:models": "GET /api/models",
     "usage:read": "GET /api/usage（用量统计）",
+    "tool:read": "GET /api/tools（生效工具清单与 MCP 服务器状态）",
+    "memory:read": "GET /api/memories（长期记忆清单）",
+    "memory:delete": "DELETE /api/memories/{path}（删除单条长期记忆）",
     "apikey:manage": "管理 API Key（创建/列出/吊销）",
     "audit:read": "读取审计日志",
     "admin:all": "所有资源的所有操作",
@@ -87,10 +96,19 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
             "hitl:approve",
             "file:read",
             "usage:read",
+            # WHY member 也有 tool:read：工具清单回答的是「这个助手能做什么」，
+            # 是使用者的基本知情项；它不含任何他人数据，收紧到 admin 只会
+            # 让成员靠猜。真正敏感的是「调用工具」，而那由执行审批把关。
+            "tool:read",
+            # WHY member 也有 memory:delete：记忆是 Agent 对「我」的画像，
+            # 「让它忘掉这条」属于使用者自查自纠的一部分，与删除自己的会话
+            # 同量级；服务层按 owner 收敛，拿到权限也删不到别人的记忆。
+            "memory:read",
+            "memory:delete",
         }
     ),
     "admin": frozenset(PERMISSIONS.keys()),
 }
 
 # 系统保留的匿名主体，用于 auth_mode=disabled 保持向后兼容。
-ANONYMOUS_PRINCIPAL = Principal(user_id="__anonymous__", role="admin", auth_method="disabled")
+ANONYMOUS_PRINCIPAL = Principal(user_id=ANONYMOUS_USER_ID, role="admin", auth_method="disabled")

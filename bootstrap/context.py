@@ -10,9 +10,11 @@ if TYPE_CHECKING:
 
     from agent.graph import AgentFactory
     from application.health import HealthService
+    from application.memory_service import MemoryService
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
     from application.thread_service import ThreadService
+    from application.tool_catalog import ToolCatalog
     from application.usage_service import UsageService
     from config import AppConfig
     from runtime.api_key_store import APIKeyStore
@@ -44,6 +46,8 @@ class AppContext:
         health: 健康检查与运行指标服务。
         usage_store: Token 用量存储。
         usage: 用量统计服务。
+        tools: 生效工具目录（内置 + 自定义 + MCP）。
+        memories: 长期记忆管理服务（查看 / 删除）。
     """
 
     config: AppConfig
@@ -59,3 +63,5 @@ class AppContext:
     health: HealthService
     usage_store: UsageStore
     usage: UsageService
+    tools: ToolCatalog
+    memories: MemoryService
