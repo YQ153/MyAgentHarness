@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from text_utils import build_title
+from text_utils import build_title, collapse_whitespace
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -68,6 +68,41 @@ def normalize_thread_id(thread_id: str) -> str:
         )
     return normalized
 
+def normalize_search_query(query: str | None) -> str | None:
+    """校验并归一标题搜索关键字。
+
+    WHY 放在模块级并公开：与 ``normalize_thread_id`` 同理——搜索关键字的合法性
+    只有一份定义，应用层（决定回 400 还是 500）与存储层（拼接 LIKE 模式）各自
+    调用，避免「服务层放行、存储层拒绝」这种口径不一致；也让服务层的校验不依赖
+    「存储实现恰好也会校验」这一巧合。
+
+    WHY 需要长度上限：搜索串会被拼进 LIKE 模式，超长输入除了无意义地扫描全表外
+    没有任何作用；上限取与标题硬上限一致，保证能被搜到的标题一定在模式长度之内。
+
+    Args:
+        query: 原始关键字。
+
+    Returns:
+        归一后的关键字；``None`` 与空白串都表示「不过滤」。
+
+    Raises:
+        ValueError: 非字符串或超出长度上限。
+    """
+    if query is None:
+        return None
+    if not isinstance(query, str):
+        raise ValueError(f"query 必须是字符串，实际：{type(query).__name__}")
+    collapsed = collapse_whitespace(query)
+    if not collapsed:
+        return None
+    if len(collapsed) > _MAX_TITLE_CHARS:
+        raise ValueError(f"query 过长（{len(collapsed)} > {_MAX_TITLE_CHARS}）")
+    return collapsed
+
+
+# ``archived`` 是软删除标记（0/1），``archived_at`` 记录归档时刻、取消归档时清空。
+# WHY 用软删除：删除会连带清掉检查点且不可恢复，而多数时候用户只是想让清单干净，
+# 过一阵还想翻回来；真删除仍由 ``delete`` 提供。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_meta (
     thread_id     TEXT PRIMARY KEY,
@@ -75,7 +110,9 @@ CREATE TABLE IF NOT EXISTS thread_meta (
     title         TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    turn_count    INTEGER NOT NULL DEFAULT 0
+    turn_count    INTEGER NOT NULL DEFAULT 0,
+    archived      INTEGER NOT NULL DEFAULT 0,
+    archived_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
@@ -89,9 +126,74 @@ _MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_thread_meta_owner_updated
         ON thread_meta (owner_id, updated_at DESC, thread_id DESC);
     """,
+    # 归档列：老库升级路径。SQLite 的 ADD COLUMN 带默认值会为既有行填默认值，
+    # 因此升级后所有历史会话都处于「未归档」，与升级前的可见性一致。
+    """
+    ALTER TABLE thread_meta ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+    """,
+    """
+    ALTER TABLE thread_meta ADD COLUMN archived_at TEXT NOT NULL DEFAULT '';
+    """,
+    # 列表默认过滤 archived = 0 并按 updated_at 排序，索引把过滤与排序一起覆盖，
+    # 避免归档会话一多就退化成全表扫描 + 临时排序。
+    """
+    CREATE INDEX IF NOT EXISTS idx_thread_meta_archived_updated
+        ON thread_meta (archived, updated_at DESC, thread_id DESC);
+    """,
 ]
 
-_COLUMNS = "thread_id, owner_id, title, created_at, updated_at, turn_count"
+_COLUMNS = "thread_id, owner_id, title, created_at, updated_at, turn_count, archived, archived_at"
+
+_LIKE_ESCAPE = "\\"
+"""LIKE 通配符的转义字符。"""
+
+
+def _escape_like(text: str) -> str:
+    """转义 LIKE 模式里的通配符。
+
+    WHY 必须转义：``%`` 与 ``_`` 是 LIKE 的元字符。用户搜「50%」时若原样拼进
+    模式串，会匹配到**所有**标题——现象是「搜索结果变多了」，极难联想到转义，
+    因此这里连同转义符本身一起处理。
+    """
+    for char in (_LIKE_ESCAPE, "%", "_"):
+        text = text.replace(char, _LIKE_ESCAPE + char)
+    return text
+
+
+def _build_filters(
+    *,
+    owner_id: str | None,
+    include_unowned: bool,
+    query: str | None,
+    include_archived: bool,
+) -> tuple[str, list[Any]]:
+    """把查询条件编译成 WHERE 子句与参数。
+
+    WHY 抽成函数：``list_threads`` 与 ``count`` 必须用**完全相同**的过滤条件，
+    否则分页元信息会与实际返回条数不符（表现为「还有下一页」但翻过去是空的）。
+    此前 owner 条件已在两处各写一遍，归档与搜索再加进来就是四份。
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    # WHY 默认排除归档：归档的语义就是「从清单里收起来」，若默认仍返回，
+    # 这个功能等于没做。
+    if not include_archived:
+        conditions.append("archived = 0")
+
+    if owner_id is not None:
+        if include_unowned:
+            conditions.append("(owner_id = ? OR owner_id = '')")
+        else:
+            conditions.append("owner_id = ?")
+        params.append(owner_id)
+
+    if query:
+        conditions.append(f"title LIKE ? ESCAPE '{_LIKE_ESCAPE}'")
+        params.append(f"%{_escape_like(query)}%")
+
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    return where, params
 
 
 def _utc_now() -> str:
@@ -102,6 +204,19 @@ def _utc_now() -> str:
     排序可以完全交给索引而无需任何转换函数。
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _row_to_record(row: Any) -> dict[str, Any]:
+    """把数据库行转换成对外的元数据字典。
+
+    WHY 单独做一次转换而不是直接 ``dict(row)``：``archived`` 在库里是 INTEGER
+    （SQLite 没有布尔类型），直接把 0/1 透出去会让上层面对两种表示——
+    而「真值判断」的写法在 0/1 下碰巧能工作，直到有人拿它做 ``is True`` 比较
+    或序列化成 JSON 才暴露出来。
+    """
+    record = dict(row)
+    record["archived"] = bool(record.get("archived"))
+    return record
 
 
 def _normalize_title(title: str | None) -> str:
@@ -326,6 +441,94 @@ class ThreadMetaStore:
             logger.debug("刷新活动时间未命中任何行：thread=%s", normalized_id)
         return updated
 
+    async def rename(self, thread_id: str, title: str) -> dict[str, Any] | None:
+        """改写会话标题。
+
+        WHY 不改 ``updated_at``：列表按「最近对话活动」排序，而改名不是对话活动。
+        若改名刷新时间，用户整理一次标题就会把整个列表顺序打乱——那是纯粹的
+        副作用，用户不会把顺序变化归因到「我刚改了标题」。
+
+        WHY 超长标题报错而不是截断：截断会让「我输入的标题」与「列表里的标题」
+        不一致，而这种差异只在标题很长时才出现，用户只会觉得界面在乱改他的输入。
+        存储层的硬上限仍然保留，作为绕过服务层直接调用的兜底。
+
+        Args:
+            thread_id: 会话 ID。
+            title: 新标题。
+
+        Returns:
+            更新后的元数据；``None`` 表示会话不存在（调用方应判定为 404）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法、标题为空或超出长度上限。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        collapsed = collapse_whitespace(title)
+        if not collapsed:
+            raise ValueError("标题不能为空")
+        if len(collapsed) > _MAX_TITLE_CHARS:
+            raise ValueError(f"标题过长（{len(collapsed)} > {_MAX_TITLE_CHARS}）")
+
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET title = ? WHERE thread_id = ?",
+                    (collapsed, normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("改写会话标题失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("改写标题未命中任何行：thread=%s", normalized_id)
+            return None
+        logger.info("会话标题已改写：thread=%s", normalized_id)
+        return await self.get(normalized_id)
+
+    async def set_archived(self, thread_id: str, archived: bool) -> dict[str, Any] | None:
+        """设置会话的归档状态（软删除）。
+
+        WHY 不改 ``updated_at``：理由同 ``rename`` ——归档是清单操作，不是对话活动。
+        归档时刻记在 ``archived_at`` 里，取消归档时清空，避免留下「已恢复但仍有
+        归档时间」这种自相矛盾的记录。
+
+        Args:
+            thread_id: 会话 ID。
+            archived: ``True`` 归档，``False`` 恢复。
+
+        Returns:
+            更新后的元数据；``None`` 表示会话不存在（调用方应判定为 404）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法或 ``archived`` 不是布尔值。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        if not isinstance(archived, bool):
+            raise ValueError(f"archived 必须是布尔值，实际：{type(archived).__name__}")
+
+        archived_at = _utc_now() if archived else ""
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET archived = ?, archived_at = ? WHERE thread_id = ?",
+                    (1 if archived else 0, archived_at, normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("设置会话归档状态失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("设置归档状态未命中任何行：thread=%s", normalized_id)
+            return None
+        logger.info("会话归档状态已更新：thread=%s archived=%s", normalized_id, archived)
+        return await self.get(normalized_id)
+
     async def delete(self, thread_id: str) -> bool:
         """删除会话元数据。
 
@@ -410,7 +613,7 @@ class ThreadMetaStore:
                 logger.exception("读取会话元数据失败：thread=%s", normalized_id)
                 raise
 
-        return dict(row) if row is not None else None
+        return _row_to_record(row) if row is not None else None
 
     async def list_threads(
         self,
@@ -419,6 +622,8 @@ class ThreadMetaStore:
         include_unowned: bool = False,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """按最近活动时间倒序列出会话。
 
@@ -428,26 +633,27 @@ class ThreadMetaStore:
                 用于向后兼容与迁移场景。
             limit: 返回条数，1..200。
             offset: 跳过的条数，用于分页。
+            query: 标题关键字；``None`` 或空串表示不过滤。**只搜标题**——
+                消息正文存在检查点的 msgpack BLOB 里，检索需要逐条反序列化，
+                那是另一个量级的成本（详见项目文档的已知限制）。
+            include_archived: 是否连同已归档的会话一起返回。
 
         Returns:
             元数据字典列表，最近活动的在前。
 
         Raises:
-            ValueError: 分页参数非法。
+            ValueError: 分页参数或 ``query`` 非法。
             aiosqlite.Error: 数据库层异常，原样向上抛出。
         """
         self._validate_paging(limit, offset)
+        normalized_query = normalize_search_query(query)
 
-        conditions = []
-        params: list[Any] = []
-        if owner_id is not None:
-            if include_unowned:
-                conditions.append("(owner_id = ? OR owner_id = '')")
-            else:
-                conditions.append("owner_id = ?")
-            params.append(owner_id)
-
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        where, params = _build_filters(
+            owner_id=owner_id,
+            include_unowned=include_unowned,
+            query=normalized_query,
+            include_archived=include_archived,
+        )
         sql = f"""
             SELECT {_COLUMNS} FROM thread_meta
             {where}
@@ -461,37 +667,51 @@ class ThreadMetaStore:
                 async with self._conn.execute(sql, tuple(params)) as cursor:
                     rows = await cursor.fetchall()
             except Exception:
-                logger.exception("查询会话列表失败：limit=%s offset=%s", limit, offset)
+                logger.exception(
+                    "查询会话列表失败：limit=%s offset=%s query=%s archived=%s",
+                    limit,
+                    offset,
+                    normalized_query,
+                    include_archived,
+                )
                 raise
 
-        logger.debug("会话列表查询完成：返回 %d 条（offset=%s）", len(rows), offset)
-        return [dict(row) for row in rows]
+        logger.debug(
+            "会话列表查询完成：返回 %d 条（offset=%s query=%s）",
+            len(rows),
+            offset,
+            normalized_query,
+        )
+        return [_row_to_record(row) for row in rows]
 
     async def count(
         self,
         *,
         owner_id: str | None = None,
         include_unowned: bool = False,
+        query: str | None = None,
+        include_archived: bool = False,
     ) -> int:
         """返回会话总数，用于分页元信息。
 
         Args:
             owner_id: 只统计该所有者的会话；``None`` 表示不限制。
             include_unowned: 是否同时统计 ``owner_id=''`` 的会话。
+            query: 标题关键字；必须与 ``list_threads`` 传同一个值，
+                否则总数与实际返回条数不符。
+            include_archived: 是否连同已归档的会话一起统计。
 
         Raises:
+            ValueError: ``query`` 非法。
             aiosqlite.Error: 数据库层异常，原样向上抛出。
         """
-        conditions = []
-        params: list[Any] = []
-        if owner_id is not None:
-            if include_unowned:
-                conditions.append("(owner_id = ? OR owner_id = '')")
-            else:
-                conditions.append("owner_id = ?")
-            params.append(owner_id)
-
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        normalized_query = normalize_search_query(query)
+        where, params = _build_filters(
+            owner_id=owner_id,
+            include_unowned=include_unowned,
+            query=normalized_query,
+            include_archived=include_archived,
+        )
         sql = f"SELECT COUNT(1) FROM thread_meta {where}"
 
         async with self._lock:

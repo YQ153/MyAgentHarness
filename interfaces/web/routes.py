@@ -18,6 +18,7 @@ from application.dto import (
     MemoryDeleteResult,
     MemoryListResult,
     ModelInfo,
+    ThreadSummary,
     ToolListResult,
     UsageSummary,
 )
@@ -47,6 +48,7 @@ from interfaces.web.schemas import (
     StopResponse,
     ThreadListResponse,
     ThreadResponse,
+    ThreadUpdateRequest,
 )
 from interfaces.web.sse import SSE_HEADERS, encode_sse
 
@@ -240,6 +242,8 @@ async def create_thread(
 async def list_threads(
     limit: int = Query(default=50, ge=1, le=200, description="返回条数"),
     offset: int = Query(default=0, ge=0, description="跳过的条数"),
+    query: str | None = Query(default=None, description="标题关键字；不传表示不过滤"),
+    include_archived: bool = Query(default=False, description="是否包含已归档的会话"),
     threads: ThreadService = Depends(get_threads),
     principal: Principal = Depends(require_permission("thread:list")),
 ) -> ThreadListResponse:
@@ -248,9 +252,19 @@ async def list_threads(
     WHY 注册在 ``/threads/{thread_id}`` 之前：路径段数不同本不冲突，但把集合
     资源放在单资源之前可以让路由表读起来与 REST 语义一致，避免以后新增
     ``/threads/summary`` 之类的静态子路径时被参数路由抢先匹配。
+
+    WHY 搜索只匹配标题：正文存在检查点的 msgpack BLOB 里，逐条反序列化检索的
+    成本与「列一张窄表」完全不是一个量级；把这条边界写在接口上，比让它表现成
+    「搜索偶尔很慢」要诚实。
     """
     try:
-        result = await threads.list_threads(principal, limit=limit, offset=offset)
+        result = await threads.list_threads(
+            principal,
+            limit=limit,
+            offset=offset,
+            query=query,
+            include_archived=include_archived,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -261,6 +275,53 @@ async def list_threads(
         ) from exc
 
     return ThreadListResponse(items=result.items, total=result.total)
+
+
+@router.patch("/threads/{thread_id}", response_model=ThreadSummary)
+async def update_thread(
+    thread_id: str,
+    body: ThreadUpdateRequest,
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:update")),
+) -> ThreadSummary:
+    """重命名或归档会话。
+
+    WHY 用 ``thread:update`` 而不是复用 ``thread:delete``：归档可逆、改名无破坏性，
+    与「把数据删掉」不是同一风险量级；复用一个权限会让只想授予整理能力的角色
+    连带拿到删除权。
+    """
+    normalized = _validate_thread_id(thread_id)
+    if body.title is None and body.archived is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="title 与 archived 至少要提供一项",
+        )
+
+    try:
+        if body.title is not None:
+            result = await threads.rename_thread(normalized, body.title, principal)
+        else:
+            # 上面已校验「至少提供一项」，因此走到这里 archived 必然非 None
+            result = await threads.set_archived(normalized, bool(body.archived), principal)
+
+        # WHY 同时给两个字段时再补一次归档而不是分成两次请求：改完名顺手归档
+        # 是同一个界面动作，拆成两次往返只会多出一个「改成功了但归档失败了」
+        # 的中间态，前端还得为它单独设计提示。
+        if body.title is not None and body.archived is not None:
+            result = await threads.set_archived(normalized, body.archived, principal)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except OwnershipError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("更新会话失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+    return result
 
 
 @router.get("/threads/{thread_id}", response_model=list[HistoryMessage])

@@ -28,6 +28,19 @@
           <span class="sidebar-title">会话</span>
           <button id="new-thread" type="button">新会话</button>
         </div>
+        <div class="thread-toolbar">
+          <input
+            id="thread-search"
+            type="search"
+            class="thread-search"
+            placeholder="搜索标题…"
+            autocomplete="off"
+          />
+          <label class="thread-archived-toggle">
+            <input id="thread-archived" type="checkbox" />
+            <span>含已归档</span>
+          </label>
+        </div>
         <div id="thread-list" class="thread-list"></div>
       </aside>
 

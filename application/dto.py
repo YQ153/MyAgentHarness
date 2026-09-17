@@ -59,6 +59,8 @@ class ThreadSummary(BaseModel):
     created_at: str = Field(description="创建时间（ISO8601 UTC）")
     updated_at: str = Field(description="最近活动时间（ISO8601 UTC）")
     turn_count: int = Field(description="已发生的用户对话轮数")
+    archived: bool = Field(default=False, description="是否已归档（软删除）")
+    archived_at: str = Field(default="", description="归档时刻（ISO8601 UTC）；未归档为空串")
 
 
 class ThreadListResult(BaseModel):

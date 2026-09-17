@@ -31,6 +31,8 @@
     newThread: document.getElementById('new-thread'),
     modelSelect: document.getElementById('model-select'),
     threadList: document.getElementById('thread-list'),
+    threadSearch: document.getElementById('thread-search'),
+    threadArchived: document.getElementById('thread-archived'),
     authStatus: document.getElementById('auth-status'),
     adminModal: document.getElementById('admin-modal'),
     adminClose: document.getElementById('admin-close'),
@@ -59,6 +61,8 @@
     toolNodes: [],
     auth: { mode: 'disabled', principal: null },
     admin: { apikeys: [] },
+    /** 会话清单的过滤条件；与界面控件保持一致，刷新清单时统一从这里取。 */
+    threadFilter: { query: '', includeArchived: false },
     memories: { items: [], truncated: false },
   };
 
@@ -260,6 +264,30 @@
     });
   }
 
+  /** 会话条目的行内操作：重命名 / 归档（已归档时是恢复）。 */
+  function threadActions(item) {
+    const actions = el('div', 't-actions');
+
+    const rename = el('button', 'icon-action', '重命名');
+    rename.type = 'button';
+    rename.addEventListener('click', (event) => {
+      // WHY 阻止冒泡：按钮在整行之内，不拦下这次点击就会连带触发「打开会话」
+      event.stopPropagation();
+      renameThread(item);
+    });
+    actions.appendChild(rename);
+
+    const archive = el('button', 'icon-action', item.archived ? '恢复' : '归档');
+    archive.type = 'button';
+    archive.addEventListener('click', (event) => {
+      event.stopPropagation();
+      setThreadArchived(item, !item.archived);
+    });
+    actions.appendChild(archive);
+
+    return actions;
+  }
+
   function renderThreads(items) {
     els.threadList.innerHTML = '';
 
@@ -271,11 +299,18 @@
     items.forEach((item) => {
       const node = el('div', 'thread-item');
       node.dataset.threadId = item.thread_id;
-      node.appendChild(el('div', 't-title', item.title || '未命名会话'));
+
+      const head = el('div', 't-head');
+      head.appendChild(el('div', 't-title', item.title || '未命名会话'));
+      // 归档条目只有勾了「含已归档」才会出现，必须带标记，否则用户会以为
+      // 清单里混进了不该出现的东西
+      if (item.archived) head.appendChild(el('span', 't-badge', '已归档'));
+      node.appendChild(head);
 
       const sub = [formatTime(item.updated_at)];
       if (item.turn_count > 0) sub.push(`${item.turn_count} 轮`);
       node.appendChild(el('div', 't-sub', sub.filter(Boolean).join(' · ')));
+      node.appendChild(threadActions(item));
 
       node.addEventListener('click', () => {
         // 运行中禁止切换：事件流绑定在当前会话上，换 ID 会把输出渲染进错误的窗口
@@ -288,9 +323,54 @@
     markActiveThread();
   }
 
-  async function loadThreads() {
+  /** 重命名会话；取消或留空视为放弃。 */
+  async function renameThread(item) {
+    const next = window.prompt('新标题', item.title || '');
+    if (next === null) return;
+    const title = next.trim();
+    // WHY 留空直接返回而不是提交：空标题会被服务端拒绝，弹一次「标题不能为空」
+    // 的报错对用户没有任何帮助——他刚刚只是清空了输入框。
+    if (!title) return;
+
     try {
-      const response = await api(`/api/threads?limit=${THREAD_PAGE_SIZE}`);
+      await api(`/api/threads/${encodeURIComponent(item.thread_id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: title }),
+      });
+      await loadThreads();
+    } catch (err) {
+      appendError('重命名失败：' + err.message);
+    }
+  }
+
+  /** 归档或恢复会话。 */
+  async function setThreadArchived(item, archived) {
+    try {
+      await api(`/api/threads/${encodeURIComponent(item.thread_id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: archived }),
+      });
+      await loadThreads();
+      // WHY 归档当前会话时不切走界面：归档只是从清单里收起来，历史仍可读；
+      // 把消息区一并清空会让人以为「会话被删了」，而用户只是想整理列表。
+      if (archived && item.thread_id === state.threadId) {
+        appendNotice('该会话已归档：打开「含已归档」可以找回。');
+      }
+    } catch (err) {
+      appendError((archived ? '归档' : '恢复') + '失败：' + err.message);
+    }
+  }
+
+  async function loadThreads() {
+    const filter = state.threadFilter;
+    const params = new URLSearchParams({ limit: String(THREAD_PAGE_SIZE) });
+    if (filter.query) params.set('query', filter.query);
+    if (filter.includeArchived) params.set('include_archived', 'true');
+
+    try {
+      const response = await api(`/api/threads?${params.toString()}`);
       const payload = await response.json();
       renderThreads(payload.items || []);
     } catch (err) {
@@ -737,6 +817,22 @@
       if (state.running) return;
       // 只切草稿态：不申请、不写库，会话在首条消息发出时才诞生
       navigate('');
+    });
+
+    // WHY 输入防抖：逐个字符发请求会在中文输入法下产生大量无意义查询，
+    // 而每次查询都要在服务端扫一遍标题。
+    let searchTimer = null;
+    els.threadSearch.addEventListener('input', () => {
+      if (searchTimer) window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => {
+        state.threadFilter.query = els.threadSearch.value.trim();
+        loadThreads();
+      }, 300);
+    });
+
+    els.threadArchived.addEventListener('change', () => {
+      state.threadFilter.includeArchived = els.threadArchived.checked;
+      loadThreads();
     });
   }
 

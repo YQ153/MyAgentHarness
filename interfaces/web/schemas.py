@@ -33,6 +33,22 @@ class DecisionPayload(BaseModel):
     edited_action: EditedAction | None = Field(default=None, description="改写后的调用")
 
 
+class ThreadUpdateRequest(BaseModel):
+    """会话的局部更新：重命名与归档。
+
+    WHY 用一个 PATCH 承载两件事：两者都是「所有者对清单条目的整理」，且都可能
+    在同一处界面动作里发生（改完名顺手归档）；拆成两个端点只会让前端多一次
+    往返，也让「至少改一项」这条校验要在两处各写一遍。
+
+    WHY 两个字段都可选但必须至少给一个：只传 None 表示一次什么都没改的请求，
+    应当直接拒绝（400），否则会产出「接口返回成功但没有任何变化」这种无法归因
+    的结果。
+    """
+
+    title: str | None = Field(default=None, description="新标题；None 表示不改标题")
+    archived: bool | None = Field(default=None, description="归档状态；None 表示不改归档")
+
+
 class ChatRequest(BaseModel):
     """发起一轮对话。"""
 
@@ -113,4 +129,5 @@ __all__ = [
     "StopResponse",
     "ThreadListResponse",
     "ThreadResponse",
+    "ThreadUpdateRequest",
 ]

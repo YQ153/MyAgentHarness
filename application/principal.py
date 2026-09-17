@@ -62,6 +62,7 @@ PERMISSIONS = {
     "thread:list": "GET /api/threads",
     "thread:read": "GET /api/threads/{id}",
     "thread:create": "POST /api/threads/{id}/runs",
+    "thread:update": "PATCH /api/threads/{id}（重命名 / 归档）",
     "thread:delete": "DELETE /api/threads/{id}",
     "hitl:approve": "POST /api/threads/{id}/resume（人工审批决策）",
     "file:read": "FilesystemBackend read",
@@ -93,6 +94,9 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
             "thread:read",
             "thread:list",
             "thread:create",
+            # WHY member 也有 thread:update：给会话改名与归档都是「整理自己的
+            # 清单」，与删除同属所有者对自己数据的处置权；归档可逆，风险更低。
+            "thread:update",
             "hitl:approve",
             "file:read",
             "usage:read",

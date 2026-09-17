@@ -25,7 +25,12 @@ from application.ownership import effective_owner_id, ensure_thread_access
 from application.principal import Principal
 from application.runnable import build_runnable_config
 from runtime.audit_store import AuditStore
-from runtime.thread_store import ThreadMetaStore, normalize_thread_id
+from runtime.thread_store import (
+    ThreadMetaStore,
+    normalize_search_query,
+    normalize_thread_id,
+)
+from text_utils import collapse_whitespace
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -166,6 +171,8 @@ class ThreadService:
         *,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
+        include_archived: bool = False,
     ) -> ThreadListResult:
         """列出会话清单，最近活动的在前。
 
@@ -176,25 +183,41 @@ class ThreadService:
             principal: 当前主体；``None`` 仅在认证关闭时使用。
             limit: 返回条数，1..200。
             offset: 跳过的条数，用于分页。
+            query: 标题关键字；``None`` 表示不过滤。搜索只覆盖标题——正文检索
+                需要反序列化检查点，属另一个量级的工作（见项目文档已知限制）。
+            include_archived: 是否连同已归档的会话一起返回。
 
         Returns:
             会话清单与总数。
 
         Raises:
-            ValueError: 分页参数非法（调用方应映射为 400）。
+            ValueError: 分页参数或关键字非法（调用方应映射为 400）。
             RuntimeError: 查询失败（调用方应映射为 500）。
         """
+        # WHY 在服务层也校验一次关键字：依赖「存储实现恰好会校验」是不可靠的——
+        # 换一个存储实现，非法关键字就会从 400 变成 500 或静默全表匹配。
+        normalized_query = normalize_search_query(query)
         owner_id = self._effective_owner_id(principal)
         try:
+            # WHY 两个查询传完全相同的过滤条件：总数与实际返回条数必须对得上，
+            # 否则前端会显示「还有下一页」但翻过去是空的。
             items = await self._thread_store.list_threads(
-                owner_id=owner_id, limit=limit, offset=offset
+                owner_id=owner_id,
+                limit=limit,
+                offset=offset,
+                query=normalized_query,
+                include_archived=include_archived,
             )
-            total = await self._thread_store.count(owner_id=owner_id)
+            total = await self._thread_store.count(
+                owner_id=owner_id,
+                query=normalized_query,
+                include_archived=include_archived,
+            )
         except ValueError:
             # WHY 让参数错误原样透出：路由层需要把它映射为 400 而不是 500
             raise
         except Exception as exc:
-            logger.exception("查询会话列表失败：limit=%s offset=%s", limit, offset)
+            logger.exception("查询会话列表失败：limit=%s offset=%s query=%s", limit, offset, query)
             raise RuntimeError("查询会话列表失败") from exc
 
         logger.debug("会话列表返回 %d 条，总计 %d 条", len(items), total)
@@ -366,7 +389,145 @@ class ThreadService:
 
         return True
 
+    async def rename_thread(
+        self,
+        thread_id: str,
+        title: str,
+        principal: Principal | None = None,
+    ) -> ThreadSummary:
+        """重命名会话。
+
+        WHY 由所有者自行改名：自动标题取自首条输入，常常无法概括整段对话
+        （「帮我看看这个」），改名是用户让清单可读的唯一手段。
+
+        Args:
+            thread_id: 会话 ID。
+            title: 新标题；内部空白会被折叠为单个空格。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
+
+        Returns:
+            更新后的会话摘要。
+
+        Raises:
+            ValueError: 标题非字符串、为空或超出 ``thread_rename_max_chars``。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权修改该会话。
+            RuntimeError: 写入失败。
+        """
+        normalized = normalize_thread_id(thread_id)
+        normalized_title = self._normalize_rename_title(title)
+
+        # WHY 先查再改：与删除同源——无权访问时不能通过响应差异泄露会话是否存在。
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        try:
+            updated = await self._thread_store.rename(normalized, normalized_title)
+        except ValueError:
+            # 存储层再次校验（硬上限），参数错误仍应由路由映射为 400
+            raise
+        except Exception as exc:
+            logger.exception("重命名会话失败：thread=%s", normalized)
+            raise RuntimeError(f"重命名会话失败：thread={normalized}") from exc
+
+        if updated is None:
+            # 校验通过后被并发删除：按「不存在」处理，而不是返回一份空摘要
+            raise NotFoundError("会话", normalized)
+
+        actor_id = principal.user_id if principal else "anonymous"
+        await self._audit(
+            event_type="thread_rename",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="rename",
+            outcome="success",
+            details={"title": normalized_title},
+        )
+        logger.info("会话已重命名：thread=%s actor=%s", normalized, actor_id)
+        return ThreadSummary(**updated)
+
+    async def set_archived(
+        self,
+        thread_id: str,
+        archived: bool,
+        principal: Principal | None = None,
+    ) -> ThreadSummary:
+        """归档或恢复会话（软删除）。
+
+        WHY 归档而不是删除：删除会连带清掉检查点且不可恢复，而用户多数时候只是
+        想让清单干净，过一阵还想翻回来。归档只改变清单可见性——历史仍可读、
+        用量仍保留、正在运行的任务不受影响；真正销毁数据仍然是 ``delete_thread``。
+
+        Args:
+            thread_id: 会话 ID。
+            archived: ``True`` 归档，``False`` 恢复。
+            principal: 当前主体；``None`` 仅在认证关闭时使用。
+
+        Returns:
+            更新后的会话摘要。
+
+        Raises:
+            ValueError: ``thread_id`` 非法或 ``archived`` 不是布尔值。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权修改该会话。
+            RuntimeError: 写入失败。
+        """
+        normalized = normalize_thread_id(thread_id)
+        if not isinstance(archived, bool):
+            raise ValueError(f"archived 必须是布尔值，实际：{type(archived).__name__}")
+
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        try:
+            updated = await self._thread_store.set_archived(normalized, archived)
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.exception("设置会话归档状态失败：thread=%s", normalized)
+            raise RuntimeError(f"设置会话归档状态失败：thread={normalized}") from exc
+
+        if updated is None:
+            raise NotFoundError("会话", normalized)
+
+        actor_id = principal.user_id if principal else "anonymous"
+        await self._audit(
+            event_type="thread_archive",
+            actor_id=actor_id,
+            target_id=normalized,
+            action="archive" if archived else "unarchive",
+            outcome="success",
+            details={"archived": archived},
+        )
+        logger.info("会话归档状态已更新：thread=%s archived=%s actor=%s", normalized, archived, actor_id)
+        return ThreadSummary(**updated)
+
     # ------------------------------------------------------------------ 内部
+
+    def _normalize_rename_title(self, title: Any) -> str:
+        """校验并归一重命名标题。
+
+        WHY 在服务层就拒绝超长而不是留给存储层截断：用户输入的标题被静默改写，
+        是「界面不听话」的典型来源；报错才能让人知道要缩短到什么程度。
+
+        Args:
+            title: 原始标题。
+
+        Returns:
+            折叠空白后的标题。
+
+        Raises:
+            ValueError: 非字符串、为空或超出配置的字符上限。
+        """
+        if not isinstance(title, str):
+            raise ValueError(f"title 必须是字符串，实际：{type(title).__name__}")
+        collapsed = collapse_whitespace(title)
+        if not collapsed:
+            raise ValueError("title 不能为空")
+        limit = self._config.thread_rename_max_chars
+        if len(collapsed) > limit:
+            raise ValueError(f"title 过长（{len(collapsed)} > {limit}）")
+        return collapsed
 
     @staticmethod
     def _message_to_dto(message: Any) -> HistoryMessage:

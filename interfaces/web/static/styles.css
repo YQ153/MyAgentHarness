@@ -109,6 +109,75 @@ html, body {
   color: var(--muted);
 }
 
+/* ---------- 会话搜索与归档 ---------- */
+.thread-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+
+.thread-search {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.thread-archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.thread-item .t-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* min-width: 0 是省略号生效的前提：flex 子项默认不收缩到内容宽度以下 */
+.thread-item .t-head .t-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.thread-item .t-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f1f3f5;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.thread-item .t-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.icon-action {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.icon-action:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .thread-empty {
   padding: 12px 8px;
   font-size: 12px;
