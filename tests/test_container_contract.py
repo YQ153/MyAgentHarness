@@ -49,9 +49,10 @@ def test_secrets_are_excluded_from_build_context() -> None:
 def test_compose_keeps_authentication_on_and_persists_state() -> None:
     compose = _read("docker-compose.yml")
 
-    # WHY 必须显式覆盖：容器会把端口映射到宿主机，网络边界比本机进程宽得多，
-    # 跟随本机开发配置（disabled）等于把 Agent 交给任何能连上该端口的人
-    assert "AUTH_MODE: apikey" in compose
+    # WHY 默认必须是 apikey：容器会把端口映射到宿主机，网络边界比本机进程宽得多，
+    # 跟随本机开发配置（disabled）等于把 Agent 交给任何能连上该端口的人。
+    # 注意断言的是「带默认值的可覆盖形式」——改回硬编码 apikey 会让 OIDC 档位无法切换。
+    assert "${AUTH_MODE:-apikey}" in compose
     assert "/app/.data" in compose
     assert "/app/workspace" in compose
 
@@ -61,3 +62,33 @@ def test_compose_binds_to_loopback_by_default() -> None:
 
     # 默认不暴露到局域网：要暴露时应当是一处刻意的改动，而不是默认行为
     assert "127.0.0.1:8000:8000" in compose
+
+
+def test_identity_provider_is_behind_a_profile() -> None:
+    compose = _read("docker-compose.yml")
+
+    # WHY：IdP 那一套近 2 GB。默认 up 只应起 agent，多起一个 IdP 是刻意的选择
+    for service in ("postgresql:", "server:", "worker:"):
+        assert service in compose
+    assert compose.count("profiles: [oidc]") >= 3, "IdP 的三个服务都应挂在 oidc 档位下"
+
+
+def test_identity_provider_does_not_mount_the_docker_socket() -> None:
+    compose = _read("docker-compose.yml")
+
+    # WHY 这条要在测试里钉死：挂 docker.sock 进容器等价于把宿主的 root 交出去，
+    # 而上游示例编排确实带着它（只为 outpost 服务，本部署用不到）。
+    # 这种「照抄示例」引入的提权面不报错、不告警，只能靠断言挡住。
+    #
+    # WHY 断言「挂载形式」而不是子串：编排里**讨论**这件事的注释是正当且必要的，
+    # 而 `"docker.sock" not in compose` 会把那句注释判成违规——一条会把正确行为判失败的
+    # 断言比没有断言更糟。带冒号的容器侧路径只在真正的 volume 映射里出现。
+    assert ":/var/run/docker.sock" not in compose
+
+
+def test_auth_mode_is_overridable_and_defaults_to_apikey() -> None:
+    compose = _read("docker-compose.yml")
+
+    # 默认仍是 apikey（容器化不裸奔）；切 OIDC 必须由 .env 显式决定，而不是改编排文件
+    assert "${AUTH_MODE:-apikey}" in compose
+
