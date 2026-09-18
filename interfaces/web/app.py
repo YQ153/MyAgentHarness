@@ -26,6 +26,7 @@ from interfaces.web.auth import router as auth_router
 from interfaces.web.health import router as health_router
 from interfaces.web.request_context import RequestContextMiddleware
 from interfaces.web.routes import router
+from interfaces.web.workspace_routes import router as workspace_router
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.api_key_store = context.api_key_store
             app.state.device_flow_store = context.device_flow_store
             app.state.threads = context.threads
+            app.state.workspace = context.workspace
             app.state.runs = context.runs
             app.state.catalog = context.catalog
             app.state.health = context.health
@@ -149,6 +151,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(router)
+    app.include_router(workspace_router)
 
     if _STATIC_DIR.is_dir():
         # WHY 静态挂载必须放在路由注册之后：挂载 "/" 会吞掉之后注册的所有

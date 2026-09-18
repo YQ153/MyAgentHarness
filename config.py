@@ -326,6 +326,24 @@ class AppConfig(BaseSettings):
     现象。
     """
 
+    # ---------------- 工作区文件（Web 文件面板） ----------------
+    workspace_list_max_entries: int = Field(default=500, ge=1, le=5000)
+    """单次列目录返回的最大条目数。
+
+    WHY 需要上限：工作区里常有 ``node_modules`` 这类上万条的目录，无上限地返回
+    会让一次展开变成一次大数据传输，也会让前端渲染卡死。
+    """
+
+    workspace_file_preview_chars: int = Field(default=20_000, ge=100, le=500_000)
+    """文件面板里文本预览的字符上限（超出截断并在响应里标注）。"""
+
+    workspace_file_max_bytes: int = Field(default=5_000_000, ge=1024)
+    """超过此字节数的文件不做文本预览，只回 ``too_large`` 降级标记。
+
+    WHY 用降级标记而不是报错：文件确实存在、也确实读得到，只是不适合整份塞进
+    浏览器。当成错误会让界面只能显示一句失败，而用户真正想知道的是「它有多大」。
+    """
+
     # ---------------- 会话 ----------------
     thread_title_max_chars: int = Field(default=24, ge=1, le=200)
     """**自动生成**标题的字符上限（按首条用户输入生成，超出以省略号截断）。

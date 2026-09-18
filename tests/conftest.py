@@ -9,6 +9,15 @@
 
 from __future__ import annotations
 
+# WHY 提前显式导入这个子模块：本机 pydantic 版本把 ``pydantic.root_model`` 做成
+# 惰性加载（``import pydantic`` 之后它并不在 ``sys.modules`` 里），而 ``mcp.types``
+# 在**导入期**就执行 ``class JSONRPCMessage(RootModel[...])``，其内部要按模块名取
+# ``sys.modules['pydantic.root_model']`` —— 没加载就抛 KeyError。
+# 谁先被导入决定了测试能否收集：换个 --cov 参数就可能让整套用例在收集阶段崩掉。
+# 在 conftest 里钉住这一句，使收集顺序不再影响结果（实测：缺了它，12 个测试文件
+# 在「带多个 --cov 源」时收集失败；补上后全绿）。
+import pydantic.root_model  # noqa: F401  （仅为副作用导入）
+
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from application.thread_service import ThreadService
     from application.tool_catalog import ToolCatalog
     from application.usage_service import UsageService
+    from application.workspace_service import WorkspaceService
     from config import AppConfig
     from runtime.api_key_store import APIKeyStore
     from runtime.audit_store import AuditStore
@@ -48,6 +49,7 @@ class AppContext:
         usage: 用量统计服务。
         tools: 生效工具目录（内置 + 自定义 + MCP）。
         memories: 长期记忆管理服务（查看 / 删除）。
+        workspace: 工作区文件服务（Web 文件面板的列目录与读文件）。
     """
 
     config: AppConfig
@@ -65,3 +67,4 @@ class AppContext:
     usage: UsageService
     tools: ToolCatalog
     memories: MemoryService
+    workspace: WorkspaceService

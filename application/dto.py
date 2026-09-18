@@ -45,6 +45,44 @@ class ModelInfo(BaseModel):
     model: str = Field(description="provider 侧的原始模型名")
 
 
+class WorkspaceEntryInfo(BaseModel):
+    """文件面板里的一条目录项。"""
+
+    name: str = Field(description="条目名")
+    path: str = Field(description="虚拟路径，可直接回传给文件接口")
+    is_dir: bool = Field(description="是否为目录")
+    size: int = Field(description="字节数")
+    modified_at: float = Field(description="最近修改时间（Unix 秒）")
+    is_symlink: bool = Field(default=False, description="是否为符号链接")
+
+
+class WorkspaceListing(BaseModel):
+    """一次目录列举的结果。"""
+
+    path: str = Field(description="当前目录的虚拟路径")
+    parent: str | None = Field(default=None, description="上级目录虚拟路径；根目录为 None")
+    entries: list[WorkspaceEntryInfo] = Field(default_factory=list, description="目录项，目录在前")
+    truncated: bool = Field(default=False, description="是否因条目数上限被截断")
+
+
+class WorkspaceFileContent(BaseModel):
+    """一次文件读取的结果。
+
+    WHY 用 ``kind`` 而不是让调用方看状态码区分：``binary`` / ``too_large`` /
+    ``image`` 都是「读取成功但展示方式不同」，与读取失败（400 / 404）走的是
+    完全不同的分支——把前者做成错误，界面就只能显示一句失败，而用户想知道的是
+    「多大的什么文件」。
+    """
+
+    path: str = Field(description="虚拟路径")
+    name: str = Field(description="文件名")
+    size: int = Field(description="文件总字节数")
+    kind: str = Field(description="text / image / binary / too_large")
+    text: str = Field(default="", description="文本内容，或图片的 data URL；其余类型为空")
+    truncated: bool = Field(default=False, description="文本是否被预览上限截断")
+    mime_type: str = Field(default="", description="据扩展名推断的 MIME 类型")
+
+
 class ThreadSummary(BaseModel):
     """会话列表中的一条记录。
 

@@ -21,6 +21,7 @@ from application.run_service import RunService
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
+from application.workspace_service import WorkspaceService
 from bootstrap.context import AppContext
 from config import AppConfig
 from runtime.api_key_store import open_api_key_store
@@ -133,6 +134,9 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             # 记忆——各持一份（哪怕指向同一文件）会让「面板显示已删除」与
             # 「Agent 还记得」同时成立。
             memories=MemoryService(config, store=store, audit_store=audit_store),
+            # WHY 与 Agent 共享同一个工作区根：文件面板要展示的正是 Agent 读写
+            # 的那片目录，指向不同根会出现「Agent 写了但面板看不见」。
+            workspace=WorkspaceService(config, audit_store=audit_store),
         )
 
         logger.info(
