@@ -173,6 +173,46 @@ async def test_read_file_marks_oversized_file(tmp_path: Path):
     assert audit.target_ids() == ["/big.txt"]
 
 
+async def test_read_file_pages_cover_the_whole_file(tmp_path: Path):
+    """「完整查看」的机器判据：分页拼起来必须与文件逐字符一致。
+
+    WHY 断言全等而不是逐页长度：单独看每一页都「返回了内容」，只有把它们拼起来
+    与原文比对，才能发现漏页、重叠或某页被静默截短——那类缺陷在界面上表现为
+    「内容看着挺多但就是缺一段」。"""
+    service, _ = _service(tmp_path, workspace_file_preview_chars=100)
+
+    chunks: list[str] = []
+    offset = 0
+    page = None
+    for _ in range(200):  # 上限只为防死循环；真实页数由文件大小决定
+        page = await service.read_file("/big.txt", offset=offset)
+        assert page.offset == offset
+        chunks.append(page.text)
+        offset += len(page.text)
+        if not page.truncated:
+            break
+
+    assert "".join(chunks) == "x" * 5000
+    assert len(chunks) == 50  # 5000 字符 / 每页 100
+    assert page is not None and page.truncated is False
+
+
+async def test_read_file_rejects_negative_offset(tmp_path: Path):
+    service, _ = _service(tmp_path)
+
+    with pytest.raises(ValueError, match="offset"):
+        await service.read_file("/big.txt", offset=-1)
+
+
+async def test_read_file_past_end_returns_empty_tail(tmp_path: Path):
+    service, _ = _service(tmp_path)
+
+    page = await service.read_file("/big.txt", offset=99_999)
+
+    assert page.text == ""
+    assert page.truncated is False
+
+
 async def test_read_file_reports_missing_and_directory(tmp_path: Path):
     service, _ = _service(tmp_path)
 

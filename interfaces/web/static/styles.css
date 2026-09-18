@@ -878,3 +878,19 @@ button.small {
   text-decoration: underline;
   cursor: pointer;
 }
+
+.ws-more {
+  margin-top: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.ws-more:disabled {
+  cursor: default;
+  color: var(--muted);
+}

@@ -78,8 +78,11 @@ class WorkspaceFileContent(BaseModel):
     name: str = Field(description="文件名")
     size: int = Field(description="文件总字节数")
     kind: str = Field(description="text / image / binary / too_large")
-    text: str = Field(default="", description="文本内容，或图片的 data URL；其余类型为空")
-    truncated: bool = Field(default=False, description="文本是否被预览上限截断")
+    text: str = Field(default="", description="本次返回的文本片段，或图片的 data URL；其余类型为空")
+    truncated: bool = Field(
+        default=False, description="本次返回的片段之后是否还有内容（前端据此提供「加载更多」）"
+    )
+    offset: int = Field(default=0, description="本次片段在文件中的起始字符偏移；续取时原样传回")
     mime_type: str = Field(default="", description="据扩展名推断的 MIME 类型")
 
 

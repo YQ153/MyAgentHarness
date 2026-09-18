@@ -83,7 +83,10 @@ def write_tool_output(path: Path, text: str, *, max_chars: int) -> None:
             f"{text[:max_chars]}\n\n"
             f"... Output truncated at {max_chars} chars (retained copy of a larger result)."
         )
-    path.write_text(text, encoding="utf-8")
+    # WHY newline=""：文本模式在 Windows 上会把 \n 改写成 \r\n，于是「留存完整输出」
+    # 实际留存的是一份**被改写过的**副本（实测一次 22,441 字符的输出多出 801 个字节），
+    # 而回取时又会被读回成另一个形状。留存的价值在于逐字节原样，不是「差不多一样」。
+    path.write_text(text, encoding="utf-8", newline="")
 
 
 def prune_tool_outputs(thread_dir: Path, *, keep: int) -> int:

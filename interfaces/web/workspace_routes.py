@@ -64,15 +64,18 @@ async def list_workspace_files(
 @router.get("/file", response_model=WorkspaceFileContent)
 async def read_workspace_file(
     path: str = Query(description="文件的虚拟路径"),
+    offset: int = Query(default=0, ge=0, description="起始字符偏移，用于续取大文件/长工具输出"),
     service: WorkspaceService = Depends(get_workspace),
     principal: Principal = Depends(require_permission("file:read")),
 ) -> WorkspaceFileContent:
-    """读取一个文件，返回文本内容、图片 data URL，或降级标记。
+    """读取一个文件，返回一段文本、图片 data URL，或降级标记。
 
     读取成功会落一条 ``file_read`` 审计（含路径与大小，**不含正文**）。
+    响应里的 ``truncated`` 表示「后面还有」，此时用 ``offset + len(text)`` 续取
+    即可拼出完整内容——「查看完整输出」用的就是这条路径。
     """
     try:
-        return await service.read_file(path, principal)
+        return await service.read_file(path, principal, offset=offset)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:

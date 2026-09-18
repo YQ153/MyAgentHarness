@@ -75,7 +75,7 @@
      * WHY 只存「已加载的目录」而不是整棵树：面板按需展开下一层，未展开的目录
      * 不该存在于客户端状态里——否则「树」与「服务端实际情况」就有两份真相。
      */
-    workspace: { dirs: {}, expanded: {}, selected: null },
+    workspace: { dirs: {}, expanded: {}, selected: null, text: null },
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -1301,7 +1301,52 @@ function renderFile(payload) {
     );
     return;
   }
-  box.appendChild(el('pre', 'ws-text', payload.text || '（空文件）'));
+  const pre = el('pre', 'ws-text', payload.text || '（空文件）');
+  box.appendChild(pre);
+
+  if (payload.kind === 'text' && payload.truncated) {
+    // WHY 续取而不是提高预览上限：一次塞进几十万字符会把浏览器拖住，而提高上限
+    // 只是把同一个问题推给下一次更大的输出。「完整查看」由分段拼出来。
+    state.workspace.text = {
+      path: payload.path,
+      offset: (payload.offset || 0) + (payload.text || '').length,
+    };
+    const more = el('button', 'ws-more', `加载更多（已显示 ${state.workspace.text.offset} 字符）`);
+    more.type = 'button';
+    more.addEventListener('click', () => loadMoreFile(more, pre));
+    box.appendChild(more);
+  } else {
+    state.workspace.text = null;
+  }
+}
+
+/** 续取下一页并追加到预览区。 */
+async function loadMoreFile(button, pre) {
+  const cursor = state.workspace.text;
+  if (!cursor) return;
+  button.disabled = true;
+  button.textContent = '加载中…';
+  try {
+    const response = await api(
+      `/api/workspace/file?path=${encodeURIComponent(cursor.path)}&offset=${cursor.offset}`
+    );
+    const payload = await response.json();
+    pre.textContent += payload.text || '';
+    cursor.offset = (payload.offset || 0) + (payload.text || '').length;
+    if (payload.truncated) {
+      button.disabled = false;
+      button.textContent = `加载更多（已显示 ${cursor.offset} 字符）`;
+    } else {
+      button.remove();
+      els.workspacePreview.appendChild(
+        el('div', 'ws-file-sub', `已显示全部 ${cursor.offset} 字符`)
+      );
+    }
+  } catch (err) {
+    // 失败时保留按钮：这是可以重试的动作，把入口弄没等于让人重新找文件
+    button.disabled = false;
+    button.textContent = `加载更多（失败：${err.message}）`;
+  }
 }
 
 /** 从工具卡片跳到完整输出。 */

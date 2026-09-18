@@ -62,6 +62,19 @@ def test_write_creates_directories_and_utf8(tmp_path: Path):
     assert path.read_text(encoding="utf-8") == "中文内容\n"
 
 
+def test_write_preserves_bytes_verbatim(tmp_path: Path):
+    """换行不得被改写。
+
+    WHY 钉住这条：文本模式在 Windows 上会把 ``\\n`` 转成 ``\\r\\n``，于是「留存完整
+    输出」留的是一份**被改写过的**副本（实测一次 22,441 字符的输出多出 801 字节），
+    而回取时通用换行又会把它折回成另一个形状。留存的价值在于逐字节原样。"""
+    path = tmp_path / "raw.txt"
+
+    write_tool_output(path, "a\nb\n", max_chars=1000)
+
+    assert path.read_bytes() == b"a\nb\n"
+
+
 def test_write_caps_oversized_output(tmp_path: Path):
     path = tmp_path / "big.txt"
 

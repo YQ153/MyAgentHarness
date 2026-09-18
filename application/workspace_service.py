@@ -47,6 +47,8 @@ KIND_BINARY = "binary"
 KIND_TOO_LARGE = "too_large"
 
 _ANONYMOUS_ACTOR = "anonymous"
+_BYTES_PER_CHAR = 4
+"""由字符窗口换算读取字节数的系数（UTF-8 单字符最多 4 字节）。"""
 
 
 class WorkspaceService:
@@ -117,23 +119,32 @@ class WorkspaceService:
         )
 
     async def read_file(
-        self, virtual_path: str, principal: Principal | None = None
+        self, virtual_path: str, principal: Principal | None = None, *, offset: int = 0
     ) -> WorkspaceFileContent:
-        """读取一个文件并按类型给出预览。
+        """读取一个文件，返回一段文本、图片 data URL 或降级标记。
 
         读取成功即落审计（含文件名与大小，**不含正文**）。
+
+        WHY 做成按偏移分段而不是「一次给完」：工具输出经留存后可能有几十万字符，
+        一次塞进响应会把浏览器拖住；而如果干脆提高预览上限，只是把同一个问题推给
+        下一次更大的输出。分段之后每次响应仍有界，而「完整查看」由前端续取拼出来。
 
         Args:
             virtual_path: 文件虚拟路径。
             principal: 当前主体，用于审计归因。
+            offset: 起始字符偏移；由前一次响应的 ``offset + len(text)`` 得到。
 
         Returns:
-            文件内容或降级标记。
+            文件内容片段或降级标记。
 
         Raises:
             WorkspacePathError: 路径非法或逃出工作区。
             NotFoundError: 文件不存在或指向目录。
+            ValueError: ``offset`` 为负数。
         """
+        if offset < 0:
+            raise ValueError(f"offset 不能为负数，实际：{offset}")
+
         # 路径校验必须在读取之前单独走一次：``read_bytes_capped`` 只认真实路径，
         # 把「解析交给它」会让逃逸路径在打开文件那一刻才被发现。
         target = await asyncio.to_thread(resolve_in_workspace, self._root, virtual_path)
@@ -147,6 +158,9 @@ class WorkspaceService:
 
         size = (await asyncio.to_thread(target.stat)).st_size
         normalized = "/" + Path(virtual_path.strip().replace("\\", "/")).as_posix().lstrip("/")
+        limit = self._config.workspace_file_preview_chars
+        mime_type = self._mime_of(target)
+
         if size > self._config.workspace_file_max_bytes:
             # 只回大小不回正文：调用方（界面）要展示「它有多大」，
             # 而把整份内容读进内存再丢弃是纯粹的浪费。
@@ -156,67 +170,55 @@ class WorkspaceService:
                 name=target.name,
                 size=size,
                 kind=KIND_TOO_LARGE,
-                mime_type=self._mime_of(target),
+                mime_type=mime_type,
             )
 
-        data, total, hit_cap = await asyncio.to_thread(
-            read_bytes_capped, target, max_bytes=self._config.workspace_file_max_bytes
+        # WHY 字节上限随窗口推进：分页读取不能每次都按整文件上限读，否则翻到第 N 页
+        # 仍要付第 1 页的读盘代价。(offset + limit) 字符在最坏情况下占 4 字节/字符。
+        window_bytes = min((offset + limit) * _BYTES_PER_CHAR, self._config.workspace_file_max_bytes)
+        data, total, _ = await asyncio.to_thread(
+            read_bytes_capped, target, max_bytes=window_bytes
         )
         await self._audit("file_read", actor_id=self._actor(principal), path=normalized)
 
-        mime_type = self._mime_of(target)
-        if hit_cap:
-            return WorkspaceFileContent(
-                path=normalized,
-                name=target.name,
-                size=total,
-                kind=KIND_TOO_LARGE,
-                mime_type=mime_type,
-            )
-
-        if mime_type.startswith("image/"):
-            # WHY 图片判定必须排在二进制判定之前：PNG/JPEG 的字节流里必然含空字节，
-            # 先判「二进制」会让图片永远走不到这一支，界面上就只剩一句「无法预览」。
-            # 按 data URL 内联返回：文件面板不需要第二个「原始字节」端点，
-            # 而字节上限（workspace_file_max_bytes）已经把响应体大小框住了。
-            return WorkspaceFileContent(
-                path=normalized,
-                name=target.name,
-                size=total,
-                kind=KIND_IMAGE,
-                text=f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}",
-                mime_type=mime_type,
-            )
-
-        if looks_binary(data):
-            # 二进制不尝试解码：解出来是乱码，占满上下文还看不出它是二进制
-            return WorkspaceFileContent(
-                path=normalized,
-                name=target.name,
-                size=total,
-                kind=KIND_BINARY,
-                mime_type=mime_type,
-            )
+        if offset == 0:
+            # 类型判定只在第一页做：续取时类型早已确定，重复判定没有信息增量
+            if mime_type.startswith("image/"):
+                # WHY 图片判定必须排在二进制判定之前：PNG/JPEG 的字节流里必然含空字节，
+                # 先判「二进制」会让图片永远走不到这一支，界面上就只剩一句「无法预览」。
+                # 按 data URL 内联返回：文件面板不需要第二个「原始字节」端点，
+                # 而字节上限（workspace_file_max_bytes）已经把响应体大小框住了。
+                return WorkspaceFileContent(
+                    path=normalized,
+                    name=target.name,
+                    size=total,
+                    kind=KIND_IMAGE,
+                    text=f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}",
+                    mime_type=mime_type,
+                )
+            if looks_binary(data):
+                # 二进制不尝试解码：解出来是乱码，占满上下文还看不出它是二进制
+                return WorkspaceFileContent(
+                    path=normalized,
+                    name=target.name,
+                    size=total,
+                    kind=KIND_BINARY,
+                    mime_type=mime_type,
+                )
 
         text = data.decode("utf-8", errors="replace")
-        limit = self._config.workspace_file_preview_chars
-        if len(text) > limit:
-            return WorkspaceFileContent(
-                path=normalized,
-                name=target.name,
-                size=total,
-                kind=KIND_TEXT,
-                text=text[:limit],
-                truncated=True,
-                mime_type=mime_type,
-            )
+        chunk = text[offset : offset + limit]
+        # 两种「还有更多」：本页窗口没读完文件，或读完了但字符位置还没到末尾
+        has_more = total > len(data) or len(text) > offset + limit
 
         return WorkspaceFileContent(
             path=normalized,
             name=target.name,
             size=total,
             kind=KIND_TEXT,
-            text=text,
+            text=chunk,
+            truncated=has_more,
+            offset=offset,
             mime_type=mime_type,
         )
 

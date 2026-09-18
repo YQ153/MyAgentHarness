@@ -63,6 +63,30 @@ def test_reads_file_content(client: TestClient):
     assert body["truncated"] is False
 
 
+def test_file_endpoint_accepts_offset(client: TestClient):
+    """续取偏移必须能经查询参数传入，并原样回显——前端据此推进游标。"""
+    response = client.get(
+        "/api/workspace/file",
+        params={"path": "/react-vite-app/index.html", "offset": 5},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["offset"] == 5
+    assert body["text"] == "<h1>hi</h1>"[5:]
+    assert body["truncated"] is False
+
+
+def test_file_endpoint_rejects_negative_offset(client: TestClient):
+    response = client.get(
+        "/api/workspace/file",
+        params={"path": "/react-vite-app/index.html", "offset": -1},
+    )
+
+    # 由查询参数的类型约束直接拦下（422），不必进到服务层
+    assert response.status_code == 422
+
+
 def test_missing_target_returns_404(client: TestClient):
     assert client.get("/api/workspace/files", params={"path": "/nope"}).status_code == 404
     assert client.get("/api/workspace/file", params={"path": "/nope.txt"}).status_code == 404
