@@ -47,6 +47,9 @@ class ThreadUpdateRequest(BaseModel):
 
     title: str | None = Field(default=None, description="新标题；None 表示不改标题")
     archived: bool | None = Field(default=None, description="归档状态；None 表示不改归档")
+    tags: list[str] | None = Field(
+        default=None, description="整体替换标签；None 表示不改标签，空列表表示清空"
+    )
 
 
 class ChatRequest(BaseModel):

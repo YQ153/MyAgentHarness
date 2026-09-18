@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS thread_meta (
     updated_at    TEXT NOT NULL,
     turn_count    INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
-    archived_at   TEXT NOT NULL DEFAULT ''
+    archived_at   TEXT NOT NULL DEFAULT '',
+    tags          TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
@@ -137,12 +138,86 @@ _MIGRATIONS = [
     """
     ALTER TABLE thread_meta ADD COLUMN current_branch TEXT NOT NULL DEFAULT '';
     """,
+    # 标签：以「前后都带逗号」的规范形式存一个字符串（见 normalize_tags）。
+    # WHY 不建关联表：标签要按「会话」整体读写，单列足够表达；而过滤走 LIKE，
+    # 关联表带来的收益（可索引）在 LIKE 模式下用不上，只多一层 JOIN 与生命周期管理。
+    """
+    ALTER TABLE thread_meta ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 _COLUMNS = (
     "thread_id, owner_id, title, created_at, updated_at, turn_count, "
-    "archived, archived_at, current_branch"
+    "archived, archived_at, current_branch, tags"
 )
+
+_MAX_TAG_CHARS = 32
+"""单个标签的字符上限。"""
+
+_MAX_TAGS = 10
+"""一条会话允许的标签数量上限。
+
+WHY 两个上限都要有：标签会整串存在一个字段里并参与 LIKE 过滤，无上限时
+一个会话就能把这一列撑成正文——而它本来是给清单分类用的。
+"""
+
+
+def normalize_tags(tags: list[str] | None) -> list[str]:
+    """规整标签列表：去空白、去重、校验长度与数量，并保持原顺序。
+
+    WHY 放在存储层并公开：与 ``normalize_search_query`` 同理——标签的存储形式
+    （规范串）与过滤模式（``%,tag,%``）都由本模块决定，规范化必须与它们同源，
+    否则会出现「存进去的标签查不出来」这种只能靠猜的现象。
+
+    WHY 拒绝含逗号的标签：存储形式用逗号分隔，含逗号的标签会直接把一个标签
+    拆成两个——静默改变用户输入，且下次读出来才发现。
+
+    Args:
+        tags: 原始标签列表；``None`` 视为空列表。
+
+    Returns:
+        规范化后的标签列表（可能为空）。
+
+    Raises:
+        ValueError: 元素非字符串、含逗号、超长，或数量超限。
+    """
+    if tags is None:
+        return []
+    if not isinstance(tags, (list, tuple)):
+        raise ValueError(f"tags 必须是列表，实际：{type(tags).__name__}")
+
+    normalized: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError(f"标签必须是字符串，实际：{type(tag).__name__}")
+        text = collapse_whitespace(tag)
+        if not text:
+            continue
+        if "," in text:
+            raise ValueError(f"标签不能含逗号：{text}")
+        if len(text) > _MAX_TAG_CHARS:
+            raise ValueError(f"标签过长（{len(text)} > {_MAX_TAG_CHARS}）：{text}")
+        if text not in normalized:
+            normalized.append(text)
+
+    if len(normalized) > _MAX_TAGS:
+        raise ValueError(f"标签过多（{len(normalized)} > {_MAX_TAGS}）")
+    return normalized
+
+
+def tags_to_storage(tags: list[str]) -> str:
+    """把标签列表编成存储形式：前后各带一个逗号。
+
+    WHY 前后都要逗号：这样 ``LIKE '%,tag,%'`` 匹配的是**完整**标签，
+    ``tag`` 不会命中 ``mytag``——只靠单侧分隔符做不到这一点。
+    """
+    return f",{','.join(tags)}," if tags else ""
+
+
+def tags_from_storage(raw: object) -> list[str]:
+    """把存储形式解回标签列表。"""
+    text = str(raw or "")
+    return [part for part in text.split(",") if part]
 
 _LIKE_ESCAPE = "\\"
 """LIKE 通配符的转义字符。"""
@@ -166,12 +241,16 @@ def _build_filters(
     include_unowned: bool,
     query: str | None,
     include_archived: bool,
+    tag: str | None = None,
 ) -> tuple[str, list[Any]]:
     """把查询条件编译成 WHERE 子句与参数。
 
     WHY 抽成函数：``list_threads`` 与 ``count`` 必须用**完全相同**的过滤条件，
     否则分页元信息会与实际返回条数不符（表现为「还有下一页」但翻过去是空的）。
     此前 owner 条件已在两处各写一遍，归档与搜索再加进来就是四份。
+
+    WHY 标签过滤也加在这里而不是另开一个编译点：同一条约束——过滤条件一旦有第二份
+    实现，总数与条数就会在某个组合下分叉，而那种缺陷只在「翻页翻空」时暴露。
     """
     conditions: list[str] = []
     params: list[Any] = []
@@ -180,6 +259,12 @@ def _build_filters(
     # 这个功能等于没做。
     if not include_archived:
         conditions.append("archived = 0")
+
+    if tag:
+        # 规范形式前后都带逗号，故模式两侧都要逗号；标签同样要转义，
+        # 否则一个含 % 的标签会把整张表都匹配上。
+        conditions.append(f"tags LIKE ? ESCAPE '{_LIKE_ESCAPE}'")
+        params.append(f"%,{_escape_like(tag)},%")
 
     if owner_id is not None:
         if include_unowned:
@@ -216,6 +301,9 @@ def _row_to_record(row: Any) -> dict[str, Any]:
     """
     record = dict(row)
     record["archived"] = bool(record.get("archived"))
+    # WHY 在这里解码标签：存储层对外的口径是「列表」，编解码只发生在读写这一刻；
+    # 让上层自己 split 会把存储形式的细节泄漏到三个调用点，且每个都要记得处理空串。
+    record["tags"] = tags_from_storage(record.get("tags"))
     return record
 
 
@@ -623,6 +711,7 @@ class ThreadMetaStore:
         limit: int = 50,
         offset: int = 0,
         query: str | None = None,
+        tag: str | None = None,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """按最近活动时间倒序列出会话。
@@ -653,6 +742,7 @@ class ThreadMetaStore:
             include_unowned=include_unowned,
             query=normalized_query,
             include_archived=include_archived,
+            tag=tag,
         )
         sql = f"""
             SELECT {_COLUMNS} FROM thread_meta
@@ -690,6 +780,7 @@ class ThreadMetaStore:
         owner_id: str | None = None,
         include_unowned: bool = False,
         query: str | None = None,
+        tag: str | None = None,
         include_archived: bool = False,
     ) -> int:
         """返回会话总数，用于分页元信息。
@@ -711,6 +802,7 @@ class ThreadMetaStore:
             include_unowned=include_unowned,
             query=normalized_query,
             include_archived=include_archived,
+            tag=tag,
         )
         sql = f"SELECT COUNT(1) FROM thread_meta {where}"
 
@@ -729,6 +821,48 @@ class ThreadMetaStore:
             return 0
         return int(row[0])
 
+
+    async def set_tags(self, thread_id: str, tags: list[str] | None) -> dict[str, Any] | None:
+        """整体替换某会话的标签。
+
+        WHY 是「整体替换」而不是增删单个：界面上的标签是一次编辑后整体提交的，
+        逐个增删需要前端自己算差集，而差集算错的表现是「删不掉的标签」。
+        整体替换让服务端行为与用户看到的一致。
+
+        WHY 不改 ``updated_at``：与 ``rename`` 同理——打标签是清单整理，不是对话活动，
+        刷新时间会把会话清单的顺序搅乱。
+
+        Args:
+            thread_id: 会话 ID。
+            tags: 新标签列表；``None`` 或空列表表示清空。
+
+        Returns:
+            更新后的元数据；``None`` 表示会话不存在（调用方应判定为 404）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法或标签不合法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        normalized_tags = normalize_tags(tags)
+
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET tags = ? WHERE thread_id = ?",
+                    (tags_to_storage(normalized_tags), normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("设置会话标签失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("设置标签未命中任何行：thread=%s", normalized_id)
+            return None
+        logger.info("会话标签已更新：thread=%s tags=%s", normalized_id, normalized_tags)
+        return await self.get(normalized_id)
 
     async def set_branch_head(self, thread_id: str, branch_id: str, head_checkpoint: str) -> None:
         """冻结某条分支的头检查点；分支不存在时顺带把根分支补登记。

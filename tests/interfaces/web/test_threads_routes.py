@@ -43,6 +43,8 @@ class StubThreadStore:
     def __init__(self, records: list[dict[str, Any]] | None = None) -> None:
         self._records = {item["thread_id"]: item for item in (records or [])}
         self.list_calls: list[dict[str, Any]] = []
+        self.reject_tags = False
+        """置为 True 时 ``set_tags`` 抛 ValueError，模拟存储层的标签校验。"""
 
     async def get(self, thread_id: str) -> dict[str, Any] | None:
         return self._records.get(thread_id)
@@ -71,6 +73,18 @@ class StubThreadStore:
             "archived": archived,
             "archived_at": "2026-01-02T00:00:00+00:00" if archived else "",
         }
+        self._records[thread_id] = updated
+        return updated
+
+    async def set_tags(self, thread_id: str, tags: list[str] | None) -> dict[str, Any] | None:
+        if self.reject_tags:
+            raise ValueError("标签不能含逗号：含,逗号")
+        record = self._records.get(thread_id)
+        if record is None:
+            return None
+        # 替身只做「整体替换」这一件事：规范化与编解码由存储层负责，
+        # 而那正是 tests/runtime/test_thread_tags.py 在真实存储上覆盖的部分。
+        updated = {**record, "tags": list(tags or [])}
         self._records[thread_id] = updated
         return updated
 
@@ -128,6 +142,65 @@ def test_list_defaults_to_no_filter(tmp_path):
 
     assert store.list_calls[0]["query"] is None
     assert store.list_calls[0]["include_archived"] is False
+
+
+# ------------------------------------------------------------------ 标签
+
+
+def test_list_forwards_tag_filter(tmp_path):
+    """标签必须落到存储层，且与其它过滤条件同时生效。"""
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store)
+
+    response = client.get("/api/threads?tag=工作")
+
+    assert response.status_code == 200
+    assert store.list_calls[0]["tag"] == "工作"
+
+
+def test_patch_tags_only_keeps_archived_state(tmp_path):
+    """只传 tags 不得顺手把会话取消归档。
+
+    WHY 单列一条：这一版实现里最容易踩的坑——三个可更新字段若用 if/else 串起来，
+    「只给 tags」会落进归档分支，把 ``bool(None)`` 当成 False 写入，用户只想加个
+    标签，会话却从归档里冒了出来。
+    """
+    store = StubThreadStore([_record("t1", "会话", archived=True)])
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={"tags": ["重要"]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tags"] == ["重要"]
+    assert body["archived"] is True  # 未被 tags 请求改动
+
+
+def test_patch_rejects_empty_body(tmp_path):
+    """三个字段全不给应当回 400，而不是「成功但什么都没变」。"""
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={})
+
+    assert response.status_code == 400
+
+
+def test_patch_rejects_invalid_tags(tmp_path):
+    """标签不合法时回 400，且不写出半截状态。
+
+    WHY 让替身按存储层的规则抛错而不是替它做判断：规范化的唯一实现在
+    ``runtime.thread_store.normalize_tags``，在替身里再写一份等于制造第二份规则，
+    两份迟早分叉——而分叉的方向恰好是「路由测试说合法、真实存储说非法」。
+    这里只负责确认「存储层抛 ValueError 时，端点把它翻成 400」这一条。
+    """
+    store = StubThreadStore([_record("t1", "会话")])
+    store.reject_tags = True  # 替身据此模拟存储层的拒绝
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={"tags": ["含,逗号"]})
+
+    assert response.status_code == 400
 
 
 def test_list_response_carries_archive_fields(tmp_path):

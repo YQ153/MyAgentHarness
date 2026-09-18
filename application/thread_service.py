@@ -177,6 +177,7 @@ class ThreadService:
         limit: int = 50,
         offset: int = 0,
         query: str | None = None,
+        tag: str | None = None,
         include_archived: bool = False,
     ) -> ThreadListResult:
         """列出会话清单，最近活动的在前。
@@ -211,11 +212,13 @@ class ThreadService:
                 limit=limit,
                 offset=offset,
                 query=normalized_query,
+                tag=tag,
                 include_archived=include_archived,
             )
             total = await self._thread_store.count(
                 owner_id=owner_id,
                 query=normalized_query,
+                tag=tag,
                 include_archived=include_archived,
             )
         except ValueError:
@@ -440,6 +443,42 @@ class ThreadService:
         )
 
     # ------------------------------------------------------------------ 写入
+
+    async def update_tags(
+        self,
+        thread_id: str,
+        tags: list[str] | None,
+        principal: Principal | None = None,
+    ) -> ThreadSummary:
+        """整体替换会话标签。
+
+        WHY 用 ``thread:update`` 而不是新开权限：打标签与改名、归档同属「所有者
+        整理自己的清单」，风险量级一致；新开一个权限只会让只想授予整理能力的角色
+        拿不到标签功能。
+
+        Raises:
+            ValueError: ``thread_id`` 非法或标签不合法。
+            NotFoundError: 会话不存在。
+            OwnershipError: 无权访问该会话。
+        """
+        normalized = normalize_thread_id(thread_id)
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        updated = await self._thread_store.set_tags(normalized, tags)
+        if updated is None:
+            raise NotFoundError("会话", normalized)
+
+        await self._audit(
+            event_type="thread_tags",
+            actor_id=principal.user_id if principal else "anonymous",
+            target_id=normalized,
+            action="update",
+            outcome="success",
+            details={"tags": updated.get("tags") or []},
+        )
+        logger.info("会话标签已更新：thread=%s tags=%s", normalized, updated.get("tags"))
+        return ThreadSummary(**updated)
 
     async def delete_thread(
         self,

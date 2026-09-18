@@ -247,6 +247,7 @@ async def list_threads(
     limit: int = Query(default=50, ge=1, le=200, description="返回条数"),
     offset: int = Query(default=0, ge=0, description="跳过的条数"),
     query: str | None = Query(default=None, description="标题关键字；不传表示不过滤"),
+    tag: str | None = Query(default=None, description="按标签过滤；不传表示不过滤"),
     include_archived: bool = Query(default=False, description="是否包含已归档的会话"),
     threads: ThreadService = Depends(get_threads),
     principal: Principal = Depends(require_permission("thread:list")),
@@ -267,6 +268,7 @@ async def list_threads(
             limit=limit,
             offset=offset,
             query=query,
+            tag=tag,
             include_archived=include_archived,
         )
     except ValueError as exc:
@@ -295,24 +297,23 @@ async def update_thread(
     连带拿到删除权。
     """
     normalized = _validate_thread_id(thread_id)
-    if body.title is None and body.archived is None:
+    if body.title is None and body.archived is None and body.tags is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="title 与 archived 至少要提供一项",
+            detail="title / archived / tags 至少要提供一项",
         )
 
     try:
+        # WHY 三项各自独立判定，而不是 if / elif 串起来：一次请求可以同时改名与打标签，
+        # 它们互不依赖；用 else 串联会让「只传 tags」的请求走进归档分支，把
+        # ``bool(None)`` 当成 False 顺手把会话取消归档——用户只想加个标签，结果会话
+        # 从归档里冒了出来。
         if body.title is not None:
             result = await threads.rename_thread(normalized, body.title, principal)
-        else:
-            # 上面已校验「至少提供一项」，因此走到这里 archived 必然非 None
+        if body.archived is not None:
             result = await threads.set_archived(normalized, bool(body.archived), principal)
-
-        # WHY 同时给两个字段时再补一次归档而不是分成两次请求：改完名顺手归档
-        # 是同一个界面动作，拆成两次往返只会多出一个「改成功了但归档失败了」
-        # 的中间态，前端还得为它单独设计提示。
-        if body.title is not None and body.archived is not None:
-            result = await threads.set_archived(normalized, body.archived, principal)
+        if body.tags is not None:
+            result = await threads.update_tags(normalized, body.tags, principal)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except NotFoundError as exc:
