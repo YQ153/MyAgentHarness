@@ -2,6 +2,18 @@
 
 职责边界：只负责「把一次运行推进到底并产出事件」，不负责会话清单与历史
 （见 ``application.thread_service.ThreadService``）。
+
+本模块原先是一份 1800 余行的单文件实现，现已按职责拆成四块：
+- ``application.run_registry``    运行槽位、计数与审批挂起状态的唯一所有者；
+- ``application.run_governance``  超时取消与审批挂起的定时收口；
+- ``application.run_branch``      从历史检查点分叉再跑一轮（编辑 / 重新生成）；
+- 本模块：入口校验、事件流的翻译与收尾、审计与用量落库。
+
+WHY 本类保留「一行方法体 + 委托」的形态，而不是让调用方直接持有协作者：
+``RunService`` 是接口层与装配层唯一认识的运行入口，它的方法名、签名与返回值是
+既有契约（``tests/application/test_run_*.py`` 八个文件全部按它编写）。结构调整
+不该顺带改契约，否则一次「让文件变小」的改动会变成一次全仓改动。内部步骤名
+（如 ``_acquire_run_slot``）同样保留——它们同时是被测试直接驱动的入口。
 """
 
 from __future__ import annotations
@@ -10,37 +22,49 @@ import asyncio
 import itertools
 import json
 import logging
-import threading
 import time
 from collections.abc import AsyncIterator
-import uuid
 from contextlib import suppress
-from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent.run_context import ANONYMOUS_USER_ID, AgentRunContext
+from agent.run_context import AgentRunContext
 from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import GovernanceReport
 from application.errors import (
-    REASON_CONCURRENCY,
-    REASON_RATE,
     InterruptExpiredError,
     NotFoundError,
     OwnershipError,
     PermissionDeniedError,
-    RunRejectedError,
     ThreadBusyError,
 )
 from application.event_translator import LangGraphEventTranslator
 from application.events import AgentEvent, AgentEventType
 from application.interrupt_codec import build_resume_command
+from application.message_utils import (
+    last_user_index,
+    message_text,
+    role_of,
+    user_turn_number,
+)
 from application.ownership import ensure_thread_access
 from application.principal import Principal
+from application.run_branch import RunBranchService
+from application.run_governance import RunGovernor
+# RunHandle / ToolCallRecord / STOP_REASON_* 在此一并再导出：句柄是 ``run_handle``
+# 的返回类型，停止原因是 DONE 事件 payload 的取值——都是本类对外契约的一部分。
+# 调用方不应为了拿一个类型或常量去耦合实现模块。
+from application.run_registry import (
+    STOP_REASON_STOPPED,
+    STOP_REASON_TIMEOUT,
+    RunHandle,
+    RunRegistry,
+    ToolCallRecord,
+)
 from application.runnable import build_runnable_config
 from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
 from runtime.execution_registry import abort_scope, bound_scope
-from runtime.rate_limiter import RateLimiter
 from runtime.thread_store import ThreadMetaStore
 from runtime.tool_outputs import prune_tool_outputs, tool_output_path, write_tool_output
 from runtime.usage_store import UsageStore
@@ -49,67 +73,21 @@ from text_utils import build_title
 from thread_utils import normalize_thread_id
 
 
-def _role_of(message: Any) -> str:
-    """把一条图消息的角色归一成 user / assistant / tool / system。
-
-    WHY 不直接用 LangChain 的 ``type``：它以 ``human`` / ``ai`` 命名，而应用层与前端
-    一直用 ``user`` / ``assistant``。两套叫法在消息筛选处混用会静默漏判（例如把
-    ``human`` 当成未知角色），故在入口处一次性归一。
-    """
-    kind = getattr(message, "type", "") or ""
-    return {"human": "user", "ai": "assistant"}.get(kind, kind or "other")
-
-
-def _message_text(message: Any) -> str:
-    """取消息正文；正文是多段内容时拼接其中的文本段。"""
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            part.get("text", "") for part in content if isinstance(part, dict)
-        )
-    return str(content or "")
-
-
-def _last_user_index(messages: list[Any]) -> int | None:
-    """最后一条用户消息的下标；一条都没有时返回 ``None``。"""
-    for index in range(len(messages) - 1, -1, -1):
-        if _role_of(messages[index]) == "user":
-            return index
-    return None
-
-
-def _user_turn_number(messages: list[Any], index: int) -> int:
-    """下标 ``index`` 是第几条用户消息（1 基），用于给分支起一个人能看懂的名字。"""
-    return sum(1 for message in messages[: index + 1] if _role_of(message) == "user")
-
-
-def _same_message_chain(left: list[Any], right: list[Any]) -> bool:
-    """判断两段消息是否同一条历史链。
-
-    WHY 优先比 id 而不是正文：编辑过的消息正文不同，但这里要确认的是「这是同一段
-    历史」而不是「文字一样」——正文比较会把两条内容恰好相同的分支判成同一条。
-    id 缺失（手写 dict 输入的情形）时退回正文比较。
-    """
-    if len(left) != len(right):
-        return False
-    for one, other in zip(left, right):
-        left_id = getattr(one, "id", None)
-        right_id = getattr(other, "id", None)
-        if left_id and right_id:
-            if left_id != right_id:
-                return False
-            continue
-        if _message_text(one) != _message_text(other):
-            return False
-    return True
-
-
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
     from application.tool_catalog import ToolCatalog
     from config import AppConfig
+
+# WHY 显式声明对外名字：其中四个是从 ``application.run_registry`` 再导出的契约名
+# （见上方 import 处的说明）。写成 ``__all__`` 而不是依赖隐式的再导出，是为了让
+# 「谁在用哪个名字」能被静态检查看见，而不是一个看不见的副作用。
+__all__ = [
+    "STOP_REASON_STOPPED",
+    "STOP_REASON_TIMEOUT",
+    "RunHandle",
+    "RunService",
+    "ToolCallRecord",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -142,124 +120,6 @@ def _preview_args(args: Any) -> str:
     if len(text) > _TOOL_ARGS_PREVIEW_CHARS:
         return text[:_TOOL_ARGS_PREVIEW_CHARS] + "…"
     return text
-
-STOP_REASON_STOPPED = "stopped"
-"""DONE 事件的停止原因：用户主动停止。"""
-
-STOP_REASON_TIMEOUT = "timeout"
-"""DONE 事件的停止原因：运行超过 ``run_max_seconds`` 被治理协程强制取消。
-
-WHY 与 ``stopped`` 区分：两者对前端都是「流已关闭、内容不完整」，但责任方
-不同——一个是用户按了停止，一个是系统判定超时；混成一个值会让用户在没有
-任何操作的情况下看到「已停止」，从而误判界面出了 bug。
-"""
-
-SYSTEM_ACTOR = "system"
-"""后台治理动作的审计主体标识。
-
-WHY 不用空串：审计表的 ``actor_id`` 为空表示「未知」，而后台治理确实是
-系统做出的决定，二者在事后追溯时含义完全不同。
-"""
-
-
-@dataclass(frozen=True, eq=False)
-class RunHandle:
-    """一次运行中会话的运行句柄。
-
-    WHY 独立成类而不是继续用裸集合：停止（``stop``）、运行超时（后续迭代）
-    与运行指标（``/metrics``）都需要「thread_id → 取消信号 + 开始时间」这
-    同一份登记，各自另写一套必然出现口径不一致（例如超时任务看到的运行
-    集合与 stop 看到的不一致）。
-
-    eq=False：句柄的身份就是对象本身，按字段比较两个句柄（含 ``Event``）
-    没有意义，反而容易在集合操作中被误判相等。
-    """
-
-    thread_id: str
-    started_at: float
-    """``time.monotonic()`` 口径的开始时间，用于超时判断与指标。"""
-    cancel_event: asyncio.Event
-    """停止信号；置位后运行在下一个分片边界被中止。"""
-    model_name: str | None = None
-    """本轮使用的模型别名；``None`` 表示默认模型（落用量时按配置解析）。"""
-    owner_id: str = ""
-    """会话所有者；用量记录按它聚合，认证关闭时为空串。"""
-    actor_id: str = ""
-    """发起本轮运行的主体标识；工具审计按它归因，认证关闭时为 ``anonymous``。"""
-    tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    """本轮发生的工具调用记录。
-
-    WHY 挂在句柄上而不是服务上：一轮运行的工具调用天然属于这一轮，按
-    thread_id 另建一份字典会多出一套「运行结束即清理」的生命周期管理，
-    而句柄本来就随运行释放。
-
-    WHY 用可变列表而不是 frozen 语义：记录是在同步热路径（``_track_event``）
-    里逐条追加的，落库则在流结束后统一进行；可变容器是这一写多读场景下
-    唯一不需要加锁的形态。
-    """
-    stop_reason: str | None = None
-    """停止原因；``None`` 表示尚未收到停止请求，取值见模块级常量。"""
-    fork_checkpoint: str = ""
-    """本次运行的分叉起点检查点 id；空串表示接着当前分支的头跑。"""
-
-    @property
-    def stop_requested(self) -> bool:
-        """是否已收到停止请求。"""
-        return self.cancel_event.is_set()
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """已运行时长（秒）。"""
-        return time.monotonic() - self.started_at
-
-    @property
-    def memory_owner(self) -> str:
-        """本轮运行长期记忆的归属主体。
-
-        WHY 直接复用 ``owner_id``：记忆是「这个用户的偏好」，与会话归属同源，
-        另存一份必然出现两者漂移。认证关闭时 ``owner_id`` 为空串，这里统一
-        落到匿名标识——否则空串会被当成一个独立命名空间，让同一台机器上
-        「CLI 写的记忆 Web 读不到」。
-        """
-        return self.owner_id or ANONYMOUS_USER_ID
-
-    def request_stop(self, reason: str = STOP_REASON_STOPPED) -> None:
-        """请求停止本次运行；重复调用时首次的原因生效。
-
-        WHY 保留首次原因：超时强制取消之后用户再点停止（或反过来），
-        先到达的那个才是运行的真实终止原因；覆盖它会让审计与前端
-        「已超时」的结论被后来的操作改写。
-
-        WHY 用 ``object.__setattr__`` 而不是把整个句柄改成可变：句柄的
-        ``thread_id`` / ``started_at`` 一旦可写，运行登记就失去了可信度；
-        这里只为「一次性记录原因」破一个口子，比整体降级为可变更安全。
-
-        Args:
-            reason: 停止原因；取 ``STOP_REASON_STOPPED`` 或
-                ``STOP_REASON_TIMEOUT``。
-        """
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("reason 必须是非空字符串")
-        if self.stop_reason is None:
-            object.__setattr__(self, "stop_reason", reason.strip())
-        self.cancel_event.set()
-
-
-@dataclass(eq=False)
-class ToolCallRecord:
-    """一次工具调用的审计草稿。
-
-    WHY 单独成类：工具调用的开始（TOOL_CALL）与结束（TOOL_RESULT）是两个
-    不同的事件，耗时只有把它们配对后才能算出来；用一个记录对象承载这对
-    状态，比在两个字典里分别记时间戳更容易保证不漏、不串。
-    """
-
-    name: str
-    started_at: float
-    args_preview: str = ""
-    status: str = ""
-    """工具结果的 status；空串表示运行结束前都未收到结果。"""
-    elapsed_ms: int | None = None
 
 
 class _RunStoppedError(Exception):
@@ -315,39 +175,18 @@ class RunService:
         self._usage_store = usage_store
         self._tool_catalog = tool_catalog
 
-        # WHY 用 threading.Lock 保护「运行中」登记表：加解锁之间不 await，
-        # 临界区极短；更重要的是释放动作必须能在 finally 里同步完成——
-        # 若用 asyncio.Lock，客户端断开连接触发 GeneratorExit 时在 finally
-        # 中 await 会破坏生成器的关闭流程。
-        self._running: dict[str, RunHandle] = {}
-        self._running_guard = threading.Lock()
-
-        # WHY 累计运行数与 HITL 挂起登记与运行登记表共用一把锁：三者都是
-        # 「本次运行的即时状态」，若各自加锁，指标采集会读到互相矛盾的组合
-        # （例如累计运行数已加一，但槽位尚未登记）。
-        self._started_runs = 0
-        self._hitl_pending: dict[str, float] = {}
-        """会话 ID → 挂起登记时刻（``time.monotonic``），用于 TTL 判定。"""
-        self._hitl_expired: dict[str, float] = {}
-        """会话 ID → 被判定超期的时刻；用于拒绝过期审批与指标展示。
-
-        WHY 与 ``_hitl_pending`` 分开存：过期是「曾经挂起且已作废」的历史事实，
-        而挂起是当下状态。合成一个字典就要用哨兵值区分二者，届时每个读取点
-        都要记得判断哨兵——漏一处就会出现「已过期的审批被放行」。
-        """
-        self._timed_out_runs = 0
-        """进程启动以来被运行超时强制取消的运行数。"""
-        self._expired_hitl = 0
-        """进程启动以来被判定超期作废的审批挂起数。"""
-        self._rejected_runs = 0
-        """进程启动以来因超出并发上限或被限流而拒绝的运行数。"""
-
-        # WHY 限流器由本服务自己持有而不是放进装配层：它的键是「发起本轮的主体」，
-        # 而主体（owner_id）是运行期才算出来的——放进装配层就要把同一份配置再读一遍，
-        # 两处配置迟早分叉，表现为「改了配置但限流阈值没变」。
-        self._run_limiter = RateLimiter(
-            window_seconds=config.run_rate_limit_window_seconds,
-            max_attempts=config.run_rate_limit_max_attempts,
+        # WHY 三个协作者在构造期一次装配、而不是由装配层分别注入：它们必须与本次
+        # 构造共享同一份配置与**同一张**登记表（入口准入、治理巡检与指标端点读写的
+        # 是同一份运行即时状态）。从外面拼装只会多出一条「谁先把谁造出来」的顺序
+        # 约束，而顺序错了的后果是指标静默失真，不是报错。
+        self._registry = RunRegistry(config)
+        self._governor = RunGovernor(config, registry=self._registry, audit=self._audit)
+        self._branches = RunBranchService(
+            config,
+            thread_store=thread_store,
+            graph_factory=graph_factory,
+            registry=self._registry,
+            audit=self._audit,
         )
 
         logger.info(
@@ -577,10 +416,10 @@ class RunService:
 
         messages = await self._branch_messages(normalized, principal)
 
-        last_user = _last_user_index(messages)
+        last_user = last_user_index(messages)
         if last_user is None:
             raise ValueError("该会话还没有用户消息，无法重新生成")
-        text = _message_text(messages[last_user]).strip()
+        text = message_text(messages[last_user]).strip()
         if not text:
             raise ValueError("最后一条用户消息没有文本内容，无法重新生成")
 
@@ -631,10 +470,10 @@ class RunService:
         messages = await self._branch_messages(normalized, principal)
         if message_index >= len(messages):
             raise ValueError(f"message_index 越界（{message_index} >= {len(messages)}）")
-        if _role_of(messages[message_index]) != "user":
+        if role_of(messages[message_index]) != "user":
             raise ValueError("只能编辑用户消息")
 
-        turn = _user_turn_number(messages, message_index)
+        turn = user_turn_number(messages, message_index)
         return await self._fork_and_run(
             normalized,
             text,
@@ -660,73 +499,35 @@ class RunService:
     ) -> AsyncIterator[AgentEvent]:
         """从「目标消息出现之前」的检查点分叉，并用 ``text`` 跑一轮。
 
+        WHY 拼接动作只在这里发生：分叉的准备（定位检查点、登记分支、占槽位）与事件流
+        的消费（翻译、落库、收尾）分属两个模块，但调用方只应看到一个「返回事件迭代器」
+        的方法——拼接留在此处，两条路径（编辑 / 重新生成）都不必知道内部拆成了几块。
+
         Raises:
             ValueError: 找不到分叉点（历史已被清理）。
             ThreadBusyError: 该会话已有运行中的轮次。
         """
-        # WHY 先取图再登记分支：解析模型别名与初始化模型可能失败，那属于「什么都没
-        # 发生」；若先写了分支再失败，分支清单里会多出一条没有任何内容的分支。
-        graph = self._graph_factory.get(model_name)
-        actor_id = principal.user_id if principal else "anonymous"
-
-        fork_checkpoint = await self._find_fork_checkpoint(
-            graph, thread_id, messages, target_index
-        )
-
-        # WHY 不无条件冻结旧分支的头：此刻会话的头属于**最新**那条分支，未必是正要
-        # 离开的这一条——拿它去覆盖一份准确记录会把另一条分支的位置写进这一条。
-        # 只在旧分支「从未被离开过」时补记（见 ``_freeze_unrecorded`` 的说明）。
-        current = await self._thread_store.current_branch(thread_id)
-        await self._freeze_unrecorded(graph, thread_id, current)
-
-        branch_id = uuid.uuid4().hex
-        await self._thread_store.upsert_branch(
+        plan = await self._branches.prepare_fork(
             thread_id,
-            branch_id,
-            parent_branch_id=current,
+            text,
+            messages=messages,
+            target_index=target_index,
             origin=origin,
             label=label,
-        )
-        await self._thread_store.set_current_branch(thread_id, branch_id)
-
-        # WHY 与新一轮输入同样作废悬着的审批：用户既已改口，那张审批卡就不再代表
-        # 当前意图，留着只会让「待审批数」无限增长。
-        self.clear_hitl_pending(thread_id)
-        # WHY 只刷新活动时间而不加轮次：轮次记的是「用户发起了几轮」，编辑与重新生成
-        # 都没有新增一次用户发起；把它们算进去会让清单上的轮数凭空增长。
-        await self._thread_store.touch(thread_id)
-        await self._audit(
-            event_type="thread_branch",
-            actor_id=actor_id,
-            target_id=thread_id,
-            action=origin,
-            outcome="success",
-            details={
-                "branch_id": branch_id,
-                "parent_branch_id": current,
-                "label": label,
-                "message_index": target_index,
-            },
-        )
-
-        handle = self._acquire_run_slot(
-            thread_id,
             model_name=model_name,
             owner_id=self._owner_id(principal),
-            actor_id=actor_id,
-            fork_checkpoint=fork_checkpoint,
+            actor_id=principal.user_id if principal else "anonymous",
         )
-
-        payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
-        return self._consume(graph, payload, handle)
+        return self._consume(plan.graph, plan.payload, plan.handle)
 
     async def _branch_messages(
         self, thread_id: str, principal: Principal | None
     ) -> list[Any]:
         """读当前分支的消息列表，并顺带完成权限与会话校验。
 
-        WHY 读「当前分支」而不是会话最新状态：分叉之后两者不再是同一件事。用户在旧
-        分支上点重新生成，理应接着**那条**分支的上下文，而不是最新那条的。
+        WHY 权限与所有权留在这一层而不是下沉到分叉服务：这两个判定的结论必须先于
+        「会话是否存在」给出（否则状态码本身成了探测手段），属于入口契约；分叉服务
+        只管历史与分支记录。
 
         Raises:
             PermissionDeniedError: 缺少 thread:create 权限。
@@ -737,123 +538,7 @@ class RunService:
         self._ensure_permission(principal, "thread:create")
         await self._ensure_ownership(thread_id, principal)
 
-        graph = self._graph_factory.get()
-        branch = await self._thread_store.current_branch(thread_id)
-        checkpoint = await self._branch_head(graph, thread_id, branch)
-
-        try:
-            state = await graph.aget_state(
-                build_runnable_config(self._config, thread_id, checkpoint)
-            )
-        except Exception as exc:
-            logger.exception("读取分支历史失败：thread=%s branch=%s", thread_id, branch)
-            raise RuntimeError(f"读取分支历史失败：thread={thread_id}") from exc
-
-        return list(getattr(state, "values", {}).get("messages") or [])
-
-    async def _branch_head(self, graph: Any, thread_id: str, branch: str) -> str | None:
-        """返回某分支的头部检查点 id；``None`` 表示回落到会话当前的头。
-
-        WHY 以分支记录里的头为准，而不是「当前分支就跟随会话的头」：这两个值只在
-        「当前分支恰好是最新那条」时相等——而那正是最容易被当成恒等式的地方。用户一旦
-        切回旧分支，会话头仍指向最新那条，按会话头去读会把旧分支显示成新分支的内容，
-        而且界面上看不出错，只表现为「切了没反应」。
-
-        Raises:
-            NotFoundError: 该分支既不是当前分支、也没有记录在案。
-        """
-        record = await self._thread_store.get_branch(thread_id, branch)
-        head = (record or {}).get("head_checkpoint") or ""
-        if head:
-            return head
-
-        current = await self._thread_store.current_branch(thread_id)
-        if branch == current:
-            # 尚无记录（例如刚分叉出来、还没跑过的新分支）：此刻会话的头就是它的头
-            return None
-
-        raise NotFoundError("分支", branch)
-
-    async def _live_head(self, graph: Any, thread_id: str) -> str:
-        """读会话当前的头部检查点 id；空会话返回空串。"""
-        state = await graph.aget_state(build_runnable_config(self._config, thread_id))
-        return (
-            (getattr(state, "config", None) or {})
-            .get("configurable", {})
-            .get("checkpoint_id", "")
-            or ""
-        )
-
-    async def _freeze_unrecorded(self, graph: Any, thread_id: str, branch: str) -> None:
-        """给「从未被离开过、因而没有头记录」的分支补记一次头。
-
-        WHY 只在没有记录时补：一旦分支被离开过，它的头就已经由运行收尾或上一次补记
-        准确落库了。此后会话头未必还属于它（可能属于更新的那条分支），用会话头去覆盖
-        一份准确记录是错的。
-
-        WHY「没有记录」时补记是可靠的：没有记录意味着这条分支从未被离开过，也就没有
-        别的分支在它之后运行过——此刻的会话头正是它自己的头。归纳一下即可确认：任何
-        一条分支一旦被离开就会被记上一次，于是「无记录」只可能是第一次离开。
-        """
-        if not branch and branch != "":
-            return
-        existing = await self._thread_store.get_branch(thread_id, branch)
-        if (existing or {}).get("head_checkpoint"):
-            return
-
-        head = await self._live_head(graph, thread_id)
-        if head:
-            await self._thread_store.set_branch_head(thread_id, branch, head)
-
-    async def _refresh_branch_head(self, graph: Any, handle: RunHandle) -> None:
-        """把当前分支的头记成这一轮运行之后的头。
-
-        WHY 必须持久化：上游的头是**会话级**的，永远指向最新那条分支；「我这条分支停在
-        哪」则是分支级的。不记下来的话，切走再切回就找不回自己的位置。
-
-        WHY 失败不上抛：记账失败不该把一次已经成功的对话变成错误；下一次运行会重试。
-        """
-        try:
-            state = await graph.aget_state(
-                build_runnable_config(self._config, handle.thread_id)
-            )
-            checkpoint = (
-                (getattr(state, "config", None) or {})
-                .get("configurable", {})
-                .get("checkpoint_id", "")
-            )
-            if not checkpoint:
-                return
-            branch = await self._thread_store.current_branch(handle.thread_id)
-            await self._thread_store.set_branch_head(handle.thread_id, branch, checkpoint)
-        except Exception:
-            logger.exception("刷新分支头失败：thread=%s", handle.thread_id)
-
-    async def _find_fork_checkpoint(
-        self,
-        graph: Any,
-        thread_id: str,
-        messages: list[Any],
-        target_index: int,
-    ) -> str:
-        """找出「第 ``target_index`` 条消息出现之前」那个检查点。
-
-        WHY 必须逐条比对消息链：``aget_state_history`` 给出的是**整个会话**的检查点，
-        其中还包含其它分支的；只按消息条数挑会挑到别的分支上——后果是分叉后的上下文
-        变成用户没写过的一段历史，而且没有任何报错，只能靠人眼发现。
-
-        Raises:
-            ValueError: 找不到匹配的历史（例如检查点已被清理）。
-        """
-        wanted = messages[:target_index]
-        config = build_runnable_config(self._config, thread_id)
-
-        async for snapshot in graph.aget_state_history(config):
-            values = list(getattr(snapshot, "values", {}).get("messages") or [])
-            if _same_message_chain(values, wanted):
-                return snapshot.config["configurable"]["checkpoint_id"]
-
-        raise ValueError("找不到该轮次对应的分叉点，历史可能已被清理")
+        return await self._branches.messages_of(thread_id)
 
     async def resume(
         self,
@@ -1013,10 +698,9 @@ class RunService:
         由后台协程按 ``run_governance_interval_seconds`` 调用；也允许运维在
         测试中手动触发一次。
 
-        WHY 把两件事放在一次巡检里：它们共享同一份「运行即时状态」的快照，
-        也共享同一条审计口径（动作主体都是系统）；分成两个协程就要两把锁的
-        快照语义，反而更容易出现「刚判定超时、同一轮又判它挂起过期」的
-        自相矛盾记录。
+        WHY 本方法只留入口、不在正文里保留一段说明性的实现说明：巡检的两个动作
+        （判定条件、收口动作、并发让位）属于「按时间自动发生」的问题域，它们的
+        实现与这类问题的取舍一起落在 ``application.run_governance``。
 
         Returns:
             本次巡检的结果（超时数、过期数、巡检到的运行/挂起数）。
@@ -1024,31 +708,7 @@ class RunService:
         Raises:
             RuntimeError: 阈值配置非法（由配置校验兜底，理论不可达）。
         """
-        limit = self._config.run_max_seconds
-        ttl = self._config.hitl_pending_ttl_seconds
-        if not isinstance(limit, int) or limit < 0:
-            raise RuntimeError("run_max_seconds 配置非法")
-        if not isinstance(ttl, int) or ttl < 0:
-            raise RuntimeError("hitl_pending_ttl_seconds 配置非法")
-
-        now = time.monotonic()
-        running_snapshot = self.run_handles()
-        pending_snapshot = self.pending_hitl_thread_ids()
-        report = GovernanceReport(
-            checked_runs=len(running_snapshot),
-            checked_hitl=len(pending_snapshot),
-        )
-
-        report.timed_out_runs = await self._enforce_run_timeouts(running_snapshot, limit, now)
-        report.expired_hitl = await self._expire_stale_hitl(pending_snapshot, ttl)
-
-        if report.timed_out_runs or report.expired_hitl:
-            logger.info(
-                "运行治理巡检：超时取消 %d 个运行，作废 %d 个超期审批",
-                report.timed_out_runs,
-                report.expired_hitl,
-            )
-        return report
+        return await self._governor.enforce()
 
     async def _enforce_run_timeouts(
         self,
@@ -1056,84 +716,21 @@ class RunService:
         limit: int,
         now: float,
     ) -> int:
-        """强制取消超过 ``run_max_seconds`` 的运行，返回被取消的数量。"""
-        if limit <= 0:
-            return 0
+        """强制取消超过 ``run_max_seconds`` 的运行，返回被取消的数量。
 
-        cancelled = 0
-        for thread_id, handle in running_snapshot.items():
-            if handle.stop_requested or (now - handle.started_at) < limit:
-                continue
-            # WHY 二次确认句柄仍在册：快照到此刻之间该运行可能已自然结束，
-            # 若直接置位，就会对一个已废弃的句柄记一次超时审计。
-            if self.run_handle(thread_id) is not handle:
-                continue
-
-            elapsed = handle.elapsed_seconds
-            handle.request_stop(STOP_REASON_TIMEOUT)
-            # WHY 超时同样要终止子进程树：超时往往正是命令卡住造成的，
-            # 只取消 future 会让那棵进程树继续活到它自己的超时。
-            aborted = abort_scope(thread_id)
-            with self._running_guard:
-                self._timed_out_runs += 1
-            cancelled += 1
-            logger.warning(
-                "会话 %s 运行超过 %d 秒（实际 %.1f 秒），已强制取消，终止在跑命令 %d 个",
-                thread_id,
-                limit,
-                elapsed,
-                aborted,
-            )
-            await self._audit(
-                event_type="run_timeout",
-                actor_id=SYSTEM_ACTOR,
-                target_id=thread_id,
-                action="timeout",
-                outcome="success",
-                details={
-                    "elapsed_seconds": round(elapsed, 3),
-                    "max_seconds": limit,
-                },
-            )
-        return cancelled
+        WHY 保留这个私有入口而不是让调用方自己去拿治理器：它是
+        ``enforce_governance`` 的一个步骤，测试也直接驱动它来复现「快照与置位
+        之间运行已自然结束」的竞态。
+        """
+        return await self._governor.enforce_timeouts(running_snapshot, limit, now)
 
     async def _expire_stale_hitl(
         self,
         pending_snapshot: tuple[str, ...],
         ttl: int,
     ) -> int:
-        """作废挂起超过 ``hitl_pending_ttl_seconds`` 的审批，返回作废数量。
-
-        WHY 用「当前挂起时长」而不是传入的统一 ``now`` 再减：判定与作废之间
-        隔着一次 await（写审计），期间用户完全可能应答；以服务内的实时时长
-        为准，可以让刚刚被应答的会话不会被误判。
-        """
-        if ttl <= 0:
-            return 0
-
-        expired = 0
-        for thread_id in pending_snapshot:
-            age = self.hitl_pending_age(thread_id)
-            if age is None or age < ttl:
-                continue
-            # WHY 以 expire_hitl_pending 的返回值为准：用户可能刚好在这一刻
-            # 应答（resume 会先清登记），此时本次巡检应当让位，而不是把一次
-            # 已经生效的审批再标记成过期。
-            if not self.expire_hitl_pending(thread_id):
-                continue
-            expired += 1
-            await self._audit(
-                event_type="hitl_expired",
-                actor_id=SYSTEM_ACTOR,
-                target_id=thread_id,
-                action="expire",
-                outcome="success",
-                details={
-                    "pending_seconds": round(age, 3),
-                    "ttl_seconds": ttl,
-                },
-            )
-        return expired
+        """作废挂起超过 ``hitl_pending_ttl_seconds`` 的审批，返回作废数量。"""
+        return await self._governor.expire_stale_hitl(pending_snapshot, ttl)
 
     # ------------------------------------------------------------------ 内部
 
@@ -1188,7 +785,7 @@ class RunService:
         # WHY 与活动时间同一个位置：两者都是「本轮已收尾」的动作，放在同一处才不会
         # 出现「时间刷新了、分支头没记」的半截状态。会话头只在当前分支恰好是最新那条
         # 时才等于分支头，切过分支之后就不再相等——不记下来，切回去会读到别人的内容。
-        await self._refresh_branch_head(graph, handle)
+        await self._branches.refresh_head(graph, handle)
 
         # WHY 出错后仍以 DONE 收尾而不直接结束：前端依赖 DONE 复位「正在输出的
         # 那条消息」，只有 ERROR 而没有 DONE 时，下一轮回复的文本会被追加到上
@@ -1455,26 +1052,17 @@ class RunService:
                         await task
 
     # -------------------------------------------------------------- 并发控制
-
-    def _at_capacity_locked(self) -> bool:
-        """并发是否已达上限。
-
-        WHY 要求调用方已持锁：上限判定与随后的槽位占用必须是同一个原子动作，
-        否则两个请求可以同时看到「还剩一个空位」然后一起挤进来。
-        """
-        cap = self._config.max_concurrent_runs
-        return cap > 0 and len(self._running) >= cap
+    # 以下方法全部委托给 ``RunRegistry``：运行槽位、累计计数与审批挂起状态的唯一
+    # 所有者在那边（锁与状态字段一并搬走）。这里保留同名方法，是为了让「谁能读、
+    # 谁能改哪份状态」对调用方完全不变——指标端点、治理巡检与测试都按这些名字读。
 
     def _check_run_limits(self, principal: Principal | None) -> None:
         """在真正触碰会话之前判定并发与限流。
 
-        WHY 必须排在所有权校验之前：若排在之后，被限流的调用方可以从「404 还是
-        429」推断出某个会话在不在——限流不该成为一把探测他人会话的尺子。权限校验
-        仍在最前面，未授权的调用方连这一层都到不了。
-
-        WHY 并发数直接数运行登记表而不另设计数器：既有语义里「删除 / 归档会话不会
-        中断正在进行的运行」，运行因此可能比会话本身活得更久；另立的计数迟早与登记表
-        漂移，而漂移的方向恰恰是「指标说还有空位，实际已经排不动」。
+        WHY 保留这一层而不是让调用方直接去问登记表：调用顺序（权限 → 限流 →
+        所有权）本身是入口契约——限流必须早于「会话是否存在」的判断，否则被限流
+        的一方能从 404 与 429 的差别里推断出他人会话是否存在。这条约束写在调用
+        顺序唯一确定的地方，最不容易被后来的改动破坏。
 
         Args:
             principal: 当前主体；``None`` 表示认证关闭，落到匿名主体。
@@ -1482,22 +1070,7 @@ class RunService:
         Raises:
             RunRejectedError: 超出并发上限或被限流。
         """
-        retry_after = self._config.run_rejected_retry_after_seconds
-        # WHY 认证关闭时落到匿名主体：单用户场景下所有请求本就属于同一个人，
-        # 按空串计数会让「限流」在该场景下等于关闭。
-        key = self._owner_id(principal) or ANONYMOUS_USER_ID
-
-        if not self._run_limiter.is_allowed(key):
-            with self._running_guard:
-                self._rejected_runs += 1
-            logger.warning("运行被限流：owner=%s", key)
-            raise RunRejectedError(REASON_RATE, retry_after)
-
-        with self._running_guard:
-            if self._at_capacity_locked():
-                self._rejected_runs += 1
-                logger.warning("运行被拒：并发已达上限 %s", self._config.max_concurrent_runs)
-                raise RunRejectedError(REASON_CONCURRENCY, retry_after)
+        self._registry.check_limits(self._owner_id(principal))
 
     def _acquire_run_slot(
         self,
@@ -1510,115 +1083,64 @@ class RunService:
     ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
-        WHY 必须互斥：同一会话并发发起两轮会让图状态产生竞争——两轮各自读写
-        同一 thread 的检查点，后写的一方会覆盖先写一方的中间结果，表现为消息
-        丢失或工具结果错配。
-
-        WHY 把模型别名与所有者一起登记进句柄：用量在流结束时才落库，那一刻
-        已经拿不到本轮的参数；挂在句柄上才能「谁的模型、谁的用量」对齐。
-
         Args:
             thread_id: 已规范化的会话 ID。
             model_name: 本轮使用的模型别名；``None`` 表示默认模型。
             owner_id: 会话所有者；认证关闭时为空串。
             actor_id: 发起本轮运行的主体标识，用于工具审计归因。
+            fork_checkpoint: 分叉起点检查点 id；空串表示接着当前分支的头。
 
         Returns:
             本次运行的句柄；停止请求与运行指标都通过它传递。
 
         Raises:
+            ValueError: ``thread_id`` 非法。
             ThreadBusyError: 该会话已有运行中的轮次。
+            RunRejectedError: 并发上限在等待期间已被占满。
         """
-        with self._running_guard:
-            if thread_id in self._running:
-                raise ThreadBusyError(thread_id)
-
-            # WHY 在这里复查一次上限：``_check_run_limits`` 与本次占用之间隔着所有权
-            # 校验等 await，足够另一轮把最后一个槽位占走。检查与占用同在锁内才是原子的；
-            # 而这里被拒的只可能是「自己有权限的会话」，不存在借状态码探测他人的问题。
-            if self._at_capacity_locked():
-                self._rejected_runs += 1
-                raise RunRejectedError(
-                    REASON_CONCURRENCY, self._config.run_rejected_retry_after_seconds
-                )
-
-            handle = RunHandle(
-                thread_id=thread_id,
-                started_at=time.monotonic(),
-                cancel_event=asyncio.Event(),
-                model_name=model_name,
-                owner_id=owner_id,
-                actor_id=actor_id,
-                fork_checkpoint=fork_checkpoint,
-            )
-            self._running[thread_id] = handle
-            # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，
-            # 放在 stream / resume 里会漏掉其中一条路径。
-            self._started_runs += 1
-        return handle
+        return self._registry.acquire(
+            thread_id,
+            model_name=model_name,
+            owner_id=owner_id,
+            actor_id=actor_id,
+            fork_checkpoint=fork_checkpoint,
+        )
 
     def release_run_slot(self, thread_id: str) -> None:
         """释放该会话的运行槽位。
 
-        WHY 对外公开：生成器只会在被消费时通过 ``finally`` 释放槽位。若调用方
-        拿到生成器后因异常未能消费（例如构造响应体时出错），槽位就再也没人释放，
-        该会话会被永久判定为「运行中」。公开此方法让调用方能在这种情况下归还。
+        WHY 对外公开：生成器只会在被消费时通过 ``finally`` 释放槽位；若调用方拿到
+        生成器后因异常未能消费（例如构造响应体时出错），槽位就再也没人释放，该会话
+        会被永久判定为「运行中」。公开此方法让调用方能在这种情况下归还。
 
         Args:
             thread_id: 会话 ID。
         """
-        with self._running_guard:
-            self._running.pop(thread_id, None)
+        self._registry.release(thread_id)
 
     def run_handle(self, thread_id: str) -> RunHandle | None:
-        """返回指定会话的运行句柄；未在运行时为 ``None``。
-
-        WHY 公开：运行指标（``/metrics``）与运行超时治理需要读同一份登记，
-        各自维护一套集合会出现口径不一致。
-        """
-        with self._running_guard:
-            return self._running.get(thread_id)
+        """返回指定会话的运行句柄；未在运行时为 ``None``。"""
+        return self._registry.handle(thread_id)
 
     def is_running(self, thread_id: str) -> bool:
         """该会话当前是否有运行中的轮次。"""
-        with self._running_guard:
-            return thread_id in self._running
+        return self._registry.is_running(thread_id)
 
     def run_handles(self) -> dict[str, RunHandle]:
-        """当前全部运行句柄的快照（会话 ID → 句柄）。
-
-        WHY 需要整表快照而不是逐个查 ``run_handle``：运行治理要在同一时刻
-        判断「哪些运行超时」，逐个查询会让每个判断落在不同时刻，从而把扫描
-        期间才启动的运行也算进本轮结论里。
-        """
-        with self._running_guard:
-            return dict(self._running)
+        """当前全部运行句柄的快照（会话 ID → 句柄）。"""
+        return self._registry.handles()
 
     def running_thread_ids(self) -> tuple[str, ...]:
         """当前运行中的会话 ID 快照（供指标暴露）。"""
-        with self._running_guard:
-            return tuple(self._running)
+        return self._registry.running_ids()
 
     @property
     def started_runs(self) -> int:
-        """进程启动以来累计发起的运行次数。
-
-        WHY 做成指标：单看「运行中」只能知道当下忙不忙，累计值才能回答
-        「这台实例跑过多少轮」，是容量规划与异常检测的最小数据集。
-        """
-        with self._running_guard:
-            return self._started_runs
+        """进程启动以来累计发起的运行次数。"""
+        return self._registry.started_runs
 
     def mark_hitl_pending(self, thread_id: str) -> None:
         """登记该会话有一个等待人工审批的中断，并记录挂起起始时刻。
-
-        WHY 由服务持有而不是让指标端点去遍历图状态：遍历需要对每个会话
-        调一次 ``aget_state``，成本随会话数线性增长；而中断事件在事件流里
-        已经出现过一次，登记是零成本的。
-
-        WHY 重复登记不刷新起始时刻：同一轮运行里中断事件可能出现多次
-        （多个待审批工具），若每次都重置，TTL 就永远走不完；以首次登记
-        为准才能让「挂起太久」这个判断成立。
 
         Args:
             thread_id: 已规范化的会话 ID。
@@ -1626,14 +1148,7 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法。
         """
-        if not isinstance(thread_id, str) or not thread_id.strip():
-            raise ValueError("thread_id 必须是非空字符串")
-        with self._running_guard:
-            # 新一轮中断作废上一次的过期标记：既然又等上了，说明用户确实
-            # 在跟这个会话交互，此前的过期结论不再适用。
-            self._hitl_expired.pop(thread_id, None)
-            if thread_id not in self._hitl_pending:
-                self._hitl_pending[thread_id] = time.monotonic()
+        self._registry.mark_hitl_pending(thread_id)
 
     def clear_hitl_pending(self, thread_id: str) -> None:
         """清除该会话的待审批登记与过期标记；本就没有挂起时是 no-op。
@@ -1644,11 +1159,7 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法。
         """
-        if not isinstance(thread_id, str) or not thread_id.strip():
-            raise ValueError("thread_id 必须是非空字符串")
-        with self._running_guard:
-            self._hitl_pending.pop(thread_id, None)
-            self._hitl_expired.pop(thread_id, None)
+        self._registry.clear_hitl_pending(thread_id)
 
     def expire_hitl_pending(self, thread_id: str) -> bool:
         """把该会话的挂起审批标记为过期并释放占位。
@@ -1663,82 +1174,48 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法。
         """
-        if not isinstance(thread_id, str) or not thread_id.strip():
-            raise ValueError("thread_id 必须是非空字符串")
-        with self._running_guard:
-            started_at = self._hitl_pending.pop(thread_id, None)
-            if started_at is None:
-                return False
-            self._hitl_expired[thread_id] = time.monotonic()
-            self._expired_hitl += 1
-        logger.info(
-            "会话 %s 的审批挂起已超期作废：等待 %.1f 秒",
-            thread_id,
-            time.monotonic() - started_at,
-        )
-        return True
+        return self._registry.expire_hitl_pending(thread_id)
 
     def is_hitl_expired(self, thread_id: str) -> bool:
-        """该会话是否有一个已作废（超期）的审批挂起。"""
-        if not isinstance(thread_id, str) or not thread_id.strip():
-            raise ValueError("thread_id 必须是非空字符串")
-        with self._running_guard:
-            return thread_id in self._hitl_expired
+        """该会话是否有一个已作废（超期）的审批挂起。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        return self._registry.is_hitl_expired(thread_id)
 
     def hitl_pending_age(self, thread_id: str) -> float | None:
         """该会话的审批已挂起秒数；未挂起时为 ``None``。"""
-        with self._running_guard:
-            started_at = self._hitl_pending.get(thread_id)
-        return None if started_at is None else time.monotonic() - started_at
+        return self._registry.hitl_pending_age(thread_id)
 
     def pending_hitl_thread_ids(self) -> tuple[str, ...]:
-        """当前等待人工审批的会话 ID 快照。
-
-        WHY 需要这份登记：HITL 挂起的运行既不占运行槽位（图已经暂停），
-        也不是错误，只有单独记录才能被指标与后续的挂起 TTL 治理看到。
-        """
-        with self._running_guard:
-            return tuple(self._hitl_pending)
+        """当前等待人工审批的会话 ID 快照。"""
+        return self._registry.pending_hitl_ids()
 
     @property
     def timed_out_runs(self) -> int:
         """进程启动以来被运行超时强制取消的运行次数。"""
-        with self._running_guard:
-            return self._timed_out_runs
+        return self._registry.timed_out_runs
 
     @property
     def expired_hitl(self) -> int:
         """进程启动以来因超期未决策而作废的审批挂起次数。"""
-        with self._running_guard:
-            return self._expired_hitl
+        return self._registry.expired_hitl
 
     @property
     def max_concurrent_runs(self) -> int:
         """配置的全局并发上限；``0`` 表示不限制。"""
-        return self._config.max_concurrent_runs
+        return self._registry.max_concurrent_runs
 
     @property
     def available_run_slots(self) -> int:
-        """当前可用槽位数；上限为 ``0``（不限制）时返回 ``-1``。
-
-        WHY 不限制时用 ``-1`` 而不是 ``0``：``0`` 在容量语境里天然读作「一个空位都
-        没有」，而这里恰恰相反。让「不限制」有一个不可能与「已满」混淆的取值，
-        看指标的人就不必再回去查配置。
-        """
-        if self._config.max_concurrent_runs <= 0:
-            return -1
-        with self._running_guard:
-            return max(0, self._config.max_concurrent_runs - len(self._running))
+        """当前可用槽位数；上限为 ``0``（不限制）时返回 ``-1``。"""
+        return self._registry.available_slots
 
     @property
     def rejected_runs(self) -> int:
-        """进程启动以来因并发上限或限流被拒绝的运行次数。
-
-        WHY 与运行登记表共用一把锁：拒绝计数要在「判定超限」的同一临界区内自增，
-        否则指标会读到「已满但拒绝数为 0」这种自相矛盾的组合。
-        """
-        with self._running_guard:
-            return self._rejected_runs
+        """进程启动以来因并发上限或限流被拒绝的运行次数。"""
+        return self._registry.rejected_runs
 
     # ------------------------------------------------------------------ 元数据
 

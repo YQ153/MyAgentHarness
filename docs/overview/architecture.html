@@ -207,7 +207,10 @@
     <div class="layername">应用层</div>
     <div class="layerbody">
       <div class="card"><b>application/thread_service.py</b><span>会话元数据生命周期</span></div>
-      <div class="card"><b>application/run_service.py</b><span>运行推进与并发互斥</span></div>
+      <div class="card"><b>application/run_service.py</b><span>运行推进、事件产出与审计落库（对外门面）</span></div>
+      <div class="card"><b>application/run_registry.py</b><span>运行槽位、计数与审批挂起的唯一所有者</span></div>
+      <div class="card"><b>application/run_governance.py</b><span>超时取消与审批挂起 TTL 收口</span></div>
+      <div class="card"><b>application/run_branch.py</b><span>检查点分叉（编辑 / 重新生成）</span></div>
       <div class="card"><b>application/model_catalog.py</b><span>模型目录</span></div>
       <div class="card"><b>application/event_translator.py</b><span>流增量 → 应用事件</span></div>
       <div class="card"><b>application/events.py</b><span>统一事件模型（与传输无关）</span></div>
@@ -288,7 +291,10 @@
     <tr><td>护栏 <code>build_permissions</code></td><td><code>agent/guardrails.py:41</code></td><td>敏感文件黑名单 + 读写放行规则（顺序敏感）</td></tr>
     <tr><td>中断配置 <code>build_interrupt_on</code></td><td><code>agent/guardrails.py:72</code></td><td>仅 <code>local</code> 档位为 <code>execute</code> 开启审批</td></tr>
     <tr><td>会话服务 <code>ThreadService</code></td><td><code>application/thread_service.py</code></td><td>会话标识、清单、历史读取、删除</td></tr>
-    <tr><td>运行服务 <code>RunService</code></td><td><code>application/run_service.py</code></td><td>发起运行、恢复执行、并发互斥与事件产出</td></tr>
+    <tr><td>运行服务 <code>RunService</code></td><td><code>application/run_service.py</code></td><td>发起运行、恢复执行、停止与事件产出；槽位、计数、治理与分叉委托给下列三个协作者</td></tr>
+    <tr><td>运行登记表 <code>RunRegistry</code></td><td><code>application/run_registry.py</code></td><td>运行槽位、累计计数与审批挂起状态的唯一所有者（含那把 <code>threading.Lock</code> 与限流器）</td></tr>
+    <tr><td>运行治理 <code>RunGovernor</code></td><td><code>application/run_governance.py</code></td><td>后台巡检：强制取消超时运行、作废超期未决策的审批挂起（审计主体为 <code>system</code>）</td></tr>
+    <tr><td>分叉服务 <code>RunBranchService</code></td><td><code>application/run_branch.py</code></td><td>定位分叉检查点、登记分支、占好槽位；产出事件仍归 <code>RunService._consume()</code></td></tr>
     <tr><td>模型目录 <code>ModelCatalog</code></td><td><code>application/model_catalog.py</code></td><td>可切换模型的只读清单</td></tr>
     <tr><td>事件翻译器</td><td><code>application/event_translator.py</code></td><td>LangGraph 流增量 → 应用事件（有状态解析器）</td></tr>
     <tr><td>中断编解码</td><td><code>application/interrupt_codec.py</code></td><td>解析 <code>__interrupt__</code>、规整 decisions、构造 <code>Command</code></td></tr>
@@ -318,7 +324,12 @@
 │   └── __init__.py         导出 build_agent / AgentFactory
 ├── application/            应用层：会话编排与对外协议
 │   ├── thread_service.py   ★ 会话服务：new_thread_id / list_threads / history / rename_thread / set_archived / delete_thread
-│   ├── run_service.py      ★ 运行服务：stream / resume（并发互斥与事件产出）
+│   ├── run_service.py      ★ 运行服务门面：stream / resume / stop / edit / regenerate / enforce_governance
+│   ├── run_registry.py     ★ 运行登记表：槽位、累计计数与审批挂起状态的唯一所有者
+│   ├── run_governance.py   ★ 运行治理：超时强制取消与审批挂起 TTL
+│   ├── run_branch.py       ★ 分叉机制：编辑与重新生成共用的「定位检查点 → 登记分支 → 占槽位」
+│   ├── message_utils.py    会话消息读取：角色归一、正文提取、消息链比对（门面与分叉共用）
+│   ├── audit_recorder.py   业务审计写入通道协议（供治理 / 分叉协作者使用，避免反向依赖）
 │   ├── model_catalog.py    ★ 模型目录：list_models
 │   ├── event_translator.py ★ LangGraph 流增量 → AgentEvent
 │   ├── events.py           ★ 统一事件模型 AgentEvent（与传输方式无关）
@@ -613,7 +624,7 @@
 <h2 id="c-service">7. 核心组件：应用服务层</h2>
 
 <p>
-  应用层由三个互不下沉的服务组成，它们都是 CLI 与 Web 的共同下游。两者的差异只在
+  应用层对外由三个互不下沉的服务组成，它们都是 CLI 与 Web 的共同下游。两者的差异只在
   「人工决策从哪来」——CLI 读 stdin，Web 收 HTTP 请求体——而恢复图执行的逻辑完全一致，
   因此下沉到此处以避免两份实现漂移。
 </p>
@@ -622,7 +633,7 @@
   <thead><tr><th>服务</th><th>职责</th><th>不做什么</th></tr></thead>
   <tbody>
     <tr><td><code>ThreadService</code></td><td>会话的元数据生命周期：发号、清单、历史、删除</td><td>不推进运行、不产出事件</td></tr>
-    <tr><td><code>RunService</code></td><td>一次运行的推进、并发互斥与事件产出</td><td>不管会话清单与历史</td></tr>
+    <tr><td><code>RunService</code></td><td>一次运行的推进与事件产出；槽位、治理与分叉委托给三个协作者（见下文「运行服务的模块边界」）</td><td>不管会话清单与历史</td></tr>
     <tr><td><code>ModelCatalog</code></td><td>可切换模型的只读目录</td><td>不参与会话与运行编排</td></tr>
   </tbody>
 </table>
@@ -659,12 +670,43 @@
   </tbody>
 </table>
 
+<h4>运行服务的模块边界（2026-09-19 拆分）</h4>
+<p>
+  <code>run_service.py</code> 原先是 1826 行的单文件实现，同时承担八类变更理由。
+  现按「单模块变更理由唯一」拆成四个模块；<strong>对外契约一字未改</strong>——入口校验、
+  事件流翻译与收尾、审计与用量落库留在 <code>run_service.py</code>，其余三块各自成模块。
+</p>
+<table>
+  <thead><tr><th>模块</th><th>持有 / 负责</th><th>改动它意味着改什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>run_service.py</code></td><td><code>stream</code> / <code>resume</code> / <code>stop</code> / <code>edit</code> / <code>regenerate</code>；<code>_consume</code> → <code>_iterate</code> → <code>_stream_graph</code> 事件流骨架；工具调用审计与工具输出留存落盘；轮次与用量的旁路写入</td><td>事件协议、流式收尾顺序、审计与用量口径</td></tr>
+    <tr><td><code>run_registry.py</code></td><td><code>RunHandle</code> / <code>ToolCallRecord</code>；<code>_running</code> 登记表、五个累计计数、<code>_hitl_pending</code> 与 <code>_hitl_expired</code> 两份挂起登记，以及守护它们的同一把 <code>threading.Lock</code> 与按主体限流器</td><td>「什么算运行中」、并发与限流的判定口径、指标含义</td></tr>
+    <tr><td><code>run_governance.py</code></td><td>超时强制取消（含终止卡住命令的进程树）、审批挂起 TTL 作废，以及两者的 <code>system</code> 主体审计</td><td>「多久算失控」与「失控后如何收口」</td></tr>
+    <tr><td><code>run_branch.py</code></td><td>分支头读写、分叉点定位（逐条比对消息链）、分支登记，返回 <code>ForkPlan</code></td><td>历史定位算法与分支记录的语义</td></tr>
+  </tbody>
+</table>
+
+<div class="box">
+  <span class="t">为什么 <code>RunService</code> 上仍保留一层同名方法</span>
+  <code>RunRegistry</code> 的槽位 / 计数 / 挂起读写，以及 <code>RunGovernor</code> 的两个
+  内部步骤，在 <code>RunService</code> 上仍保留同名方法并逐行委托（含
+  <code>_acquire_run_slot</code>、<code>_enforce_run_timeouts</code> 这类内部入口）。
+  WHY：<code>RunService</code> 是接口层、装配层与测试唯一认识的运行入口——指标端点与
+  治理协程按这些名字读状态，<code>tests/application/test_run_*.py</code> 六个文件按这些
+  名字驱动行为（含直接压并发入口与直接喂过期快照）。结构调整若顺带改契约，一次
+  「让文件变小」的改动就会变成一次全仓改动。
+</div>
+
 <h4><code>RunService</code> 公开方法</h4>
 <table>
   <thead><tr><th>方法</th><th>职责</th></tr></thead>
   <tbody>
     <tr><td><code>stream()</code></td><td>发起一轮对话。<strong>普通协程而非异步生成器</strong>：校验与模型初始化都在 <code>await</code> 时完成，错误能在响应开始之前被映射成正常状态码；在进入图之前登记会话（标题取自本次输入）</td></tr>
-    <tr><td><code>resume()</code></td><td>把审批载荷编成 <code>Command(resume=...)</code> 后恢复执行；只刷新活动时间，不重复计入轮次</td></tr>
+    <tr><td><code>resume()</code></td><td>把审批载荷编成 <code>Command(resume=...)</code> 后恢复执行；只刷新活动时间，不重复计入轮次。该会话的审批挂起已超期时抛 <code>InterruptExpiredError</code></td></tr>
+    <tr><td><code>stop()</code></td><td>请求停止当前运行：同步置位取消信号、终止该会话在跑的命令进程树，然后立即返回（<strong>不等待</strong>运行真正结束）。幂等——未在运行时返回 <code>stopped=false</code>，重复请求返回 <code>already_stopping</code></td></tr>
+    <tr><td><code>regenerate()</code></td><td>从「最后一条用户消息之前」的检查点分叉重跑；旧分支原样保留，切回去仍可对比</td></tr>
+    <tr><td><code>edit()</code></td><td>按下标改写一条用户消息并从该点分叉重跑；与 <code>regenerate()</code> 共用 <code>run_branch.py</code> 的分叉机制，权限 / 并发 / 分支登记 / 用量归属各只有一份实现</td></tr>
+    <tr><td><code>enforce_governance()</code></td><td>巡检一次运行治理（超时取消 + 审批挂起 TTL），返回 <code>GovernanceReport</code>；由装配层注册为后台协程，也允许手工触发一次</td></tr>
     <tr><td><code>release_run_slot()</code></td><td>归还运行槽位。生成器只在被消费时通过 <code>finally</code> 归还；调用方拿到迭代器后若因异常未能消费，需显式归还</td></tr>
   </tbody>
 </table>
@@ -689,9 +731,12 @@
 <div class="box warn">
   <span class="t">并发互斥</span>
   同一会话并发发起两轮会让图状态竞争：两轮各自读写同一 thread 的检查点，后写的一方会
-  覆盖先写一方的中间结果，表现为消息丢失或工具结果错配。因此 <code>RunService</code>
-  用「运行中会话集合」做互斥，命中时抛 <code>ThreadBusyError</code>（HTTP 409）
-  <strong>而非排队</strong>——一次运行可能持续数分钟，排队会让请求无限期挂起。
+  覆盖先写一方的中间结果，表现为消息丢失或工具结果错配。因此由
+  <code>RunRegistry</code>（<code>application/run_registry.py</code>）用「运行中会话集合」
+  做互斥，命中时抛 <code>ThreadBusyError</code>（HTTP 409）<strong>而非排队</strong>——
+  一次运行可能持续数分钟，排队会让请求无限期挂起。
+  运行登记表同时守护累计计数与审批挂起登记，三者共用一把 <code>threading.Lock</code>：
+  若各自加锁，指标采集会读到「槽位已满但拒绝数为 0」这类自相矛盾的组合。
 </div>
 
 <div class="box">
@@ -1456,6 +1501,13 @@ StreamingResponse(text/event-stream)
     <tr>
       <td>新增配置项</td>
       <td><code>config.py</code> 的 <code>AppConfig</code> 字段 + <code>.env.example</code> + README 配置表</td>
+    </tr>
+    <tr>
+      <td>调整运行槽位 / 并发上限 / 审批挂起 TTL</td>
+      <td><code>application/run_registry.py</code>（状态与准入判定）与
+      <code>application/run_governance.py</code>（阈值收口）——<strong>不要在
+      <code>run_service.py</code> 里另存一份状态或计数</strong>：那里的同名方法只是委托，
+      同名的状态字段一旦重建就会与登记表漂移，表现为指标与实际槽位不符</td>
     </tr>
     <tr>
       <td>新增 HTTP 端点</td>
