@@ -113,6 +113,95 @@ uv run python main.py web --host 0.0.0.0 --port 8080
 
 ---
 
+### 3. 容器化运行
+
+```bash
+docker compose up -d --build     # 首次构建并启动
+docker compose ps                # 等 STATUS 出现 (healthy)
+curl -s http://127.0.0.1:8000/ready
+```
+
+`/ready` 返回 **200** 表示数据库可访问且默认模型配置自洽（返回 503 时响应体里会写明
+哪一项没就绪）。`/health` 是不查任何依赖的存活探针，容器 `HEALTHCHECK` 打的是它——
+依赖抖动不该让编排系统反复重启容器。
+
+**它长什么样**：镜像用多阶段构建（依赖装完只拷结果），以 **uid 10001 的非 root 用户**
+运行，`Dockerfile` 里带 `HEALTHCHECK`。端口默认只绑 `127.0.0.1:8000`。
+
+#### 环境变量
+
+配置来源有两处，按优先级排列：
+
+| 来源 | 内容 | 怎么进来的 |
+| --- | --- | --- |
+| 宿主机 `.env` | `AUTH_SESSION_SECRET`、`AUTH_API_KEY_DEV` 等既有配置 | compose 的 `env_file: .env` |
+| 宿主机环境变量 | `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | compose 的 `${VAR:-}` 透传 |
+| compose `environment` | `HOST` / `PORT` / `AUTH_MODE` / `DB_PATH` / `WORKSPACE` / `MEMORY_FILE` | 覆盖上面两处的取值 |
+
+两类变量名与 `.env` 里完全一致（配置是扁平的，环境变量名就是字段名大写）。
+
+容器化默认 **`AUTH_MODE=apikey`**，不跟随本机开发用的 `disabled`——端口一旦映射到
+宿主机，网络边界比本机进程宽得多。因此 `AUTH_SESSION_SECRET` 必须已设置（≥32 字节，
+`auth_mode != disabled` 时必填），否则服务会拒绝启动。
+
+**执行档位按 `.env` 原样生效，compose 不覆盖它。** 本仓库 `.env` 里是
+`EXECUTION_MODE=disabled`，容器因此以该档位启动，`execute` 工具调用会直接返回错误
+（启动日志里有 `执行档位=disabled：execute 工具调用将返回错误`）；文件类工具不受影响。
+
+**当前不要改用 `local` 档位**：在本仓库钉住的 `deepagents 0.7.14` 下，`local`
+（提供命令执行的 backend）与工具级权限配置**互不兼容**，Agent 构建阶段就会失败：
+
+```
+NotImplementedError: FilesystemMiddleware does not yet support permissions with backends
+that provide command execution (SandboxBackendProtocol).
+```
+
+这不是容器特有的——在宿主机上以同样的档位运行 `main.py cli` 会得到同一处报错。
+上游要么支持该组合、要么我们放弃工具级权限，二选一之前 `local` 与 `sandbox`
+都用不了。这是独立于容器化的既有问题，已知限制见 `docs/planning`。
+
+WHY 编排不替使用者改这个值：镜像里有模型密钥、容器有网络出口，而允许执行命令意味着
+一次提示词注入就能在容器里跑命令。这类开关应按各自的威胁模型显式打开，不跟着编排文件默认开启。
+
+#### 卷
+
+| 卷 | 容器内路径 | 内容 |
+| --- | --- | --- |
+| `agent-data` | `/app/.data` | SQLite 数据库（会话、检查点、用量、审计）与审计归档 |
+| `agent-workspace` | `/app/workspace` | Agent 的工作区：产出文件与 `_tool_outputs/` 留存 |
+
+用命名卷而不是绑定挂载，是因为容器以 uid 10001 运行，绑定挂载的目录属主由宿主机决定
+（常见结果是「起得来但写不进去」）；命名卷首次挂载会继承镜像里该目录的属主。
+
+想在宿主机上直接翻看 Agent 产出的文件，把 compose 里的 `agent-workspace` 换成绑定挂载，
+并把宿主机目录交给同一位用户：
+
+```bash
+mkdir -p ./workspace && sudo chown -R 10001:10001 ./workspace
+```
+
+#### 容器内跑 CLI（apikey 模式）
+
+CLI 通过 `HARNESS_API_KEY` 取凭据。最省事的入口是 `.env` 里的 `AUTH_API_KEY_DEV`
+（单 key 快速通道，角色为 `admin`）；生产环境应把它留空，改用管理面板创建真实 Key：
+
+```bash
+docker compose exec -e HARNESS_API_KEY="$AUTH_API_KEY_DEV" agent python main.py cli
+```
+
+Web 接口在同一个容器里，无需另起进程。
+
+#### 一次性维护命令
+
+```bash
+# 给历史会话补归属（从单用户升级到多用户时执行一次）
+docker compose exec agent python scripts/migrate_thread_owners.py
+
+# 查看日志 / 停止
+docker compose logs -f agent
+docker compose down            # 保留卷；加 -v 会连数据一起删
+```
+
 ## 五、执行档位（安全相关）
 
 `EXECUTION_MODE` 决定 `execute`（shell 命令执行）工具是否可用，**默认是关闭的**：

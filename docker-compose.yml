@@ -1,0 +1,53 @@
+# 单机编排：一个服务、两个卷。用法与变量说明见 README「容器化运行」。
+#
+# WHY 默认 AUTH_MODE=apikey 而不是 disabled：容器会把端口映射到宿主机，网络边界比
+# 本机进程宽得多；disabled 下任何能连上该端口的人都能读写你的会话与工作区。
+# 本机开发仍可用 `uv run python main.py cli`，那条路不受这里影响。
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: myagentharness:local
+    restart: unless-stopped
+
+    # 只绑回环：默认不把 Agent 暴露到局域网。要让别的机器访问时改成 "8000:8000"，
+    # 并同时确认 AUTH_MODE 与 AUTH_SESSION_SECRET 都已按生产要求设置。
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    # 模型与认证配置来自宿主机的 .env（该文件已被 .gitignore 忽略，且被 .dockerignore
+    # 挡在构建上下文之外——它不会进镜像，只在运行时以环境变量形式注入）。
+    env_file:
+      - .env
+
+    environment:
+      # 容器内必须监听 0.0.0.0，否则端口映射连不上（127.0.0.1 只对容器自己可见）
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # 覆盖 .env 里的取值：容器化部署默认开启认证，不跟随本机开发配置
+      AUTH_MODE: apikey
+      DB_PATH: /app/.data/agent.db
+      WORKSPACE: /app/workspace
+      MEMORY_FILE: /app/workspace/AGENTS.md
+      # 模型密钥留在宿主环境变量里（本机 .env 未保存它），因此在这里显式透传。
+      # 缺省为空串：缺密钥时服务能启动、/ready 会如实报未就绪，而不是启动就崩。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+    volumes:
+      # WHY 用命名卷而不是绑定挂载宿主机目录：容器以 uid 10001 运行，绑定挂载的属主
+      # 由宿主机决定，最省事的结果往往是「跑起来但写不进去」。命名卷首次挂载会继承
+      # 镜像里该目录的属主（Dockerfile 已把 /app/.data 与 /app/workspace 交给 app），
+      # 因此开箱可用。要直接看容器产出的文件，见 README 里换成绑定挂载的写法。
+      - agent-data:/app/.data
+      - agent-workspace:/app/workspace
+
+    # 探活沿用镜像内的 HEALTHCHECK（打 /health）。此处不重复声明：
+    # 同一个判据写在两处，改一处忘一处时编排行为会与文档分叉。
+
+volumes:
+  agent-data:
+  agent-workspace:

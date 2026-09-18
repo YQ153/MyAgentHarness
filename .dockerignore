@@ -1,0 +1,43 @@
+# 构建上下文排除项。
+# WHY 重要：被排除的文件不只是「不必要」——没被排除的会**永久留在镜像层里**，
+# 而镜像层可被任何拿到镜像的人解开。密文文件尤其如此。
+
+# 密钥与本地配置：绝不进镜像层
+.env
+.env.*
+!.env.example
+
+# 本地环境与缓存
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# 运行时数据：数据库与审计归档由卷提供，镜像里带一份会让「首次启动是空库」这件事
+# 变得不确定（新卷是否继承镜像内容取决于目录是否为空）。
+.data/
+
+# 工具输出留存：体积不可控，且属于运行产物
+workspace/_tool_outputs/
+
+# 版本控制与 CI
+.git/
+.gitignore
+.github/
+.importlinter
+
+# 编辑器与系统垃圾
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+*~
