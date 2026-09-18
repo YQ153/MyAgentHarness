@@ -63,6 +63,8 @@
     threadId: null,
     running: false,
     assistantEl: null,
+    /** 助手气泡里的正文容器；用量标签与工具卡片是它的兄弟节点。 */
+    assistantBody: null,
     toolNodes: [],
     auth: { mode: 'disabled', principal: null },
     admin: { apikeys: [] },
@@ -569,7 +571,18 @@
 
       // 助手消息可能只有工具调用、没有正文，因此两者独立判断
       if (content.trim()) {
-        els.messages.appendChild(el('div', 'msg assistant', content));
+        const bubble = el('div', 'msg assistant');
+        const body = el('div', 'md-body');
+        // WHY 这里可以用 innerHTML：渲染器先整段转义、再只插入它自己白名单里的标签，
+        // 链接地址还过一道 scheme 白名单。它不可用时退回纯文本——绝不能把原始文本
+        // 直接塞进 innerHTML，那正是这次渲染要避开的 XSS 面。
+        if (window.Markdown) {
+          body.innerHTML = window.Markdown.render(content);
+        } else {
+          body.textContent = content;
+        }
+        bubble.appendChild(body);
+        els.messages.appendChild(bubble);
       }
       (message.tool_calls || []).forEach((call, index) => {
         appendToolCard({
@@ -726,9 +739,15 @@
       case 'token':
         if (!state.assistantEl) {
           state.assistantEl = el('div', 'msg assistant');
+          // 正文单独一个容器：用量小标签与工具卡片挂在气泡上、是它的兄弟节点，
+          // 收尾渲染正文时只覆盖这一个节点，才不会把它们一起抹掉。
+          state.assistantBody = el('div', 'md-body');
+          state.assistantEl.appendChild(state.assistantBody);
           els.messages.appendChild(state.assistantEl);
         }
-        state.assistantEl.textContent += data.text || '';
+        // WHY 流式期间保持纯文本：每个 token 重渲染一次，会把未闭合的 ``` 反复解析，
+        // 既慢又让人看到排版来回跳动；收尾时渲染一次，代价只付一遍。
+        state.assistantBody.textContent += data.text || '';
         scrollToBottom();
         break;
 
@@ -763,7 +782,15 @@
         break;
 
       case 'done':
+        // 收尾时把整段正文渲染成 Markdown。转义与链接白名单都在渲染器里，
+        // 因此这里可以安全地使用 innerHTML；渲染器缺席时保留纯文本。
+        if (state.assistantBody && window.Markdown) {
+          state.assistantBody.innerHTML = window.Markdown.render(
+            state.assistantBody.textContent
+          );
+        }
         state.assistantEl = null;
+        state.assistantBody = null;
         state.toolNodes = [];
         // 非正常收尾：流关闭但内容不完整，给出可见反馈而不是静默截断。
         // WHY 区分两种原因：用户自己按的停止他知道，而超时是系统替他终止的，
