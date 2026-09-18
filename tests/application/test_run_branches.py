@@ -14,16 +14,24 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
-from application.errors import NotFoundError, ThreadBusyError
+from application.errors import (
+    NotFoundError,
+    OwnershipError,
+    PermissionDeniedError,
+    ThreadBusyError,
+)
 from application.run_service import RunService
 from application.thread_service import ThreadService
+from application.usage_service import UsageService
 from tests.application.test_run_service import (
     FakeGraphFactory,
     _drain,
     _make_service,
+    _principal,
 )
+from tests.conftest import make_config
 
 
 class Snapshot:
@@ -43,11 +51,20 @@ class BranchingGraph:
     逻辑依赖这个顺序，替身若反过来，测试就会在替身上通过、在上游失败。
     """
 
-    def __init__(self, snapshots: list[Snapshot]) -> None:
+    def __init__(self, snapshots: list[Snapshot], chunks: list[Any] | None = None) -> None:
         if not snapshots:
             raise ValueError("至少需要一条快照")
         self._snapshots = snapshots
+        self._chunks = chunks or []
         self.astream_configs: list[dict[str, Any]] = []
+
+    def advance_head(self, checkpoint_id: str, messages: list[Any]) -> None:
+        """模拟一次运行把会话头推进到新检查点（真实 LangGraph 会写出新记录）。
+
+        WHY 替身需要这个能力：分叉之后会话头与旧分支的头不再相同，而这正是最容易
+        被当成恒等式的地方——替身若不推进头，就永远复现不出那类缺陷。
+        """
+        self._snapshots.insert(0, Snapshot(checkpoint_id, messages))
 
     async def aget_state(self, config: dict[str, Any]) -> Snapshot:
         wanted = (config.get("configurable") or {}).get("checkpoint_id")
@@ -72,8 +89,8 @@ class BranchingGraph:
         context: Any = None,
     ) -> AsyncIterator[Any]:
         self.astream_configs.append(config or {})
-        return
-        yield  # noqa: WPS328 不可达，仅为构造异步生成器
+        for chunk in self._chunks:
+            yield chunk
 
 
 def _turn(
@@ -116,6 +133,31 @@ def _thread_service(config: Any, store: Any, graph: Any) -> ThreadService:
         checkpointer=object(),
         thread_store=store,
         graph_factory=FakeGraphFactory(graph),
+    )
+
+
+def _usage_service(config: Any, store: Any, graph: Any, usage_store: Any) -> RunService:
+    """带用量存储的 RunService；`_make_service` 不接用量存储，故单独构造。"""
+    return RunService(
+        config,
+        thread_store=store,
+        graph_factory=FakeGraphFactory(graph),
+        usage_store=usage_store,
+    )
+
+
+def _chunk(text: str = "", **usage: Any) -> tuple[str, Any]:
+    """构造带用量字段的消息分片（与 ``test_run_usage`` 同形）。"""
+    message = AIMessageChunk(content=text)
+    if usage:
+        message.usage_metadata = usage
+    return ("messages", (message, {"langgraph_node": "model"}))
+
+
+def _auth_config(tmp_path: Any) -> Any:
+    """开启认证的配置；会话密钥是构造前置条件，不补会让用例集体失败。"""
+    return make_config(
+        tmp_path, auth_mode="apikey", auth_session_secret="测试用会话密钥" * 8
     )
 
 
@@ -175,10 +217,17 @@ async def test_fork_point_skips_history_from_other_branches(test_config, thread_
 # ------------------------------------------------------------------ 分支记账
 
 
-async def test_regenerate_freezes_old_branch_and_activates_new(test_config, thread_store):
+async def test_regenerate_records_both_branch_heads(test_config, thread_store):
+    """分叉后两条分支各自都记下了自己的头。
+
+    WHY 先跑一轮再分叉：真实会话里的每个检查点都来自一次运行，而「记下自己的头」正是
+    在运行收尾时发生的。跳过这一步的替身会造出一个现实中不存在的状态——有检查点、
+    却没有任何分支记录，于是断言会红在一个与产品无关的地方。
+    """
     graph = BranchingGraph(_chain(2))
     service = _async_service(test_config, thread_store, graph)
     await thread_store.create("t1", title="会话")
+    await _drain(await service.stream("t1", "第一个问题"))
 
     await _drain(await service.regenerate("t1"))
 
@@ -187,11 +236,12 @@ async def test_regenerate_freezes_old_branch_and_activates_new(test_config, thre
     branches = {row["branch_id"]: row for row in await thread_store.list_branches("t1")}
 
     assert current != ""
-    # 旧分支（根）的头被冻结在离开时的位置——否则它下次被切回来会接错地方
+    # 旧分支（根）的位置由它自己上一轮运行收尾时记下——切回来才有地方可回
     assert branches[""]["head_checkpoint"] == "cp-2"
     assert branches[current]["parent_branch_id"] == ""
     assert branches[current]["origin"] == "regenerate"
-    assert branches[current]["head_checkpoint"] == ""
+    # 新分支跑完这一轮后同样记下自己的头
+    assert branches[current]["head_checkpoint"] == "cp-2"
 
 
 async def test_edit_labels_the_branch_with_the_turn_number(test_config, thread_store):
@@ -207,20 +257,30 @@ async def test_edit_labels_the_branch_with_the_turn_number(test_config, thread_s
     assert branches[current]["label"] == "编辑第 2 轮"
 
 
-async def test_activate_branch_freezes_the_branch_being_left(test_config, thread_store):
+async def test_switching_back_reads_the_old_branch_not_the_newest(test_config, thread_store):
+    """切回旧分支后必须读到**它自己**的内容。
+
+    复现的是一条真实路径：会话头永远指向最新那条分支，只有当前分支恰好是它时两者
+    才相等。切回旧分支后若按会话头去读，旧分支会被显示成新分支的内容——界面上只
+    表现为「切了没反应」，没有任何报错。
+    """
     graph = BranchingGraph(_chain(2))
     runs = _async_service(test_config, thread_store, graph)
     threads = _thread_service(test_config, thread_store, graph)
     await thread_store.create("t1", title="会话")
-
     await _drain(await runs.regenerate("t1"))
-    left = (await thread_store.get("t1"))["current_branch"]
 
-    result = await threads.activate_branch("t1", "")
+    # 模拟这次运行写出新检查点：会话头被推进到新分支上，与根分支的头不再相同
+    graph.advance_head(
+        "cp-run",
+        _turn(1) + _turn(2) + [HumanMessage(content="新问", id="nh")],
+    )
 
-    assert result.current_branch == ""
-    branches = {row["branch_id"]: row for row in await thread_store.list_branches("t1")}
-    assert branches[left]["head_checkpoint"] == "cp-2"
+    await threads.activate_branch("t1", "")
+
+    messages = await threads.history("t1", branch_id="")
+
+    assert len(messages) == 4  # 根分支自己的 4 条，而不是新分支的 5 条
 
 
 async def test_branch_list_includes_root_before_any_fork(test_config, thread_store):
@@ -301,3 +361,56 @@ async def test_history_rejects_unknown_branch(test_config, thread_store):
 
     with pytest.raises(NotFoundError):
         await threads.history("t1", branch_id="不存在的分支")
+
+
+# ------------------------------------------------------------------ 用量归属
+
+
+async def test_regenerate_keeps_the_previous_attempt_usage(
+    test_config, thread_store, usage_store
+):
+    """重生成不得抹掉上一次尝试的成本。
+
+    WHY 断言「总量含两次」而不是「新建一条分支维度的记录」：用量本来就按会话记
+    （T10 的口径是「删除会话保留用量」），重生成不删任何既有记录，成本自然不消失。
+    若哪天有人图省事在重生成时清一遍旧记录，这条用例会红。
+
+    WHY 用关闭认证的配置：这里要断言的是记账，不是鉴权——开着认证就必须再造一个
+    主体，那会让失败指向「谁在调用」而不是「记了多少」。
+    """
+    graph = BranchingGraph(
+        _chain(2), chunks=[_chunk("答", input_tokens=100, output_tokens=10)]
+    )
+    service = _usage_service(test_config, thread_store, graph, usage_store)
+    await thread_store.create("t1", title="会话")
+
+    await _drain(await service.stream("t1", "第一个问题"))
+    await _drain(await service.regenerate("t1"))
+
+    summary = await UsageService(
+        test_config, usage_store=usage_store, thread_store=thread_store
+    ).summarize(thread_id="t1")
+
+    assert summary.run_count == 2
+    assert summary.total_tokens == 220  # (100 + 10) × 2 次尝试
+
+
+# ------------------------------------------------------------------ 权限与归属
+
+
+async def test_edit_requires_thread_create_permission(tmp_path, thread_store):
+    """只读角色（viewer）不得改写他人会话的消息。"""
+    service = _make_service(_auth_config(tmp_path), thread_store, BranchingGraph(_chain(2)))
+    await thread_store.create("t1", title="会话", owner_id="alice")
+
+    with pytest.raises(PermissionDeniedError):
+        await service.edit("t1", 0, "不该成功", principal=_principal("alice", "viewer"))
+
+
+async def test_edit_requires_ownership(tmp_path, thread_store):
+    """有权限但不是会话所有者，同样不得改写。"""
+    service = _make_service(_auth_config(tmp_path), thread_store, BranchingGraph(_chain(2)))
+    await thread_store.create("t1", title="会话", owner_id="alice")
+
+    with pytest.raises(OwnershipError):
+        await service.edit("t1", 0, "不该成功", principal=_principal("bob"))

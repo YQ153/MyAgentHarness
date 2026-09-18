@@ -894,3 +894,42 @@ button.small {
   cursor: default;
   color: var(--muted);
 }
+
+.msg-action {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.msg-action:hover {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.branch-bar,
+.regenerate-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.branch-label {
+  flex: none;
+}
+
+.branch-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.branch-chip.current {
+  border-color: var(--accent);
+  color: var(--accent);
+}

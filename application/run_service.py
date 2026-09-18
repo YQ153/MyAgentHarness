@@ -644,11 +644,11 @@ class RunService:
             graph, thread_id, messages, target_index
         )
 
+        # WHY 不无条件冻结旧分支的头：此刻会话的头属于**最新**那条分支，未必是正要
+        # 离开的这一条——拿它去覆盖一份准确记录会把另一条分支的位置写进这一条。
+        # 只在旧分支「从未被离开过」时补记（见 ``_freeze_unrecorded`` 的说明）。
         current = await self._thread_store.current_branch(thread_id)
-        # WHY 冻结必须在登记新分支之前：反过来一旦中途失败，旧分支的头就再也回不来，
-        # 而新分支已经把自己设成当前——分支清单从此无法还原成操作前的样子。
-        live_head = await self._live_head(graph, thread_id)
-        await self._thread_store.set_branch_head(thread_id, current, live_head)
+        await self._freeze_unrecorded(graph, thread_id, current)
 
         branch_id = uuid.uuid4().hex
         await self._thread_store.upsert_branch(
@@ -723,37 +723,82 @@ class RunService:
         return list(getattr(state, "values", {}).get("messages") or [])
 
     async def _branch_head(self, graph: Any, thread_id: str, branch: str) -> str | None:
-        """返回某分支的头部检查点 id；``None`` 表示「跟随会话当前的头」。
+        """返回某分支的头部检查点 id；``None`` 表示回落到会话当前的头。
 
-        WHY 当前分支不查表：它的头随每次运行前移，存下来的值必然过期。表里存的是
-        「离开该分支时冻结的那个头」——那才是切回来时要用的东西。
+        WHY 以分支记录里的头为准，而不是「当前分支就跟随会话的头」：这两个值只在
+        「当前分支恰好是最新那条」时相等——而那正是最容易被当成恒等式的地方。用户一旦
+        切回旧分支，会话头仍指向最新那条，按会话头去读会把旧分支显示成新分支的内容，
+        而且界面上看不出错，只表现为「切了没反应」。
 
         Raises:
-            NotFoundError: 该分支既不是当前分支、也没登记过。
+            NotFoundError: 该分支既不是当前分支、也没有记录在案。
         """
-        current = await self._thread_store.current_branch(thread_id)
-        if branch == current:
-            return None
-
         record = await self._thread_store.get_branch(thread_id, branch)
         head = (record or {}).get("head_checkpoint") or ""
-        if not head:
-            raise NotFoundError("分支", branch)
-        return head
+        if head:
+            return head
+
+        current = await self._thread_store.current_branch(thread_id)
+        if branch == current:
+            # 尚无记录（例如刚分叉出来、还没跑过的新分支）：此刻会话的头就是它的头
+            return None
+
+        raise NotFoundError("分支", branch)
 
     async def _live_head(self, graph: Any, thread_id: str) -> str:
-        """读会话当前的头部检查点 id。
-
-        Raises:
-            ValueError: 会话还没有任何检查点（空会话无从分叉）。
-        """
+        """读会话当前的头部检查点 id；空会话返回空串。"""
         state = await graph.aget_state(build_runnable_config(self._config, thread_id))
-        checkpoint = (
-            (getattr(state, "config", None) or {}).get("configurable", {}).get("checkpoint_id", "")
+        return (
+            (getattr(state, "config", None) or {})
+            .get("configurable", {})
+            .get("checkpoint_id", "")
+            or ""
         )
-        if not checkpoint:
-            raise ValueError("该会话还没有可用的检查点，无法分叉")
-        return checkpoint
+
+    async def _freeze_unrecorded(self, graph: Any, thread_id: str, branch: str) -> None:
+        """给「从未被离开过、因而没有头记录」的分支补记一次头。
+
+        WHY 只在没有记录时补：一旦分支被离开过，它的头就已经由运行收尾或上一次补记
+        准确落库了。此后会话头未必还属于它（可能属于更新的那条分支），用会话头去覆盖
+        一份准确记录是错的。
+
+        WHY「没有记录」时补记是可靠的：没有记录意味着这条分支从未被离开过，也就没有
+        别的分支在它之后运行过——此刻的会话头正是它自己的头。归纳一下即可确认：任何
+        一条分支一旦被离开就会被记上一次，于是「无记录」只可能是第一次离开。
+        """
+        if not branch and branch != "":
+            return
+        existing = await self._thread_store.get_branch(thread_id, branch)
+        if (existing or {}).get("head_checkpoint"):
+            return
+
+        head = await self._live_head(graph, thread_id)
+        if head:
+            await self._thread_store.set_branch_head(thread_id, branch, head)
+
+    async def _refresh_branch_head(self, graph: Any, handle: RunHandle) -> None:
+        """把当前分支的头记成这一轮运行之后的头。
+
+        WHY 必须持久化：上游的头是**会话级**的，永远指向最新那条分支；「我这条分支停在
+        哪」则是分支级的。不记下来的话，切走再切回就找不回自己的位置。
+
+        WHY 失败不上抛：记账失败不该把一次已经成功的对话变成错误；下一次运行会重试。
+        """
+        try:
+            state = await graph.aget_state(
+                build_runnable_config(self._config, handle.thread_id)
+            )
+            checkpoint = (
+                (getattr(state, "config", None) or {})
+                .get("configurable", {})
+                .get("checkpoint_id", "")
+            )
+            if not checkpoint:
+                return
+            branch = await self._thread_store.current_branch(handle.thread_id)
+            await self._thread_store.set_branch_head(handle.thread_id, branch, checkpoint)
+        except Exception:
+            logger.exception("刷新分支头失败：thread=%s", handle.thread_id)
 
     async def _find_fork_checkpoint(
         self,
@@ -1109,6 +1154,11 @@ class RunService:
         # WHY 在 done 之前刷新活动时间：调用方一旦停止消费，生成器剩余代码就
         # 不再执行，放在 done 之后会出现「对话已结束但列表时间没更新」的窗口。
         await self._touch(thread_id)
+
+        # WHY 与活动时间同一个位置：两者都是「本轮已收尾」的动作，放在同一处才不会
+        # 出现「时间刷新了、分支头没记」的半截状态。会话头只在当前分支恰好是最新那条
+        # 时才等于分支头，切过分支之后就不再相等——不记下来，切回去会读到别人的内容。
+        await self._refresh_branch_head(graph, handle)
 
         # WHY 出错后仍以 DONE 收尾而不直接结束：前端依赖 DONE 复位「正在输出的
         # 那条消息」，只有 ERROR 而没有 DONE 时，下一轮回复的文本会被追加到上

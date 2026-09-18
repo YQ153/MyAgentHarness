@@ -355,9 +355,14 @@ class ThreadService:
 
         current = await self._thread_store.current_branch(normalized)
         if current != branch_id:
-            head = await self._live_head(normalized)
-            if head:
-                await self._thread_store.set_branch_head(normalized, current, head)
+            # WHY 不无条件冻结原分支：此刻会话头属于**最新**那条分支，未必是正要离开
+            # 的这一条。只在它「从未被离开过」时补记一次——那种情况下会话头正是它自己
+            # 的头（详见 ``RunService._freeze_unrecorded`` 的归纳）。
+            existing = await self._thread_store.get_branch(normalized, current)
+            if not (existing or {}).get("head_checkpoint"):
+                head = await self._live_head(normalized)
+                if head:
+                    await self._thread_store.set_branch_head(normalized, current, head)
             await self._thread_store.set_current_branch(normalized, branch_id)
             await self._audit(
                 event_type="thread_branch",
@@ -379,21 +384,25 @@ class ThreadService:
     async def _resolve_branch(self, thread_id: str, branch_id: str | None) -> str | None:
         """把分支标识解析成要读的检查点 id。
 
+        WHY 以分支记录里的头为准：会话头永远指向最新那条分支，只有当前分支恰好是它时
+        两者才相等。切回旧分支后若按会话头去读，旧分支会被显示成新分支的内容。
+
         Returns:
-            检查点 id；``None`` 表示「跟随会话当前的头」（当前分支的情形）。
+            检查点 id；``None`` 表示回落到会话当前的头（尚无记录的分支）。
 
         Raises:
-            NotFoundError: 指定分支既不是当前分支、也没登记过（或没有冻结的头）。
+            NotFoundError: 指定分支既不是当前分支、也没有记录在案。
         """
+        record = await self._thread_store.get_branch(thread_id, branch_id or "")
+        head = (record or {}).get("head_checkpoint") or ""
+        if head:
+            return head
+
         current = await self._thread_store.current_branch(thread_id)
         if branch_id is None or branch_id == current:
             return None
 
-        record = await self._thread_store.get_branch(thread_id, branch_id)
-        head = (record or {}).get("head_checkpoint") or ""
-        if not head:
-            raise NotFoundError("分支", branch_id)
-        return head
+        raise NotFoundError("分支", branch_id)
 
     async def _live_head(self, thread_id: str) -> str:
         """读会话当前的头检查点 id；空会话或读取失败时返回空串。

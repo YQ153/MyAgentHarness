@@ -76,6 +76,10 @@
      * 不该存在于客户端状态里——否则「树」与「服务端实际情况」就有两份真相。
      */
     workspace: { dirs: {}, expanded: {}, selected: null, text: null },
+    /** 编辑态：待改写的用户消息下标；null 表示正常发送新消息。 */
+    editTarget: null,
+    /** 正在查看的分支标识；null 表示会话的当前分支。 */
+    branch: null,
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -397,16 +401,29 @@
     state.threadId = threadId;
     state.assistantEl = null;
     state.toolNodes = [];
+    state.editTarget = null;
     els.messages.innerHTML = '';
     markActiveThread();
 
     try {
-      const response = await api(`/api/threads/${encodeURIComponent(threadId)}`);
+      const response = await api(historyUrl(threadId));
       const messages = await response.json();
       renderHistory(messages);
+      await renderConversationControls();
     } catch (err) {
       appendError('加载会话历史失败：' + err.message);
     }
+  }
+
+  /**
+   * 历史地址：带上正在查看的分支。
+   *
+   * WHY 分支走查询参数而不是路径段：根分支的标识是空串，路径上无法表达空值。
+   */
+  function historyUrl(threadId) {
+    const base = `/api/threads/${encodeURIComponent(threadId)}`;
+    if (!state.branch) return base;
+    return `${base}?branch=${encodeURIComponent(state.branch)}`;
   }
 
   /* ------------------------------------------------------------------ 渲染 */
@@ -490,7 +507,12 @@
       const content = typeof message.content === 'string' ? message.content : '';
 
       if (role === 'human') {
-        els.messages.appendChild(el('div', 'msg user', content));
+        const bubble = el('div', 'msg user', content);
+        // WHY 用渲染下标当 message_index：历史按后端同一顺序渲染，两边不必再对一次 id
+        const edit = el('span', 'msg-action', '编辑');
+        edit.addEventListener('click', () => beginEdit(order, content));
+        bubble.appendChild(edit);
+        els.messages.appendChild(bubble);
         return;
       }
 
@@ -787,16 +809,134 @@
       els.input.style.height = 'auto';
       scrollToBottom();
 
-      const response = await api(`/api/threads/${state.threadId}/runs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: content, model: els.modelSelect.value || null }),
-      });
+      const editing = state.editTarget;
+      const response = await api(
+        editing === null
+          ? `/api/threads/${state.threadId}/runs`
+          : `/api/threads/${state.threadId}/edit`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            editing === null
+              ? { content: content, model: els.modelSelect.value || null }
+              : {
+                  message_index: editing,
+                  content: content,
+                  model: els.modelSelect.value || null,
+                }
+          ),
+        }
+      );
       await handleStream(response);
+      // WHY 分叉后重载而不是就地拼接：编辑与重新生成会切到一条**新的**分支，
+      // 就地拼出来的画面仍是旧分支的历史加上新回复，看着像接错了上下文。
+      if (editing !== null) {
+        await loadThread(state.threadId);
+      }
     } catch (err) {
       appendError(err.message);
     } finally {
       setRunning(false);
+      await renderConversationControls();
+    }
+  }
+
+  /** 进入编辑态：把原文本灌进输入框，发送时改为走 /edit 从该点分叉。 */
+  function beginEdit(index, content) {
+    state.editTarget = index;
+    els.input.value = content;
+    els.input.focus();
+    renderConversationControls();
+  }
+
+  /** 重新生成最后一轮助手回复；与发送共用同一套流式处理。 */
+  async function regenerate() {
+    if (state.running || !state.threadId) return;
+    setRunning(true);
+    try {
+      const response = await api(`/api/threads/${state.threadId}/regenerate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: els.modelSelect.value || null }),
+      });
+      await handleStream(response);
+      await loadThread(state.threadId);
+    } catch (err) {
+      appendError('重新生成失败：' + err.message);
+    } finally {
+      setRunning(false);
+      await renderConversationControls();
+    }
+  }
+
+  /**
+   * 渲染分支栏与「重新生成」入口。
+   *
+   * WHY 每轮流结束都重画：分叉会改变当前分支，而这两个控件的内容都取决于它；
+   * 少画一次界面就会停在操作前的分支上，用户会以为没生效。
+   */
+  async function renderConversationControls() {
+    els.messages
+      .querySelectorAll('.branch-bar, .regenerate-bar')
+      .forEach((node) => node.remove());
+    if (!state.threadId) return;
+
+    let branches = null;
+    try {
+      const response = await api(`/api/threads/${state.threadId}/branches`);
+      branches = await response.json();
+    } catch (err) {
+      // 分支栏是辅助信息：拉不到就不显示，不该打断正在进行的对话
+      branches = null;
+    }
+
+    if (branches && (branches.items || []).length > 1) {
+      const bar = el('div', 'branch-bar');
+      bar.appendChild(el('span', 'branch-label', '分支：'));
+      branches.items.forEach((item) => {
+        const chip = el(
+          'span',
+          item.current ? 'branch-chip current' : 'branch-chip',
+          item.label || '原始分支'
+        );
+        chip.addEventListener('click', () => activateBranch(item.branch_id));
+        bar.appendChild(chip);
+      });
+      els.messages.insertBefore(bar, els.messages.firstChild);
+    }
+
+    const bar = el('div', 'regenerate-bar');
+    const action = el(
+      'span',
+      'msg-action',
+      state.editTarget === null ? '重新生成' : '取消编辑'
+    );
+    action.addEventListener('click', () => {
+      if (state.editTarget === null) {
+        regenerate();
+        return;
+      }
+      state.editTarget = null;
+      els.input.value = '';
+      renderConversationControls();
+    });
+    bar.appendChild(action);
+    els.messages.appendChild(bar);
+  }
+
+  /** 切换到指定分支并重载对话。 */
+  async function activateBranch(branchId) {
+    if (state.running) return;
+    try {
+      await api(
+        `/api/threads/${state.threadId}/branches/activate?branch_id=${encodeURIComponent(branchId)}`,
+        { method: 'POST' }
+      );
+      state.branch = branchId || null;
+      await loadThread(state.threadId);
+    } catch (err) {
+      appendError('切换分支失败：' + err.message);
     }
   }
 
