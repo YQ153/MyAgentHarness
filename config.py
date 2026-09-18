@@ -710,6 +710,14 @@ class AppConfig(BaseSettings):
     run_rejected_retry_after_seconds: int = Field(default=5, ge=1)
     """被限流或超出并发上限时回给客户端的 Retry-After 秒数。"""
 
+    # 日志形态
+    log_format: Literal["json", "text"] = "text"
+    """日志输出格式；``text`` 供本机阅读，``json`` 供采集系统解析。
+
+    WHY 默认 ``text``：本机开发时肉眼读日志是最主要的用法，默认切成 JSON 会让
+    每一次本地排障都先过一道格式转换。结构化是「上线时需要」的能力，不是默认形态。
+    """
+
     # OIDC 模式
     oidc_issuer: str = ""
     """IdP 的 issuer URL，例如 https://auth.example.com/application/o/myagentharness/。"""

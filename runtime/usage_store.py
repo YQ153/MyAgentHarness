@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
     model             TEXT NOT NULL DEFAULT '',
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
+    trace_id          TEXT,
     created_at        TEXT NOT NULL
 );
 
@@ -85,6 +86,10 @@ CREATE INDEX IF NOT EXISTS idx_usage_log_owner_time
 
 CREATE INDEX IF NOT EXISTS idx_usage_log_thread_time
     ON usage_log (thread_id, created_at DESC);
+
+-- 按链路把一次请求的成本与它的审计记录对上：同一个 trace_id 两边都能查
+CREATE INDEX IF NOT EXISTS idx_usage_log_trace
+    ON usage_log (trace_id, created_at DESC);
 """
 
 
@@ -116,6 +121,7 @@ class UsageStore:
         prompt_tokens: int,
         completion_tokens: int,
         owner_id: str = "",
+        trace_id: str | None = None,
         created_at: str | None = None,
     ) -> int:
         """写入一条用量记录。
@@ -126,6 +132,7 @@ class UsageStore:
             prompt_tokens: 输入 token 数。
             completion_tokens: 输出 token 数。
             owner_id: 会话所有者；认证关闭时为空串。
+            trace_id: 本次请求的链路标识；``None`` 表示未知（例如 CLI 形态）。
             created_at: 落库时间；``None`` 表示取当前 UTC 时间。
 
         Returns:
@@ -147,8 +154,9 @@ class UsageStore:
                 async with self._conn.execute(
                     """
                     INSERT INTO usage_log
-                        (thread_id, owner_id, model, prompt_tokens, completion_tokens, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (thread_id, owner_id, model, prompt_tokens, completion_tokens,
+                         trace_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_thread,
@@ -156,6 +164,7 @@ class UsageStore:
                         normalized_model,
                         prompt,
                         completion,
+                        trace_id,
                         timestamp,
                     ),
                 ) as cursor:
@@ -372,6 +381,12 @@ async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
+        try:
+            # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+            # 而升级前的库里已有用量数据。重复执行必然抛「列已存在」，忽略即可。
+            await conn.execute("ALTER TABLE usage_log ADD COLUMN trace_id TEXT;")
+        except Exception:
+            logger.debug("usage_log.trace_id 已存在，跳过迁移")
         await conn.commit()
         logger.info("用量记录表已就绪：%s", db_path)
         yield UsageStore(conn)

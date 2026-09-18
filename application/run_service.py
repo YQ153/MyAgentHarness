@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from agent.run_context import ANONYMOUS_USER_ID, AgentRunContext
-from application.audit_context import audit_client_info
+from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import GovernanceReport
 from application.errors import (
     REASON_CONCURRENCY,
@@ -429,6 +429,9 @@ class RunService:
                 outcome=outcome,
                 ip=ip,
                 user_agent=ua,
+                # WHY 与 IP/UA 同一处读取：三者都是「这次请求的来路」，分开读会让
+                # 后续新增的读取点只记得其中一个，表现为部分审计记录没有链路标识。
+                trace_id=audit_trace_id(),
                 details=details,
             )
         except Exception:
@@ -1792,6 +1795,10 @@ class RunService:
                 prompt_tokens=int(prompt),
                 completion_tokens=int(completion),
                 owner_id=handle.owner_id,
+                # WHY 用量也要链路标识：审计说「谁在什么时候干了什么」，用量说
+                # 「这次花了多少」——两者分开看都只是半张图，同一个 trace_id 才能
+                # 回答「这一次请求到底花了多少」。CLI 形态下为 None，表示未知。
+                trace_id=audit_trace_id(),
             )
         except Exception:
             logger.exception("用量记录失败：thread=%s", handle.thread_id)

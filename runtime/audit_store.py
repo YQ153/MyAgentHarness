@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     outcome       TEXT NOT NULL,
     ip            TEXT,
     user_agent    TEXT,
+    trace_id      TEXT,
     details       TEXT,
     created_at    TEXT NOT NULL
 );
@@ -70,6 +71,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_actor_time
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_event_time
     ON audit_log (event_type, created_at DESC);
+
+-- 按链路查「一次请求都做了什么」：没有这个索引就得全表扫 created_at
+CREATE INDEX IF NOT EXISTS idx_audit_log_trace
+    ON audit_log (trace_id, created_at DESC);
 """
 
 
@@ -93,12 +98,17 @@ class AuditStore:
         outcome: str,
         ip: str | None = None,
         user_agent: str | None = None,
+        trace_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
         """记录一条审计事件。
 
         WHY 独立方法而非直接 INSERT：所有审计字段统一落库，避免调用方漏写
         ``created_at``；同时 ``details`` 会自动 JSON 序列化。
+
+        WHY ``trace_id`` 由调用方传入而不是本方法自己去读上下文：``runtime`` 层
+        不得依赖 ``application``（分层契约 3），而上下文载体在应用层。IP/UA 走的是
+        同一条路径，这里保持一致，不为一列数据破一次分层。
         """
         if not event_type or not actor_id or not outcome:
             raise ValueError("event_type、actor_id、outcome 不能为空")
@@ -109,8 +119,9 @@ class AuditStore:
                 await self._conn.execute(
                     """
                     INSERT INTO audit_log
-                        (event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                         trace_id, details, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_type,
@@ -120,6 +131,7 @@ class AuditStore:
                         outcome,
                         ip,
                         user_agent,
+                        trace_id,
                         json.dumps(details, ensure_ascii=False, default=str) if details else None,
                         now,
                     ),
@@ -164,7 +176,8 @@ class AuditStore:
             raise ValueError("after_id 必须是不小于 0 的整数")
 
         sql = """
-            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at
+            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                   trace_id, details, created_at
             FROM audit_log
             WHERE created_at < ? AND id > ?
             ORDER BY id ASC
@@ -266,7 +279,8 @@ class AuditStore:
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         sql = f"""
-            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at
+            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                   trace_id, details, created_at
             FROM audit_log
             {where}
             ORDER BY created_at DESC, id DESC
@@ -295,6 +309,12 @@ async def open_audit_store(db_path: Path) -> AsyncIterator[AuditStore]:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
+        try:
+            # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+            # 而升级前的库里已经有审计数据。重复执行必然抛「列已存在」，忽略即可。
+            await conn.execute("ALTER TABLE audit_log ADD COLUMN trace_id TEXT;")
+        except Exception:
+            logger.debug("audit_log.trace_id 已存在，跳过迁移")
         await conn.commit()
         logger.info("审计日志表已就绪：%s", db_path)
         yield AuditStore(conn)
