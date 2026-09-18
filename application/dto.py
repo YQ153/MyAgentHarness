@@ -122,6 +122,31 @@ class HistoryMessage(BaseModel):
     )
 
 
+class BranchSummary(BaseModel):
+    """会话的一条分支。
+
+    WHY ``head_checkpoint`` 对当前分支为空串：当前分支的头随每次运行前移，存下来
+    必然过期；而它本来就是「会话当前的头」，读的时候现取即可。存下的是**离开**该分支
+    时冻结的那个头——那才是切回来时需要的东西。
+    """
+
+    branch_id: str = Field(description="分支标识，会话内唯一；空串表示根分支")
+    head_checkpoint: str = Field(description="离开该分支时冻结的检查点 id；当前分支为空串")
+    parent_branch_id: str = Field(description="从哪条分支分叉而来；根分支为空串")
+    origin: str = Field(description="分支来源：root / edit / regenerate")
+    label: str = Field(description="给界面看的简短说明，如「编辑第 2 轮」")
+    created_at: str = Field(description="创建时间（ISO8601 UTC）")
+    current: bool = Field(default=False, description="是否为当前激活的分支")
+
+
+class BranchListResult(BaseModel):
+    """会话的分支清单。"""
+
+    thread_id: str = Field(description="会话标识")
+    current_branch: str = Field(description="当前分支标识；空串表示根分支")
+    items: list[BranchSummary] = Field(default_factory=list, description="按创建时间升序排列")
+
+
 class DeleteResult(BaseModel):
     """删除会话的结果。"""
 

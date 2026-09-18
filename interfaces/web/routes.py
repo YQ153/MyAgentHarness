@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from application.dto import (
+    BranchListResult,
     MemoryDeleteResult,
     MemoryListResult,
     ModelInfo,
@@ -42,7 +43,9 @@ from interfaces.web.deps import require_state
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
+    EditRequest,
     HistoryMessage,
+    RegenerateRequest,
     ResumeRequest,
     StopResponse,
     ThreadListResponse,
@@ -327,13 +330,17 @@ async def update_thread(
 @router.get("/threads/{thread_id}", response_model=list[HistoryMessage])
 async def get_history(
     thread_id: str,
+    branch: str | None = Query(default=None, description="要读取的分支；缺省为当前分支"),
     threads: ThreadService = Depends(get_threads),
     principal: Principal = Depends(require_permission("thread:read")),
 ) -> list[HistoryMessage]:
-    """读取会话历史，用于刷新页面后恢复上下文。"""
+    """读取会话历史，用于刷新页面后恢复上下文。
+
+    WHY 用查询参数而不是路径段指定分支：根分支的标识是空串，而路径上无法表达空值。
+    """
     normalized = _validate_thread_id(thread_id)
     try:
-        return await threads.history(normalized, principal)
+        return await threads.history(normalized, principal, branch_id=branch)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -508,6 +515,174 @@ async def resume_agent(
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+@router.post("/threads/{thread_id}/regenerate")
+async def regenerate_reply(
+    thread_id: str,
+    body: RegenerateRequest,
+    runs: RunService = Depends(get_runs),
+    principal: Principal = Depends(require_permission("thread:create")),
+) -> StreamingResponse:
+    """重新生成最后一轮助手回复，以 SSE 流式返回。
+
+    WHY 与编辑分成两个端点：两者的请求体本就不同（编辑必须给出下标与新文本），
+    合成一个就会引入「哪些字段在哪种模式下必填」的隐含约定，而那种约定只能靠文档维持。
+    """
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        events = await runs.regenerate(normalized, principal=principal, model_name=body.model)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except ThreadBusyError as exc:
+        # WHY 必须回 409 而不是让流里报错：分叉与运行共用同一份槽位登记，
+        # 运行中发起分叉会让两轮各自读写同一会话的检查点。这个判断发生在流开始
+        # 之前，所以调用方能得到一个正常的状态码。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("Agent 初始化失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent 初始化失败：{exc}",
+        ) from exc
+
+    return StreamingResponse(
+        _encode_stream(events),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@router.post("/threads/{thread_id}/edit")
+async def edit_message(
+    thread_id: str,
+    body: EditRequest,
+    runs: RunService = Depends(get_runs),
+    principal: Principal = Depends(require_permission("thread:create")),
+) -> StreamingResponse:
+    """改写指定轮次的用户消息并从该点分叉，以 SSE 流式返回。"""
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        events = await runs.edit(
+            normalized,
+            body.message_index,
+            body.content,
+            principal=principal,
+            model_name=body.model,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except ThreadBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("Agent 初始化失败：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent 初始化失败：{exc}",
+        ) from exc
+
+    return StreamingResponse(
+        _encode_stream(events),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@router.get("/threads/{thread_id}/branches", response_model=BranchListResult)
+async def list_branches(
+    thread_id: str,
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:read")),
+) -> BranchListResult:
+    """列出会话的全部分支。"""
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        return await threads.list_branches(normalized, principal)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+
+
+@router.post("/threads/{thread_id}/branches/activate", response_model=BranchListResult)
+async def activate_branch(
+    thread_id: str,
+    branch_id: str = Query(default="", description="要切换到的分支；空串表示根分支"),
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:read")),
+) -> BranchListResult:
+    """切换当前分支，返回切换后的分支清单。
+
+    WHY 用查询参数而不是路径段：根分支的标识是空串，路径上无法表达空值（
+    ``/branches//activate`` 会被规范化掉）。切换要能回到根分支，就必须允许空值。
+    """
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        return await threads.activate_branch(normalized, branch_id, principal)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
 
 
 @router.post("/threads/{thread_id}/stop", response_model=StopResponse)

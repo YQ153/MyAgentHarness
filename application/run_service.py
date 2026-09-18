@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 from collections.abc import AsyncIterator
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,64 @@ from runtime.usage_store import UsageStore
 from runtime.workspace_files import to_virtual_path
 from text_utils import build_title
 from thread_utils import normalize_thread_id
+
+
+def _role_of(message: Any) -> str:
+    """把一条图消息的角色归一成 user / assistant / tool / system。
+
+    WHY 不直接用 LangChain 的 ``type``：它以 ``human`` / ``ai`` 命名，而应用层与前端
+    一直用 ``user`` / ``assistant``。两套叫法在消息筛选处混用会静默漏判（例如把
+    ``human`` 当成未知角色），故在入口处一次性归一。
+    """
+    kind = getattr(message, "type", "") or ""
+    return {"human": "user", "ai": "assistant"}.get(kind, kind or "other")
+
+
+def _message_text(message: Any) -> str:
+    """取消息正文；正文是多段内容时拼接其中的文本段。"""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return str(content or "")
+
+
+def _last_user_index(messages: list[Any]) -> int | None:
+    """最后一条用户消息的下标；一条都没有时返回 ``None``。"""
+    for index in range(len(messages) - 1, -1, -1):
+        if _role_of(messages[index]) == "user":
+            return index
+    return None
+
+
+def _user_turn_number(messages: list[Any], index: int) -> int:
+    """下标 ``index`` 是第几条用户消息（1 基），用于给分支起一个人能看懂的名字。"""
+    return sum(1 for message in messages[: index + 1] if _role_of(message) == "user")
+
+
+def _same_message_chain(left: list[Any], right: list[Any]) -> bool:
+    """判断两段消息是否同一条历史链。
+
+    WHY 优先比 id 而不是正文：编辑过的消息正文不同，但这里要确认的是「这是同一段
+    历史」而不是「文字一样」——正文比较会把两条内容恰好相同的分支判成同一条。
+    id 缺失（手写 dict 输入的情形）时退回正文比较。
+    """
+    if len(left) != len(right):
+        return False
+    for one, other in zip(left, right):
+        left_id = getattr(one, "id", None)
+        right_id = getattr(other, "id", None)
+        if left_id and right_id:
+            if left_id != right_id:
+                return False
+            continue
+        if _message_text(one) != _message_text(other):
+            return False
+    return True
+
 
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
@@ -136,6 +195,8 @@ class RunHandle:
     """
     stop_reason: str | None = None
     """停止原因；``None`` 表示尚未收到停止请求，取值见模块级常量。"""
+    fork_checkpoint: str = ""
+    """本次运行的分叉起点检查点 id；空串表示接着当前分支的头跑。"""
 
     @property
     def stop_requested(self) -> bool:
@@ -459,6 +520,266 @@ class RunService:
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
         return self._consume(graph, payload, handle)
+
+    # ------------------------------------------------------------ 编辑与分叉
+
+    async def regenerate(
+        self,
+        thread_id: str,
+        *,
+        principal: Principal | None = None,
+        model_name: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """重新生成最后一轮助手回复。
+
+        WHY 与编辑共用同一条机制：两者都是「从某个历史检查点分叉，再用一段文本跑一次」，
+        差别只在分叉点与新文本从哪来。分成两套实现会让权限、并发、分支登记、用量归属
+        各写一遍，而它们迟早分叉；合成一条路径则这些语义只存在一处。
+
+        WHY 是分叉而不是原地重跑：旧回复所在的路径原样保留，用户不满意时还能切回去
+        比对；这也让「成本不因重新生成而消失」自然成立——旧分支的用量记录一条都没删。
+
+        Returns:
+            产出统一事件的异步迭代器。
+
+        Raises:
+            ValueError: ``thread_id`` 非法，或该会话还没有可用的用户消息。
+            PermissionDeniedError: 缺少 thread:create 权限。
+            NotFoundError: 会话或分支不存在。
+            OwnershipError: 无权访问该会话。
+            ThreadBusyError: 该会话已有运行中的轮次。
+        """
+        normalized = normalize_thread_id(thread_id)
+        messages = await self._branch_messages(normalized, principal)
+
+        last_user = _last_user_index(messages)
+        if last_user is None:
+            raise ValueError("该会话还没有用户消息，无法重新生成")
+        text = _message_text(messages[last_user]).strip()
+        if not text:
+            raise ValueError("最后一条用户消息没有文本内容，无法重新生成")
+
+        return await self._fork_and_run(
+            normalized,
+            text,
+            messages=messages,
+            target_index=last_user,
+            origin="regenerate",
+            label="重新生成",
+            principal=principal,
+            model_name=model_name,
+        )
+
+    async def edit(
+        self,
+        thread_id: str,
+        message_index: int,
+        content: str,
+        *,
+        principal: Principal | None = None,
+        model_name: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """改写指定下标的用户消息，并从该点分叉重跑。
+
+        WHY 用下标而不是消息 id 定位：历史消息 DTO 一直不对外暴露 id，为编辑单独加一个
+        字段会让前端必须先从两处对上号；下标在「某条分支的消息列表」内是确定的，而编辑
+        本来就必须先看到那份列表。
+
+        Raises:
+            ValueError: ``thread_id`` 非法、下标越界、目标不是用户消息、或新文本为空。
+            PermissionDeniedError: 缺少 thread:create 权限。
+            NotFoundError: 会话或分支不存在。
+            OwnershipError: 无权访问该会话。
+            ThreadBusyError: 该会话已有运行中的轮次。
+        """
+        normalized = normalize_thread_id(thread_id)
+        if not isinstance(message_index, int) or isinstance(message_index, bool):
+            raise ValueError(f"message_index 必须是整数，实际：{type(message_index).__name__}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content 必须是非空字符串")
+        text = content.strip()
+
+        messages = await self._branch_messages(normalized, principal)
+        if message_index >= len(messages):
+            raise ValueError(f"message_index 越界（{message_index} >= {len(messages)}）")
+        if _role_of(messages[message_index]) != "user":
+            raise ValueError("只能编辑用户消息")
+
+        turn = _user_turn_number(messages, message_index)
+        return await self._fork_and_run(
+            normalized,
+            text,
+            messages=messages,
+            target_index=message_index,
+            origin="edit",
+            label=f"编辑第 {turn} 轮",
+            principal=principal,
+            model_name=model_name,
+        )
+
+    async def _fork_and_run(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        messages: list[Any],
+        target_index: int,
+        origin: str,
+        label: str,
+        principal: Principal | None,
+        model_name: str | None,
+    ) -> AsyncIterator[AgentEvent]:
+        """从「目标消息出现之前」的检查点分叉，并用 ``text`` 跑一轮。
+
+        Raises:
+            ValueError: 找不到分叉点（历史已被清理）。
+            ThreadBusyError: 该会话已有运行中的轮次。
+        """
+        # WHY 先取图再登记分支：解析模型别名与初始化模型可能失败，那属于「什么都没
+        # 发生」；若先写了分支再失败，分支清单里会多出一条没有任何内容的分支。
+        graph = self._graph_factory.get(model_name)
+        actor_id = principal.user_id if principal else "anonymous"
+
+        fork_checkpoint = await self._find_fork_checkpoint(
+            graph, thread_id, messages, target_index
+        )
+
+        current = await self._thread_store.current_branch(thread_id)
+        # WHY 冻结必须在登记新分支之前：反过来一旦中途失败，旧分支的头就再也回不来，
+        # 而新分支已经把自己设成当前——分支清单从此无法还原成操作前的样子。
+        live_head = await self._live_head(graph, thread_id)
+        await self._thread_store.set_branch_head(thread_id, current, live_head)
+
+        branch_id = uuid.uuid4().hex
+        await self._thread_store.upsert_branch(
+            thread_id,
+            branch_id,
+            parent_branch_id=current,
+            origin=origin,
+            label=label,
+        )
+        await self._thread_store.set_current_branch(thread_id, branch_id)
+
+        # WHY 与新一轮输入同样作废悬着的审批：用户既已改口，那张审批卡就不再代表
+        # 当前意图，留着只会让「待审批数」无限增长。
+        self.clear_hitl_pending(thread_id)
+        # WHY 只刷新活动时间而不加轮次：轮次记的是「用户发起了几轮」，编辑与重新生成
+        # 都没有新增一次用户发起；把它们算进去会让清单上的轮数凭空增长。
+        await self._thread_store.touch(thread_id)
+        await self._audit(
+            event_type="thread_branch",
+            actor_id=actor_id,
+            target_id=thread_id,
+            action=origin,
+            outcome="success",
+            details={
+                "branch_id": branch_id,
+                "parent_branch_id": current,
+                "label": label,
+                "message_index": target_index,
+            },
+        )
+
+        handle = self._acquire_run_slot(
+            thread_id,
+            model_name=model_name,
+            owner_id=self._owner_id(principal),
+            actor_id=actor_id,
+            fork_checkpoint=fork_checkpoint,
+        )
+
+        payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
+        return self._consume(graph, payload, handle)
+
+    async def _branch_messages(
+        self, thread_id: str, principal: Principal | None
+    ) -> list[Any]:
+        """读当前分支的消息列表，并顺带完成权限与会话校验。
+
+        WHY 读「当前分支」而不是会话最新状态：分叉之后两者不再是同一件事。用户在旧
+        分支上点重新生成，理应接着**那条**分支的上下文，而不是最新那条的。
+
+        Raises:
+            PermissionDeniedError: 缺少 thread:create 权限。
+            NotFoundError: 会话或分支不存在。
+            OwnershipError: 无权访问该会话。
+            RuntimeError: 读取失败。
+        """
+        self._ensure_permission(principal, "thread:create")
+        await self._ensure_ownership(thread_id, principal)
+
+        graph = self._graph_factory.get()
+        branch = await self._thread_store.current_branch(thread_id)
+        checkpoint = await self._branch_head(graph, thread_id, branch)
+
+        try:
+            state = await graph.aget_state(
+                build_runnable_config(self._config, thread_id, checkpoint)
+            )
+        except Exception as exc:
+            logger.exception("读取分支历史失败：thread=%s branch=%s", thread_id, branch)
+            raise RuntimeError(f"读取分支历史失败：thread={thread_id}") from exc
+
+        return list(getattr(state, "values", {}).get("messages") or [])
+
+    async def _branch_head(self, graph: Any, thread_id: str, branch: str) -> str | None:
+        """返回某分支的头部检查点 id；``None`` 表示「跟随会话当前的头」。
+
+        WHY 当前分支不查表：它的头随每次运行前移，存下来的值必然过期。表里存的是
+        「离开该分支时冻结的那个头」——那才是切回来时要用的东西。
+
+        Raises:
+            NotFoundError: 该分支既不是当前分支、也没登记过。
+        """
+        current = await self._thread_store.current_branch(thread_id)
+        if branch == current:
+            return None
+
+        record = await self._thread_store.get_branch(thread_id, branch)
+        head = (record or {}).get("head_checkpoint") or ""
+        if not head:
+            raise NotFoundError("分支", branch)
+        return head
+
+    async def _live_head(self, graph: Any, thread_id: str) -> str:
+        """读会话当前的头部检查点 id。
+
+        Raises:
+            ValueError: 会话还没有任何检查点（空会话无从分叉）。
+        """
+        state = await graph.aget_state(build_runnable_config(self._config, thread_id))
+        checkpoint = (
+            (getattr(state, "config", None) or {}).get("configurable", {}).get("checkpoint_id", "")
+        )
+        if not checkpoint:
+            raise ValueError("该会话还没有可用的检查点，无法分叉")
+        return checkpoint
+
+    async def _find_fork_checkpoint(
+        self,
+        graph: Any,
+        thread_id: str,
+        messages: list[Any],
+        target_index: int,
+    ) -> str:
+        """找出「第 ``target_index`` 条消息出现之前」那个检查点。
+
+        WHY 必须逐条比对消息链：``aget_state_history`` 给出的是**整个会话**的检查点，
+        其中还包含其它分支的；只按消息条数挑会挑到别的分支上——后果是分叉后的上下文
+        变成用户没写过的一段历史，而且没有任何报错，只能靠人眼发现。
+
+        Raises:
+            ValueError: 找不到匹配的历史（例如检查点已被清理）。
+        """
+        wanted = messages[:target_index]
+        config = build_runnable_config(self._config, thread_id)
+
+        async for snapshot in graph.aget_state_history(config):
+            values = list(getattr(snapshot, "values", {}).get("messages") or [])
+            if _same_message_chain(values, wanted):
+                return snapshot.config["configurable"]["checkpoint_id"]
+
+        raise ValueError("找不到该轮次对应的分叉点，历史可能已被清理")
 
     async def resume(
         self,
@@ -1013,7 +1334,9 @@ class RunService:
         """
         astream = graph.astream(
             payload,
-            config=build_runnable_config(self._config, handle.thread_id),
+            config=build_runnable_config(
+                self._config, handle.thread_id, handle.fork_checkpoint or None
+            ),
             stream_mode=_STREAM_MODES,
             # WHY 必须显式传 context：长期记忆的命名空间在图内按主体计算，
             # 缺了它记忆会落进匿名池——多用户部署下等于跨用户串味。
@@ -1060,6 +1383,7 @@ class RunService:
         model_name: str | None = None,
         owner_id: str = "",
         actor_id: str = "",
+        fork_checkpoint: str = "",
     ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
@@ -1092,6 +1416,7 @@ class RunService:
                 model_name=model_name,
                 owner_id=owner_id,
                 actor_id=actor_id,
+                fork_checkpoint=fork_checkpoint,
             )
             self._running[thread_id] = handle
             # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，

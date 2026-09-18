@@ -56,6 +56,22 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
 
 
+class RegenerateRequest(BaseModel):
+    """重新生成最后一轮助手回复。"""
+
+    model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
+
+
+class EditRequest(BaseModel):
+    """编辑指定轮次的用户消息并从该点分叉。"""
+
+    message_index: int = Field(
+        ge=0, description="目标消息在当前分支消息列表中的下标（0 基），必须指向用户消息"
+    )
+    content: str = Field(min_length=1, description="改写后的用户消息")
+    model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
+
+
 class ResumeRequest(BaseModel):
     """人工审批后恢复执行。"""
 

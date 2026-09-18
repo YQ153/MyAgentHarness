@@ -92,6 +92,22 @@ CREATE TABLE IF NOT EXISTS thread_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
+-- 分支表：一次分叉等于「把旧分支的头冻结下来 + 登记一个新分支」。
+-- WHY 有必要自己存：上游检查点的头指针会跟着最新的一次运行走（切换分支的代价为零，
+-- 但「有哪些分支」上游不给），也只认「按 id 取某个检查点」这一种读法。所以分支清单
+-- 只能由我们自己维护——主键取 (thread_id, branch_id)，分支 id 因此是会话内唯一的。
+CREATE TABLE IF NOT EXISTS thread_branches (
+    thread_id         TEXT NOT NULL,
+    branch_id         TEXT NOT NULL,
+    head_checkpoint   TEXT NOT NULL DEFAULT '',
+    parent_branch_id  TEXT NOT NULL DEFAULT '',
+    origin            TEXT NOT NULL DEFAULT '',
+    label             TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (thread_id, branch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_branches_thread
+    ON thread_branches (thread_id, created_at);
 """
 
 _MIGRATIONS = [
@@ -116,9 +132,17 @@ _MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_thread_meta_archived_updated
         ON thread_meta (archived, updated_at DESC, thread_id DESC);
     """,
+    # 当前分支游标：空串表示「根分支」。老库升级后为空串，与升级前「只有一条分支」
+    # 的可见性完全一致，不需要额外回填。
+    """
+    ALTER TABLE thread_meta ADD COLUMN current_branch TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
-_COLUMNS = "thread_id, owner_id, title, created_at, updated_at, turn_count, archived, archived_at"
+_COLUMNS = (
+    "thread_id, owner_id, title, created_at, updated_at, turn_count, "
+    "archived, archived_at, current_branch"
+)
 
 _LIKE_ESCAPE = "\\"
 """LIKE 通配符的转义字符。"""
@@ -704,6 +728,184 @@ class ThreadMetaStore:
             logger.warning("会话总数查询未返回结果行，按 0 处理")
             return 0
         return int(row[0])
+
+
+    async def set_branch_head(self, thread_id: str, branch_id: str, head_checkpoint: str) -> None:
+        """冻结某条分支的头检查点；分支不存在时顺带把根分支补登记。
+
+        WHY 只更新头而不整体 UPSERT：冻结发生在「即将离开这条分支」的时刻，这一动作
+        只应改头，不该把既有的 origin / label / parent 覆盖掉——那些字段描述的是这条
+        分支从哪来，与它此刻停在哪无关。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+            head_checkpoint: 冻结下来的检查点 id。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO thread_branches
+                        (thread_id, branch_id, head_checkpoint, parent_branch_id,
+                         origin, label, created_at)
+                    VALUES (?, ?, ?, '', 'root', '', ?)
+                    ON CONFLICT (thread_id, branch_id) DO UPDATE SET
+                        head_checkpoint = excluded.head_checkpoint
+                    """,
+                    (normalized_id, branch_id, head_checkpoint, _utc_now()),
+                )
+                await self._conn.commit()
+            except Exception:
+                logger.exception(
+                    "冻结分支头失败：thread=%s branch=%s", normalized_id, branch_id
+                )
+                raise
+
+    async def upsert_branch(
+        self,
+        thread_id: str,
+        branch_id: str,
+        *,
+        parent_branch_id: str = "",
+        origin: str = "",
+        label: str = "",
+    ) -> dict[str, Any]:
+        """登记（或更新）一条分支，头检查点留空表示「它就是当前分支」。
+
+        WHY 用 UPSERT 而不是「已存在就报错」：同一轮分叉在重试时会被重复登记，
+        幂等比把调用方逼去「先查再写」更好——后者中间正好是一个并发窗口。
+
+        WHY 覆盖写时不动 ``created_at``：它是这条分支「从哪一刻起存在」的凭据，
+        重试不该把它往后推，否则分支清单的排序会随重试次数漂移。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+            parent_branch_id: 从哪条分支分叉而来。
+            origin: 来源（root / edit / regenerate）。
+            label: 界面展示用的简短说明。
+
+        Returns:
+            写入后的分支记录；仅当会话行不存在时可能为 ``None``。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO thread_branches
+                        (thread_id, branch_id, head_checkpoint, parent_branch_id,
+                         origin, label, created_at)
+                    VALUES (?, ?, '', ?, ?, ?, ?)
+                    ON CONFLICT (thread_id, branch_id) DO UPDATE SET
+                        parent_branch_id = excluded.parent_branch_id,
+                        origin = excluded.origin,
+                        label = excluded.label
+                    """,
+                    (normalized_id, branch_id, parent_branch_id, origin, label, _utc_now()),
+                )
+                await self._conn.commit()
+            except Exception:
+                logger.exception(
+                    "登记分支失败：thread=%s branch=%s", normalized_id, branch_id
+                )
+                raise
+
+        record = await self.get_branch(normalized_id, branch_id)
+        if record is None:
+            logger.warning("登记分支后回读未命中：thread=%s branch=%s", normalized_id, branch_id)
+            return {}
+        return record
+
+    async def get_branch(self, thread_id: str, branch_id: str) -> dict[str, Any] | None:
+        """读取一条分支记录；不存在返回 ``None``。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            async with self._conn.execute(
+                """
+                SELECT branch_id, head_checkpoint, parent_branch_id, origin, label, created_at
+                FROM thread_branches WHERE thread_id = ? AND branch_id = ?
+                """,
+                (normalized_id, branch_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list_branches(self, thread_id: str) -> list[dict[str, Any]]:
+        """列出某会话的全部分支，按创建时间升序（根分支在前的稳定顺序）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            async with self._conn.execute(
+                """
+                SELECT branch_id, head_checkpoint, parent_branch_id, origin, label, created_at
+                FROM thread_branches WHERE thread_id = ?
+                ORDER BY created_at ASC, branch_id ASC
+                """,
+                (normalized_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def set_current_branch(self, thread_id: str, branch_id: str) -> bool:
+        """把某条分支设为当前分支。
+
+        WHY 当前分支必须落库而不是留在内存：它是「下一次运行接在哪条分支之后」的
+        唯一依据，只存在进程里会让重启后接错分支——表现出来是「用户切了分支，
+        回来一看回复接在了另一条上」。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+
+        Returns:
+            是否命中并更新了一行；``False`` 表示会话不存在。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET current_branch = ? WHERE thread_id = ?",
+                    (branch_id, normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("设置当前分支失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("设置当前分支未命中任何行：thread=%s", normalized_id)
+        return updated
+
+    async def current_branch(self, thread_id: str) -> str:
+        """读当前分支标识；空串表示根分支，会话不存在时同样返回空串。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        record = await self.get(thread_id)
+        return (record or {}).get("current_branch", "") or ""
 
 
 @asynccontextmanager

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 from application.audit_context import audit_client_info
 from application.dto import (
+    BranchListResult,
+    BranchSummary,
     DeleteOutcome,
     DeleteResult,
     HistoryMessage,
@@ -230,6 +232,8 @@ class ThreadService:
         self,
         thread_id: str,
         principal: Principal | None = None,
+        *,
+        branch_id: str | None = None,
     ) -> list[HistoryMessage]:
         """读取会话历史，供前端刷新页面后恢复上下文。
 
@@ -241,16 +245,21 @@ class ThreadService:
         都无法区分，故障也就不可观测。``aget_state`` 对不存在的会话返回的是空
         状态快照而不是异常，因此空列表仍然精确对应「无历史」。
 
+        WHY 支持指定分支：分叉之后「会话最新状态」与「用户正在看的那条分支」不再是
+        同一件事。整条分支切换路径之所以便宜，是因为它只是换个检查点 id 去读同一个
+        接口——上游本来就支持按 id 取任意历史点的状态。
+
         Args:
             thread_id: 会话 ID。
             principal: 当前主体；``None`` 仅在认证关闭时使用。
+            branch_id: 要读取的分支；``None`` 表示当前分支。
 
         Returns:
-            历史消息列表；会话不存在时为空列表。
+            该分支的历史消息列表；会话不存在时为空列表。
 
         Raises:
             ValueError: ``thread_id`` 非法。
-            NotFoundError: 会话元数据不存在。
+            NotFoundError: 会话元数据或指定分支不存在。
             OwnershipError: 无权访问该会话。
             RuntimeError: 读取失败。
         """
@@ -259,10 +268,11 @@ class ThreadService:
         self._ensure_ownership(record, normalized, principal)
 
         graph = self._graph_factory.get()
+        checkpoint = await self._resolve_branch(normalized, branch_id)
 
         try:
             state = await graph.aget_state(
-                build_runnable_config(self._config, normalized)
+                build_runnable_config(self._config, normalized, checkpoint)
             )
         except Exception as exc:
             logger.exception("读取会话历史失败：thread=%s", normalized)
@@ -273,6 +283,149 @@ class ThreadService:
 
         messages = getattr(state, "values", {}).get("messages") or []
         return [self._message_to_dto(message) for message in messages]
+
+    # ------------------------------------------------------------------ 分支
+
+    async def list_branches(
+        self,
+        thread_id: str,
+        principal: Principal | None = None,
+    ) -> BranchListResult:
+        """列出会话的全部分支，并标出当前分支。
+
+        WHY 把「当前分支」一并返回：界面要据此高亮，而它本来就是会话行上的一列——
+        让调用方逐个分支去问一次既慢又容易与切换结果不一致。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            NotFoundError: 会话元数据不存在。
+            OwnershipError: 无权访问该会话。
+        """
+        normalized = normalize_thread_id(thread_id)
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        current = await self._thread_store.current_branch(normalized)
+        rows = await self._thread_store.list_branches(normalized)
+        items = [self._branch_to_dto(row, current) for row in rows]
+
+        # WHY 补一条根分支：从未分叉过的会话在分支表里没有任何行，而「当前分支」此时
+        # 正是空串（根分支）——不补的话，界面上被标为当前的那条分支根本不在清单里。
+        if not any(item.branch_id == "" for item in items):
+            items.insert(
+                0,
+                BranchSummary(
+                    branch_id="",
+                    head_checkpoint="",
+                    parent_branch_id="",
+                    origin="root",
+                    label="原始分支",
+                    created_at=(record or {}).get("created_at", ""),
+                    current=current == "",
+                ),
+            )
+
+        return BranchListResult(thread_id=normalized, current_branch=current, items=items)
+
+    async def activate_branch(
+        self,
+        thread_id: str,
+        branch_id: str,
+        principal: Principal | None = None,
+    ) -> BranchListResult:
+        """把某条分支设为当前分支。
+
+        WHY 切换前必须冻结原来的当前分支：它的头随每次运行前移，一旦不再是当前分支就
+        没有任何地方能说明它停在哪——不冻结的话，它下次被切回来会接到会话最新状态上，
+        也就是接错分支。这正是「分叉之后必须自己记分支头」的直接后果。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            NotFoundError: 会话或指定分支不存在。
+            OwnershipError: 无权访问该会话。
+        """
+        normalized = normalize_thread_id(thread_id)
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        if branch_id != "":
+            target = await self._thread_store.get_branch(normalized, branch_id)
+            if target is None:
+                raise NotFoundError("分支", branch_id)
+
+        current = await self._thread_store.current_branch(normalized)
+        if current != branch_id:
+            head = await self._live_head(normalized)
+            if head:
+                await self._thread_store.set_branch_head(normalized, current, head)
+            await self._thread_store.set_current_branch(normalized, branch_id)
+            await self._audit(
+                event_type="thread_branch",
+                # WHY 与 RunService 同一口径：审计主体是「谁做的」，不是查询过滤值——
+                # effective_owner_id 在认证关闭时返回 None、未认证时返回占位常量，
+                # 拿它当主体会让审计里出现一个不是任何人的标识。
+                actor_id=principal.user_id if principal else "anonymous",
+                target_id=normalized,
+                action="activate",
+                outcome="success",
+                details={"branch_id": branch_id, "frozen_branch_id": current},
+            )
+            logger.info(
+                "会话切换分支：thread=%s from=%s to=%s", normalized, current, branch_id
+            )
+
+        return await self.list_branches(normalized, principal)
+
+    async def _resolve_branch(self, thread_id: str, branch_id: str | None) -> str | None:
+        """把分支标识解析成要读的检查点 id。
+
+        Returns:
+            检查点 id；``None`` 表示「跟随会话当前的头」（当前分支的情形）。
+
+        Raises:
+            NotFoundError: 指定分支既不是当前分支、也没登记过（或没有冻结的头）。
+        """
+        current = await self._thread_store.current_branch(thread_id)
+        if branch_id is None or branch_id == current:
+            return None
+
+        record = await self._thread_store.get_branch(thread_id, branch_id)
+        head = (record or {}).get("head_checkpoint") or ""
+        if not head:
+            raise NotFoundError("分支", branch_id)
+        return head
+
+    async def _live_head(self, thread_id: str) -> str:
+        """读会话当前的头检查点 id；空会话或读取失败时返回空串。
+
+        WHY 读取失败不回滚切换：切换本身只是改一列游标，代价可忽略；而因为读不到头
+        就拒绝用户的切换，会让「检查点侧临时出问题」变成「分支功能不可用」。
+        """
+        graph = self._graph_factory.get()
+        try:
+            state = await graph.aget_state(
+                build_runnable_config(self._config, thread_id)
+            )
+        except Exception:
+            logger.exception("读取会话头检查点失败：thread=%s", thread_id)
+            return ""
+
+        config = getattr(state, "config", None) or {}
+        return (config.get("configurable") or {}).get("checkpoint_id", "") or ""
+
+    @staticmethod
+    def _branch_to_dto(row: dict[str, Any], current: str) -> BranchSummary:
+        """把分支行转成对外 DTO，并标出是否为当前分支。"""
+        branch_id = str(row.get("branch_id") or "")
+        return BranchSummary(
+            branch_id=branch_id,
+            head_checkpoint=str(row.get("head_checkpoint") or ""),
+            parent_branch_id=str(row.get("parent_branch_id") or ""),
+            origin=str(row.get("origin") or ""),
+            label=str(row.get("label") or ""),
+            created_at=str(row.get("created_at") or ""),
+            current=branch_id == current,
+        )
 
     # ------------------------------------------------------------------ 写入
 
