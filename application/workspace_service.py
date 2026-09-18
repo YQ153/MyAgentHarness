@@ -19,7 +19,7 @@ import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from application.audit_context import audit_client_info
+from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import (
     WorkspaceEntryInfo,
     WorkspaceFileContent,
@@ -255,6 +255,9 @@ class WorkspaceService:
                 outcome="success",
                 ip=ip,
                 user_agent=ua,
+                # WHY 文件读取也要链路标识：「这次请求读了哪些文件」往往正是排查的
+                # 起点，缺了它就只能按时间戳猜，而同秒内的多条记录猜不出来。
+                trace_id=audit_trace_id(),
             )
         except Exception:
             logger.exception("写入文件读取审计失败：path=%s", path)

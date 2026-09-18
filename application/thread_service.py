@@ -12,7 +12,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from application.audit_context import audit_client_info
+from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import (
     BranchListResult,
     BranchSummary,
@@ -125,11 +125,11 @@ class ThreadService:
         outcome: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """记录一条审计事件，并自动补上当前请求的 IP / User-Agent。
+        """记录一条审计事件，并自动补上当前请求的 IP / User-Agent / 链路标识。
 
-        WHY IP/UA 由本方法统一补齐：调用点只关心「记了什么」，来源信息由
-        接口层中间件写入的 ``contextvars`` 提供，任一调用点都不会漏；审计
-        失败同样不上抛——它是旁路职责，不应把一次成功的删除变成 500。
+        WHY 三者由本方法统一补齐：调用点只关心「记了什么」，来源信息由接口层中间件
+        写入的 ``contextvars`` 提供，任一调用点都不会漏；审计失败同样不上抛——
+        它是旁路职责，不应把一次成功的删除变成 500。
         """
         if self._audit_store is None:
             return
@@ -143,6 +143,9 @@ class ThreadService:
                 outcome=outcome,
                 ip=ip,
                 user_agent=ua,
+                # WHY 与 IP/UA 同一处读取：三者都是「这次请求的来路」，只补其中一个
+                # 会让会话侧的审计记录在链路视图里断掉——那正是排查时最需要连贯的一段。
+                trace_id=audit_trace_id(),
                 details=details,
             )
         except Exception:

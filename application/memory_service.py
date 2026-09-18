@@ -15,7 +15,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from agent.run_context import ANONYMOUS_USER_ID, memory_namespace
-from application.audit_context import audit_client_info
+from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import MemoryDeleteResult, MemoryItem, MemoryListResult
 from application.errors import PermissionDeniedError
 from application.ownership import UNAUTHENTICATED_OWNER, effective_owner_id
@@ -298,6 +298,10 @@ class MemoryService:
                 outcome="success",
                 ip=ip,
                 user_agent=ua,
+                # WHY 与 IP/UA 同一处读取：删除是破坏性动作，它属于哪次请求是留痕的
+                # 关键一半——只有「谁删的」「何时删的」而没有「哪次操作删的」，
+                # 一次批量删除会散成一堆互不相干的记录。
+                trace_id=audit_trace_id(),
                 details={"owner_id": owner},
             )
         except Exception:
