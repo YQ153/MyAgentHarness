@@ -690,6 +690,26 @@ class AppConfig(BaseSettings):
     auth_rate_limit_max_attempts: int = Field(default=10, ge=1)
     """单 IP 在窗口内允许的最大认证请求数（login/callback/apikey 校验）。"""
 
+    # 运行并发与限流
+    max_concurrent_runs: int = Field(default=4, ge=0)
+    """全进程允许同时进行的大模型运行数；``0`` 表示不限制。
+
+    WHY 默认给一个具体值而不是「不限制」：不限并发时，几条长任务就能同时吃掉上游
+    配额与本地内存，而那种过载在指标上只表现为「运行数很高」——看着正忙，其实已经
+    排不动了。单用户场景下 4 远高于实际并发，等于没有影响。
+    """
+
+    run_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    run_rate_limit_max_attempts: int = Field(default=30, ge=1)
+    """单个主体在窗口内允许发起的运行数。
+
+    WHY 键取 owner_id 而不是 IP：一个 NAT 出口后面可能坐着一整个团队，按 IP 计数
+    会把同事的正常使用算成一个人的滥用；而限流要挡的是「某个账号在刷」。
+    """
+
+    run_rejected_retry_after_seconds: int = Field(default=5, ge=1)
+    """被限流或超出并发上限时回给客户端的 Retry-After 秒数。"""
+
     # OIDC 模式
     oidc_issuer: str = ""
     """IdP 的 issuer URL，例如 https://auth.example.com/application/o/myagentharness/。"""

@@ -24,6 +24,37 @@ class ThreadBusyError(RuntimeError):
         self.thread_id = thread_id
 
 
+REASON_CONCURRENCY = "concurrency"
+"""拒绝原因：全局并发已达上限。"""
+
+REASON_RATE = "rate"
+"""拒绝原因：该主体在窗口内发起得过于频繁。"""
+
+
+class RunRejectedError(RuntimeError):
+    """本次运行因超出并发上限或被限流而被拒绝。
+
+    WHY 用 429 + Retry-After 而不是排队：排队需要调度器、公平性规则，以及一个
+    「请求尚未开始却已占着连接」的等待位；而一次运行可能持续数分钟，等待位会先于
+    运行本身耗尽内存。快速失败并明确告知「多久之后可以再来」，客户端才能自己决定
+    重试节奏。
+
+    WHY 不是 409：409 表达的是「资源状态冲突、重试无用」，而这里恰恰相反——稍后
+    重试正是正确动作。把可重试的拥塞说成冲突，会让客户端与用户都以为出了错。
+
+    WHY 两种拒绝共用一类异常：它们对客户端的含义完全相同（稍后重试），只有
+    ``reason`` 不同，供日志与指标区分。
+
+    对应 HTTP 429 Too Many Requests。
+    """
+
+    def __init__(self, reason: str, retry_after: int) -> None:
+        detail = "并发已达上限" if reason == REASON_CONCURRENCY else "请求过于频繁"
+        super().__init__(f"{detail}，请在 {retry_after} 秒后重试")
+        self.reason = reason
+        self.retry_after = retry_after
+
+
 class NotFoundError(RuntimeError):
     """目标资源不存在。
 

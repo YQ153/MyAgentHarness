@@ -147,6 +147,12 @@ class HealthService:
             pending_hitl=len(self._run_service.pending_hitl_thread_ids()),
             timed_out_runs=self._run_service.timed_out_runs,
             expired_hitl=self._run_service.expired_hitl,
+            # WHY 这三项直接问 RunService：并发槽位必须与运行登记表同源。另建一份
+            # 计数器会在「会话删除/归档不中断运行」这类路径上与登记表漂移，而指标
+            # 正是用来判断「现在还能不能接活」的——它说谎比没有更糟。
+            max_concurrent_runs=self._run_service.max_concurrent_runs,
+            available_run_slots=self._run_service.available_run_slots,
+            rejected_runs=self._run_service.rejected_runs,
             audit_events=audit_events,
             uptime_seconds=self.uptime_seconds,
         )

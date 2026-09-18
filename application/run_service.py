@@ -22,10 +22,13 @@ from agent.run_context import ANONYMOUS_USER_ID, AgentRunContext
 from application.audit_context import audit_client_info
 from application.dto import GovernanceReport
 from application.errors import (
+    REASON_CONCURRENCY,
+    REASON_RATE,
     InterruptExpiredError,
     NotFoundError,
     OwnershipError,
     PermissionDeniedError,
+    RunRejectedError,
     ThreadBusyError,
 )
 from application.event_translator import LangGraphEventTranslator
@@ -37,6 +40,7 @@ from application.runnable import build_runnable_config
 from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
 from runtime.execution_registry import abort_scope, bound_scope
+from runtime.rate_limiter import RateLimiter
 from runtime.thread_store import ThreadMetaStore
 from runtime.tool_outputs import prune_tool_outputs, tool_output_path, write_tool_output
 from runtime.usage_store import UsageStore
@@ -335,6 +339,16 @@ class RunService:
         """进程启动以来被运行超时强制取消的运行数。"""
         self._expired_hitl = 0
         """进程启动以来被判定超期作废的审批挂起数。"""
+        self._rejected_runs = 0
+        """进程启动以来因超出并发上限或被限流而拒绝的运行数。"""
+
+        # WHY 限流器由本服务自己持有而不是放进装配层：它的键是「发起本轮的主体」，
+        # 而主体（owner_id）是运行期才算出来的——放进装配层就要把同一份配置再读一遍，
+        # 两处配置迟早分叉，表现为「改了配置但限流阈值没变」。
+        self._run_limiter = RateLimiter(
+            window_seconds=config.run_rate_limit_window_seconds,
+            max_attempts=config.run_rate_limit_max_attempts,
+        )
 
         logger.info(
             "RunService 就绪：mode=%s recursion_limit=%s",
@@ -458,6 +472,9 @@ class RunService:
             RuntimeError: 模型初始化或装配失败。
         """
         self._ensure_permission(principal, "thread:create")
+        # WHY 限流紧跟权限：它必须排在任何「查这个会话存不存在」的动作之前，
+        # 否则被限流的一方能从 404 与 429 的差别里推断出他人会话是否存在。
+        self._check_run_limits(principal)
 
         normalized = normalize_thread_id(thread_id)
         if not isinstance(user_input, str) or not user_input.strip():
@@ -550,6 +567,11 @@ class RunService:
             ThreadBusyError: 该会话已有运行中的轮次。
         """
         normalized = normalize_thread_id(thread_id)
+        # WHY 权限与限流都排在 _branch_messages 之前：后者会读会话（含所有权校验），
+        # 而这两个判定必须先于「会话是否存在」的结论给出，否则状态码本身成了探测手段。
+        self._ensure_permission(principal, "thread:create")
+        self._check_run_limits(principal)
+
         messages = await self._branch_messages(normalized, principal)
 
         last_user = _last_user_index(messages)
@@ -598,6 +620,10 @@ class RunService:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("content 必须是非空字符串")
         text = content.strip()
+
+        # WHY 与 regenerate 同一顺序：先权限、再限流，最后才读会话。
+        self._ensure_permission(principal, "thread:create")
+        self._check_run_limits(principal)
 
         messages = await self._branch_messages(normalized, principal)
         if message_index >= len(messages):
@@ -860,6 +886,7 @@ class RunService:
         # WHY 审批需要独立权限：这一调用会让此前被拦下的高危工具真正执行，
         # 风险量级高于「发起对话」，不能复用 thread:create。
         self._ensure_permission(principal, "hitl:approve")
+        self._check_run_limits(principal)
 
         normalized = normalize_thread_id(thread_id)
         # WHY 在这里就完成审批载荷校验：非法载荷必须在事件流开始之前失败，
@@ -1426,6 +1453,49 @@ class RunService:
 
     # -------------------------------------------------------------- 并发控制
 
+    def _at_capacity_locked(self) -> bool:
+        """并发是否已达上限。
+
+        WHY 要求调用方已持锁：上限判定与随后的槽位占用必须是同一个原子动作，
+        否则两个请求可以同时看到「还剩一个空位」然后一起挤进来。
+        """
+        cap = self._config.max_concurrent_runs
+        return cap > 0 and len(self._running) >= cap
+
+    def _check_run_limits(self, principal: Principal | None) -> None:
+        """在真正触碰会话之前判定并发与限流。
+
+        WHY 必须排在所有权校验之前：若排在之后，被限流的调用方可以从「404 还是
+        429」推断出某个会话在不在——限流不该成为一把探测他人会话的尺子。权限校验
+        仍在最前面，未授权的调用方连这一层都到不了。
+
+        WHY 并发数直接数运行登记表而不另设计数器：既有语义里「删除 / 归档会话不会
+        中断正在进行的运行」，运行因此可能比会话本身活得更久；另立的计数迟早与登记表
+        漂移，而漂移的方向恰恰是「指标说还有空位，实际已经排不动」。
+
+        Args:
+            principal: 当前主体；``None`` 表示认证关闭，落到匿名主体。
+
+        Raises:
+            RunRejectedError: 超出并发上限或被限流。
+        """
+        retry_after = self._config.run_rejected_retry_after_seconds
+        # WHY 认证关闭时落到匿名主体：单用户场景下所有请求本就属于同一个人，
+        # 按空串计数会让「限流」在该场景下等于关闭。
+        key = self._owner_id(principal) or ANONYMOUS_USER_ID
+
+        if not self._run_limiter.is_allowed(key):
+            with self._running_guard:
+                self._rejected_runs += 1
+            logger.warning("运行被限流：owner=%s", key)
+            raise RunRejectedError(REASON_RATE, retry_after)
+
+        with self._running_guard:
+            if self._at_capacity_locked():
+                self._rejected_runs += 1
+                logger.warning("运行被拒：并发已达上限 %s", self._config.max_concurrent_runs)
+                raise RunRejectedError(REASON_CONCURRENCY, retry_after)
+
     def _acquire_run_slot(
         self,
         thread_id: str,
@@ -1459,6 +1529,16 @@ class RunService:
         with self._running_guard:
             if thread_id in self._running:
                 raise ThreadBusyError(thread_id)
+
+            # WHY 在这里复查一次上限：``_check_run_limits`` 与本次占用之间隔着所有权
+            # 校验等 await，足够另一轮把最后一个槽位占走。检查与占用同在锁内才是原子的；
+            # 而这里被拒的只可能是「自己有权限的会话」，不存在借状态码探测他人的问题。
+            if self._at_capacity_locked():
+                self._rejected_runs += 1
+                raise RunRejectedError(
+                    REASON_CONCURRENCY, self._config.run_rejected_retry_after_seconds
+                )
+
             handle = RunHandle(
                 thread_id=thread_id,
                 started_at=time.monotonic(),
@@ -1628,6 +1708,34 @@ class RunService:
         """进程启动以来因超期未决策而作废的审批挂起次数。"""
         with self._running_guard:
             return self._expired_hitl
+
+    @property
+    def max_concurrent_runs(self) -> int:
+        """配置的全局并发上限；``0`` 表示不限制。"""
+        return self._config.max_concurrent_runs
+
+    @property
+    def available_run_slots(self) -> int:
+        """当前可用槽位数；上限为 ``0``（不限制）时返回 ``-1``。
+
+        WHY 不限制时用 ``-1`` 而不是 ``0``：``0`` 在容量语境里天然读作「一个空位都
+        没有」，而这里恰恰相反。让「不限制」有一个不可能与「已满」混淆的取值，
+        看指标的人就不必再回去查配置。
+        """
+        if self._config.max_concurrent_runs <= 0:
+            return -1
+        with self._running_guard:
+            return max(0, self._config.max_concurrent_runs - len(self._running))
+
+    @property
+    def rejected_runs(self) -> int:
+        """进程启动以来因并发上限或限流被拒绝的运行次数。
+
+        WHY 与运行登记表共用一把锁：拒绝计数要在「判定超限」的同一临界区内自增，
+        否则指标会读到「已满但拒绝数为 0」这种自相矛盾的组合。
+        """
+        with self._running_guard:
+            return self._rejected_runs
 
     # ------------------------------------------------------------------ 元数据
 

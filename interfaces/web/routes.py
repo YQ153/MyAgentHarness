@@ -28,6 +28,7 @@ from application.errors import (
     NotFoundError,
     OwnershipError,
     PermissionDeniedError,
+    RunRejectedError,
     ThreadBusyError,
 )
 from application.events import AgentEvent
@@ -437,6 +438,14 @@ async def run_agent(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
+    except RunRejectedError as exc:
+        # WHY 必须带 Retry-After：429 只说「太多了」，客户端仍不知道何时可重试，
+        # 于是只能盲猜间隔——那等于把一次明确的服务端决策变成客户端的玄学调参。
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
     except RuntimeError as exc:
         logger.exception("Agent 初始化失败：thread=%s", normalized)
         raise HTTPException(
@@ -494,6 +503,14 @@ async def resume_agent(
     except ThreadBusyError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RunRejectedError as exc:
+        # WHY 必须带 Retry-After：429 只说「太多了」，客户端仍不知道何时可重试，
+        # 于是只能盲猜间隔——那等于把一次明确的服务端决策变成客户端的玄学调参。
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
         ) from exc
     except InterruptExpiredError as exc:
         # WHY 必须排在 RuntimeError 之前：它是 RuntimeError 的子类，顺序颠倒
@@ -615,6 +632,14 @@ async def edit_message(
     except ThreadBusyError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except RunRejectedError as exc:
+        # WHY 必须带 Retry-After：429 只说「太多了」，客户端仍不知道何时可重试，
+        # 于是只能盲猜间隔——那等于把一次明确的服务端决策变成客户端的玄学调参。
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
         ) from exc
     except RuntimeError as exc:
         logger.exception("Agent 初始化失败：thread=%s", normalized)

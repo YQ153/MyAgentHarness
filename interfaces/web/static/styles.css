@@ -903,6 +903,11 @@ button.small {
   opacity: 0.75;
 }
 
+.msg.notice {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .msg-action:hover {
   color: var(--accent);
   opacity: 1;

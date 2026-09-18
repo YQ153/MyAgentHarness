@@ -147,6 +147,9 @@
       // 「提示后重试」还是「作废当前 UI 状态」，只有文案不足以判断。
       const error = new Error(detail);
       error.status = response.status;
+      // WHY 单独带上 Retry-After：429 的语义是「稍后再来」，而「稍后」是多久只有
+      // 响应头知道；让调用方去解析错误文案里的秒数，等于把结构化信息降级成字符串匹配。
+      error.retryAfter = response.headers.get('Retry-After');
       throw error;
     }
     return response;
@@ -431,6 +434,46 @@
   function appendError(message) {
     els.messages.appendChild(el('div', 'msg error', `错误：${message}`));
     scrollToBottom();
+  }
+
+  /**
+   * 提示一条「不是错误」的状态。
+   *
+   * WHY 与 appendError 分开：混用会让「稍后重试」看起来像一次失败。用户看到
+   * 「错误：服务繁忙」的第一反应是去检查自己哪里做错了，而这里其实是服务端在
+   * 说「稍等，我接着办」。
+   */
+  function appendNotice(message) {
+    els.messages.appendChild(el('div', 'msg notice', message));
+    scrollToBottom();
+  }
+
+  /**
+   * 发起一次流式运行；服务端说「稍后再来」时自动重试一次。
+   *
+   * WHY 自动重试而不是把 429 抛给用户：429 的含义是「现在忙，稍后可重试」——把它
+   * 显示成一个错误，等于让用户为服务端的容量状况手动补一次操作。这与当初弃用 409
+   * 的理由是同一条（不能让一次正常的重试变成报错）。
+   *
+   * WHY 只重试一次：真正过载时，无限重试会把负载再翻一倍，反而让恢复更慢；
+   * 第二次仍被拒就如实告诉用户，把节奏交回给人。
+   */
+  async function submitRun(url, body) {
+    const options = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    };
+    try {
+      return await api(url, options);
+    } catch (err) {
+      if (err.status !== 429) throw err;
+      const seconds = parseInt(err.retryAfter, 10);
+      const wait = Math.max(1, Math.min(30, Number.isFinite(seconds) ? seconds : 5));
+      appendNotice(`服务当前繁忙，${wait} 秒后自动重试…`);
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      return await api(url, options);
+    }
   }
 
   /**
@@ -810,23 +853,17 @@
       scrollToBottom();
 
       const editing = state.editTarget;
-      const response = await api(
+      const response = await submitRun(
         editing === null
           ? `/api/threads/${state.threadId}/runs`
           : `/api/threads/${state.threadId}/edit`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(
-            editing === null
-              ? { content: content, model: els.modelSelect.value || null }
-              : {
-                  message_index: editing,
-                  content: content,
-                  model: els.modelSelect.value || null,
-                }
-          ),
-        }
+        editing === null
+          ? { content: content, model: els.modelSelect.value || null }
+          : {
+              message_index: editing,
+              content: content,
+              model: els.modelSelect.value || null,
+            }
       );
       await handleStream(response);
       // WHY 分叉后重载而不是就地拼接：编辑与重新生成会切到一条**新的**分支，
@@ -855,10 +892,8 @@
     if (state.running || !state.threadId) return;
     setRunning(true);
     try {
-      const response = await api(`/api/threads/${state.threadId}/regenerate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: els.modelSelect.value || null }),
+      const response = await submitRun(`/api/threads/${state.threadId}/regenerate`, {
+        model: els.modelSelect.value || null,
       });
       await handleStream(response);
       await loadThread(state.threadId);

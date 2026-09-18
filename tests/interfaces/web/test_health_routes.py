@@ -140,6 +140,10 @@ def test_metrics_returns_snapshot():
         "pending_hitl": 1,
         "timed_out_runs": 3,
         "expired_hitl": 2,
+        # 并发槽位三项取 DTO 默认值：替身只填了它自己要断言的字段
+        "max_concurrent_runs": 0,
+        "available_run_slots": -1,
+        "rejected_runs": 0,
         "audit_events": 128,
         "uptime_seconds": 3661.5,
     }

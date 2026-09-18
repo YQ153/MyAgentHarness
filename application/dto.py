@@ -243,6 +243,14 @@ class MetricsSnapshot(BaseModel):
     expired_hitl: int = Field(
         default=0, description="进程启动以来因超期未决策而作废的审批挂起次数"
     )
+    max_concurrent_runs: int = Field(default=0, description="配置的全局并发上限；0 表示不限制")
+    available_run_slots: int = Field(
+        default=-1,
+        description="当前可用的运行槽位数；上限为 0（不限制）时以 -1 表示",
+    )
+    rejected_runs: int = Field(
+        default=0, description="进程启动以来因超出并发上限或被限流而拒绝的运行次数"
+    )
     audit_events: int | None = Field(
         default=None, description="审计事件总数；``None`` 表示本次采集失败"
     )
