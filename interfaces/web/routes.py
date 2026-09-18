@@ -11,14 +11,16 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 from application.dto import (
     BranchListResult,
+    ImportResult,
     MemoryDeleteResult,
     MemoryListResult,
     ModelInfo,
+    ThreadExport,
     ThreadSummary,
     ToolListResult,
     UsageSummary,
@@ -36,6 +38,7 @@ from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.principal import Principal
 from application.run_service import RunService
+from application.thread_export import render_markdown
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
@@ -327,6 +330,80 @@ async def update_thread(
         ) from exc
 
     return result
+
+
+@router.get("/threads/{thread_id}/export")
+async def export_thread(
+    thread_id: str,
+    format: str = Query(
+        default="json", pattern="^(json|markdown)$", description="导出格式"
+    ),
+    branch: str | None = Query(default=None, description="要导出的分支；缺省为当前分支"),
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:read")),
+) -> Response:
+    """导出会话：JSON 供机器读，Markdown 供人读。
+
+    WHY 用 ``Response`` 而不是 ``response_model``：两种格式的内容类型不同，且都以
+    「文件」形式交付——带上 ``Content-Disposition`` 才能让浏览器下载而不是内联展示。
+    """
+    normalized = _validate_thread_id(thread_id)
+
+    try:
+        payload = await threads.export_thread(normalized, principal, branch_id=branch)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except OwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+
+    if format == "markdown":
+        body, media_type, suffix = render_markdown(payload), "text/markdown", "md"
+    else:
+        body, media_type, suffix = payload.model_dump_json(indent=2), "application/json", "json"
+
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="thread-{normalized[:12]}.{suffix}"'
+        },
+    )
+
+
+@router.post("/threads/import", response_model=ImportResult)
+async def import_thread(
+    body: ThreadExport,
+    threads: ThreadService = Depends(get_threads),
+    principal: Principal = Depends(require_permission("thread:create")),
+) -> ImportResult:
+    """把导出的 JSON 复原成一个**新会话**。
+
+    WHY 请求体就是导出文件本身：这样「导出 → 导入」是一条无转换的路径，不需要再
+    约定一层包装格式——多一层包装就多一处可能对不上的字段名。
+    """
+    try:
+        return await threads.import_thread(body, principal)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("导入会话失败")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
 
 
 @router.get("/threads/{thread_id}", response_model=list[HistoryMessage])

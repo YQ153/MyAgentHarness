@@ -121,6 +121,53 @@ class HistoryMessage(BaseModel):
     tool_calls: list[dict[str, Any]] = Field(
         default_factory=list, description="该消息发起的工具调用"
     )
+    tool_call_id: str = Field(
+        default="",
+        description="工具消息对应的调用标识；非工具消息为空串。导出后要能原样导回，缺了它工具消息无法重建",
+    )
+
+
+EXPORT_VERSION = "1"
+"""会话导出格式的版本号。
+
+WHY 单独列出来并写进文件：导入是「别人给我的文件」，格式一旦变化，没有版本号就
+只能靠字段猜测兼容性，而猜错的表现是内容静默错位。
+"""
+
+
+class ThreadExport(BaseModel):
+    """一个会话的可移植快照。
+
+    WHY 只导出当前分支的消息：分支结构与各分支的位置是**上游检查点**的概念，
+    导出成文件后无法在目标库里重建出同样的树；把某一分支的内容原样带过去，
+    比带一个看起来有结构、实际无法复原的树要诚实。
+    """
+
+    version: str = Field(default=EXPORT_VERSION, description="格式版本")
+    thread_id: str = Field(description="来源会话标识；导入时会分配新 ID")
+    title: str = Field(default="", description="会话标题")
+    tags: list[str] = Field(default_factory=list, description="会话标签")
+    created_at: str = Field(default="", description="来源会话创建时间（ISO8601 UTC）")
+    updated_at: str = Field(default="", description="来源会话最近活动时间（ISO8601 UTC）")
+    exported_at: str = Field(default="", description="导出时刻（ISO8601 UTC）")
+    branch_id: str = Field(default="", description="导出的是哪条分支；空串表示根分支")
+    messages: list[HistoryMessage] = Field(default_factory=list, description="该分支的消息")
+    notes: list[str] = Field(
+        default_factory=list, description="导入方需要知道的事项，随文件一起传给对方"
+    )
+
+
+class ImportResult(BaseModel):
+    """导入结果。"""
+
+    thread_id: str = Field(description="新建的会话标识")
+    title: str = Field(default="", description="新会话的标题")
+    message_count: int = Field(default=0, description="复原的消息条数")
+    skipped_messages: int = Field(default=0, description="因角色无法还原而丢弃的条数")
+    usage_note: str = Field(
+        default="", description="用量口径说明：新会话的用量自导入时刻重新计"
+    )
+    notes: list[str] = Field(default_factory=list, description="随导出文件带回的注意事项")
 
 
 class BranchSummary(BaseModel):

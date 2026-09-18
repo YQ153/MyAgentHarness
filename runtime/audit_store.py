@@ -71,10 +71,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_actor_time
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_event_time
     ON audit_log (event_type, created_at DESC);
+"""
 
--- 按链路查「一次请求都做了什么」：没有这个索引就得全表扫 created_at
+_TRACE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_audit_log_trace
     ON audit_log (trace_id, created_at DESC);
+"""
+"""trace_id 的索引。
+
+WHY 单独放在这里而不是写进 ``_SCHEMA``：``CREATE TABLE IF NOT EXISTS`` 对老库不做
+任何事，老库的 audit_log 里还没有 trace_id 这一列——索引若排在补列的 ALTER 之前，
+``executescript`` 会以「no such column」失败，**应用直接起不来**。顺序是
+「先补列、再建索引」，与 ``thread_store`` 里 owner_id 的迁移一致。
 """
 
 
@@ -315,6 +323,8 @@ async def open_audit_store(db_path: Path) -> AsyncIterator[AuditStore]:
             await conn.execute("ALTER TABLE audit_log ADD COLUMN trace_id TEXT;")
         except Exception:
             logger.debug("audit_log.trace_id 已存在，跳过迁移")
+        # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+        await conn.executescript(_TRACE_INDEX)
         await conn.commit()
         logger.info("审计日志表已就绪：%s", db_path)
         yield AuditStore(conn)

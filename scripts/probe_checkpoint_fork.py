@@ -156,6 +156,22 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print("带 checkpoint_ns 的改写失败：", type(exc).__name__, exc)
 
+        # --------------------------- 问题 6：能否给全新会话直接写入历史
+        print("\n=== 问题 6：新会话上用 aupdate_state 写入历史 ===")
+        try:
+            fresh = "import-probe"
+            await graph.aupdate_state(
+                {"configurable": {"thread_id": fresh}},
+                {"messages": [HumanMessage(content="导入的问", id="i-h"), AIMessage(content="导入的答", id="i-a")]},
+            )
+            imported = await graph.aget_state({"configurable": {"thread_id": fresh}})
+            imported_messages = [m.content for m in imported.values.get("messages", [])]
+            print("写入后读回的消息：", imported_messages)
+            print("内容一致：", imported_messages == ["导入的问", "导入的答"])
+            print("拿到了检查点 id：", bool(imported.config["configurable"].get("checkpoint_id")))
+        except Exception as exc:  # noqa: BLE001 - 探针要把失败原因原样带出来
+            print("写入失败：", type(exc).__name__, exc)
+
         # --------------------------- 问题 5：切回旧分支继续对话是否干扰新分支
         print("\n=== 问题 5：在旧分支上继续，新分支是否不受影响 ===")
         branch_a_head = fork_point  # 旧分支此刻的头就是分叉点本身

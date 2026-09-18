@@ -10,15 +10,21 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import (
+    EXPORT_VERSION,
     BranchListResult,
     BranchSummary,
     DeleteOutcome,
     DeleteResult,
     HistoryMessage,
+    ImportResult,
+    ThreadExport,
     ThreadListResult,
     ThreadSummary,
 )
@@ -41,6 +47,55 @@ if TYPE_CHECKING:
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _restore_messages(messages: list[HistoryMessage]) -> tuple[list[Any], int]:
+    """把导出的消息还原成 LangChain 消息，返回（消息列表, 丢弃条数）。
+
+    WHY 丢弃无法还原的角色而不是硬塞：图只会产生 human / ai / tool 三类。把未知角色
+    当作用户消息塞进去，会静默改变模型看到的前缀——那比少一条消息更糟；而少掉多少条
+    必须报给用户，所以这里返回计数而不是悄悄跳过。
+
+    WHY 缺 call id 时补一个：上游要求每次工具调用都有 id，而手写的导出文件未必带。
+    真正需要它的是「工具结果指向哪次调用」，那种对应关系由 tool_call_id 决定；
+    缺失时宁可丢弃该条工具消息并计数，也不给它安一个对不上的 id。
+    """
+    restored: list[Any] = []
+    skipped = 0
+
+    for index, message in enumerate(messages or []):
+        role = (message.role or "").lower()
+        if role in {"human", "user"}:
+            restored.append(HumanMessage(content=message.content))
+        elif role in {"ai", "assistant"}:
+            restored.append(
+                AIMessage(
+                    content=message.content,
+                    tool_calls=[
+                        {
+                            "id": str(call.get("id") or f"call_{index}_{position}"),
+                            "name": str(call.get("name") or ""),
+                            "args": call.get("args") or {},
+                        }
+                        for position, call in enumerate(message.tool_calls or [])
+                    ],
+                )
+            )
+        elif role == "tool":
+            if not message.tool_call_id:
+                skipped += 1
+                continue
+            restored.append(
+                ToolMessage(
+                    content=message.content,
+                    tool_call_id=message.tool_call_id,
+                    name=message.name or None,
+                )
+            )
+        else:
+            skipped += 1
+
+    return restored, skipped
 
 
 class ThreadService:
@@ -480,6 +535,132 @@ class ThreadService:
         logger.info("会话标签已更新：thread=%s tags=%s", normalized, updated.get("tags"))
         return ThreadSummary(**updated)
 
+    # ------------------------------------------------------------ 导出与导入
+
+    async def export_thread(
+        self,
+        thread_id: str,
+        principal: Principal | None = None,
+        *,
+        branch_id: str | None = None,
+    ) -> ThreadExport:
+        """把一个会话导出成可移植快照。
+
+        WHY 导出也要走归属校验：导出文件里是完整对话正文，比列表页的标题敏感得多，
+        「只是读」不构成放宽的理由。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            NotFoundError: 会话或指定分支不存在。
+            OwnershipError: 无权访问该会话。
+        """
+        normalized = normalize_thread_id(thread_id)
+        record = await self._thread_store.get(normalized)
+        self._ensure_ownership(record, normalized, principal)
+
+        messages = await self.history(normalized, principal, branch_id=branch_id)
+        current = await self._thread_store.current_branch(normalized)
+
+        return ThreadExport(
+            version=EXPORT_VERSION,
+            thread_id=normalized,
+            title=str((record or {}).get("title") or ""),
+            tags=[str(tag) for tag in ((record or {}).get("tags") or [])],
+            created_at=str((record or {}).get("created_at") or ""),
+            updated_at=str((record or {}).get("updated_at") or ""),
+            exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # WHY 记下实际导出的那条分支：缺省时导出的是当前分支，若这里留空，
+            # 文件读者会以为导出的是根分支，拿它去对照界面就会对不上。
+            branch_id=current if branch_id is None else branch_id,
+            messages=messages,
+            notes=[
+                "只包含该分支的消息；分支结构与各分支的位置不随导出迁移。",
+                "用量与审计不随导出迁移——导入后的会话自导入时刻重新计。",
+            ],
+        )
+
+    async def import_thread(
+        self,
+        payload: ThreadExport,
+        principal: Principal | None = None,
+        *,
+        title: str | None = None,
+    ) -> ImportResult:
+        """把一份导出快照复原成一个**新会话**。
+
+        WHY 永远新建、不提供覆盖：导出文件可能来自别人，覆盖语义意味着一个文件就能
+        改写本机已有会话。新建让导入成为纯增量动作——失败也不会破坏任何现有数据。
+
+        WHY 归属记在导入者名下而不是照搬文件里的 owner：文件里的标识来自另一个库，
+        在本机没有意义；照搬会让「谁导入的」这件事消失，而导入者才是本机唯一能对它
+        负责的主体。
+
+        Raises:
+            ValueError: 导入内容为空、版本不支持。
+            RuntimeError: 写入检查点失败。
+
+        WHY 本方法不做权限校验：``ThreadService`` 的权限一律由接口层的
+        ``require_permission`` 在进入前判定，服务层只负责归属（``_ensure_ownership``）。
+        在这里另写一次会引入一处「服务自认为检查过、实际用的是另一套口径」的假守卫。
+        """
+        if payload is None:
+            raise ValueError("导入内容不能为空")
+        if str(payload.version) != EXPORT_VERSION:
+            raise ValueError(f"不支持的导出格式版本：{payload.version}")
+
+        new_id = uuid.uuid4().hex
+        messages, skipped = _restore_messages(payload.messages)
+
+        graph = self._graph_factory.get()
+        try:
+            # WHY 直接写入状态而不是「重放一遍对话」：重放会真的调模型——既慢，又会
+            # 生出一轮与原文不同的回答。要的是复原，不是重新回答。
+            # 全新会话上写入不需要 checkpoint_id / checkpoint_ns / as_node，
+            # 这一点已由 scripts/probe_checkpoint_fork.py 的问题 6 验证过。
+            await graph.aupdate_state(
+                build_runnable_config(self._config, new_id),
+                {"messages": messages},
+            )
+        except Exception as exc:
+            logger.exception("导入写入检查点失败：thread=%s", new_id)
+            raise RuntimeError(f"导入写入检查点失败：{exc}") from exc
+
+        resolved_title = title or payload.title or "导入的会话"
+        # WHY 用 record_turn 一步完成登记：它本身就是一条 UPSERT——刷新活动时间、
+        # 累加轮次、标题为空时补写，并在需要时插入新行。前面再调一次 create 等于把
+        # 同一件事做两遍，还多出一处「两遍之间失败」的中间态。
+        # WHY 轮次按还原出的用户消息数补记：不补的话清单上会显示「0 轮」，而点进去
+        # 有几十条消息——清单是用户判断「值不值得打开」的依据，不能与内容矛盾。
+        await self._thread_store.record_turn(
+            new_id,
+            title_hint=resolved_title,
+            turn_delta=sum(1 for message in messages if isinstance(message, HumanMessage)),
+            owner_id=self._effective_owner_id(principal) or "",
+        )
+        if payload.tags:
+            await self._thread_store.set_tags(new_id, payload.tags)
+        await self._audit(
+            event_type="thread_import",
+            actor_id=principal.user_id if principal else "anonymous",
+            target_id=new_id,
+            action="import",
+            outcome="success",
+            details={
+                "message_count": len(messages),
+                "skipped": skipped,
+                "source_thread_id": payload.thread_id,
+            },
+        )
+
+        return ImportResult(
+            thread_id=new_id,
+            title=resolved_title,
+            message_count=len(messages),
+            skipped_messages=skipped,
+            usage_note="新会话的用量自导入时刻重新计；原会话的用量记录不随之迁移。",
+            notes=list(payload.notes),
+        )
+
     async def delete_thread(
         self,
         thread_id: str,
@@ -747,9 +928,14 @@ class ThreadService:
             name=getattr(message, "name", "") or "",
             tool_calls=[
                 {
+                    # WHY 保留 call id：工具结果消息靠它指回是哪一次调用。丢了它，
+                    # 导出的文件再导回去时工具消息会变成孤儿——要么被丢弃，要么
+                    # 挂到错误的调用上，而两者都不会报错。
+                    "id": call.get("id", ""),
                     "name": call.get("name", ""),
                     "args": call.get("args", {}),
                 }
                 for call in tool_calls
             ],
+            tool_call_id=getattr(message, "tool_call_id", "") or "",
         )

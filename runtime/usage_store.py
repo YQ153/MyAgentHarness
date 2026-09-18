@@ -86,10 +86,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_log_owner_time
 
 CREATE INDEX IF NOT EXISTS idx_usage_log_thread_time
     ON usage_log (thread_id, created_at DESC);
+"""
 
--- 按链路把一次请求的成本与它的审计记录对上：同一个 trace_id 两边都能查
+_TRACE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_usage_log_trace
     ON usage_log (trace_id, created_at DESC);
+"""
+"""trace_id 的索引。
+
+WHY 单独放在这里而不是写进 ``_SCHEMA``：``CREATE TABLE IF NOT EXISTS`` 对老库不做
+任何事，老库的 usage_log 里还没有 trace_id 这一列——索引若排在补列的 ALTER 之前，
+``executescript`` 会以「no such column」失败，**应用直接起不来**。
 """
 
 
@@ -387,6 +394,8 @@ async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
             await conn.execute("ALTER TABLE usage_log ADD COLUMN trace_id TEXT;")
         except Exception:
             logger.debug("usage_log.trace_id 已存在，跳过迁移")
+        # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+        await conn.executescript(_TRACE_INDEX)
         await conn.commit()
         logger.info("用量记录表已就绪：%s", db_path)
         yield UsageStore(conn)
