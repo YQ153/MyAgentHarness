@@ -369,6 +369,21 @@ class AppConfig(BaseSettings):
     让界面卡死；而不同部署的前端能承载的预览长度不同，硬编码无法按环境调整。
     """
 
+    tool_output_max_chars: int = Field(default=200_000, ge=1000)
+    """单个留存文件的字符上限（被截断的工具输出会完整落盘到工作区）。
+
+    WHY 仍要上限：留存是为「能回取」，不是做无限仓库；一次读到几十 MB 文件的调用
+    若原样落盘，磁盘会随对话量无界增长。截断副本配上首行说明已足以回答
+    「这次调用产出了什么」。
+    """
+
+    tool_output_retention_per_thread: int = Field(default=20, ge=1, le=1000)
+    """每个会话保留的最新工具输出份数，超出后按时间清理旧文件。
+
+    WHY 必须清理：留存目录只增不减会变成磁盘黑洞，而真正有用的只有最近若干次
+    ——旧输出对应的是已经翻过去的对话。
+    """
+
     # ---------------- 执行与安全 ----------------
     execution_mode: ExecutionMode = ExecutionMode.DISABLED
     shell_timeout: int = Field(default=120, gt=0)

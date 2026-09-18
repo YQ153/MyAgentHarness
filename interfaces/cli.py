@@ -56,6 +56,10 @@ def render_event(event: AgentEvent) -> None:
         status = payload.get("status") or ""
         suffix = " (已截断)" if payload.get("truncated") else ""
         print(f"[结果] {payload.get('name', '')} {status}{suffix}", flush=True)
+        # 被截断时给出留存位置：命令行里没有文件面板，路径就是唯一的回取入口
+        ref = payload.get("full_output_ref")
+        if ref:
+            print(f"       完整输出：workspace{ref}", flush=True)
     elif event.event is AgentEventType.TODOS:
         _render_todos(list(payload.get("items") or []))
     elif event.event is AgentEventType.STEP:

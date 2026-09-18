@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import threading
@@ -36,7 +37,9 @@ from application.usage import TokenUsage
 from runtime.audit_store import AuditStore
 from runtime.execution_registry import abort_scope, bound_scope
 from runtime.thread_store import ThreadMetaStore
+from runtime.tool_outputs import prune_tool_outputs, tool_output_path, write_tool_output
 from runtime.usage_store import UsageStore
+from runtime.workspace_files import to_virtual_path
 from text_utils import build_title
 from thread_utils import normalize_thread_id
 
@@ -800,6 +803,26 @@ class RunService:
         logger.info("会话 %s 本轮结束", thread_id)
         yield AgentEvent(AgentEventType.DONE, done_payload)
 
+    def _persist_outputs(self, batch: list[tuple[Path, str]]) -> None:
+        """在工作线程里写留存文件，并按上限清理该会话的旧留存。
+
+        WHY 单独成方法而不是写在闭包里：它要在 ``to_thread`` 里跑，写成独立方法
+        既便于测试直接调用，也让「阻塞 IO 只发生在这里」这件事在结构上看得见。
+        """
+        for path, text in batch:
+            write_tool_output(
+                path, text, max_chars=self._config.tool_output_max_chars
+            )
+        removed = prune_tool_outputs(
+            batch[0][0].parent, keep=self._config.tool_output_retention_per_thread
+        )
+        if removed:
+            logger.info(
+                "工具输出留存清理：删除 %d 个旧文件（目录=%s）",
+                removed,
+                batch[0][0].parent,
+            )
+
     async def _iterate(
         self,
         graph: Any,
@@ -807,8 +830,42 @@ class RunService:
         handle: RunHandle,
     ) -> AsyncIterator[AgentEvent]:
         """逐条翻译流增量，并负责运行期错误收敛。"""
+        pending_outputs: list[tuple[Path, str]] = []
+        output_sequence = itertools.count(1)
+
+        def capture_full_output(tool_name: str, full_text: str) -> str:
+            """算出留存引用并暂存正文，返回供事件使用的虚拟路径。
+
+            WHY 只暂存不写盘：本回调由翻译器**同步**调用，而写文件是阻塞 IO——
+            在事件循环里直接写会让流式输出卡顿。落盘交给下面的 ``flush_outputs``。
+            """
+            path = tool_output_path(
+                self._config.workspace, handle.thread_id, next(output_sequence), tool_name
+            )
+            pending_outputs.append((path, full_text))
+            return to_virtual_path(self._config.workspace, path)
+
+        async def flush_outputs() -> None:
+            """把暂存的留存写盘。
+
+            WHY 每批事件后立刻写而不是攒到整轮结束：被取消或被停止的运行走不到
+            收尾分支，攒到最后的输出会整批丢失——而「用户中途停掉」恰恰是最想
+            回看完整结果的场景。
+            """
+            if not pending_outputs:
+                return
+            batch = list(pending_outputs)
+            pending_outputs.clear()
+            try:
+                await asyncio.to_thread(self._persist_outputs, batch)
+            except Exception:
+                # 留存是旁路能力：写不进去不该让一轮已经跑完的对话崩掉，
+                # 但必须留日志，否则「为什么没有留存」只能靠猜。
+                logger.exception("工具输出留存失败，已跳过（不影响本轮对话）")
+
         translator = LangGraphEventTranslator(
-            tool_result_preview_limit=self._config.tool_result_preview_chars
+            tool_result_preview_limit=self._config.tool_result_preview_chars,
+            full_output_capture=capture_full_output,
         )
 
         try:
@@ -816,6 +873,7 @@ class RunService:
                 for event in translator.feed(mode, chunk):
                     self._track_event(event, handle)
                     yield event
+                await flush_outputs()
 
             # 流结束后冲出最后一批未发送的工具调用
             for event in translator.flush():
@@ -824,6 +882,7 @@ class RunService:
                 # 漏掉它们，就会出现「工具调用了但审计里没有」的缺口。
                 self._track_event(event, handle)
                 yield event
+            await flush_outputs()
 
         except asyncio.CancelledError:
             # WHY 单独捕获取消：客户端断开是预期行为，不应记成错误日志，

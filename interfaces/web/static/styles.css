@@ -761,3 +761,120 @@ button.small {
   color: var(--muted);
   text-align: center;
 }
+
+/* ------------------------------------------------------------------ 工作区面板 */
+
+.modal-wide {
+  max-width: min(1100px, 94vw);
+}
+
+.workspace-hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.workspace-body {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) 1fr;
+  gap: 12px;
+  height: min(68vh, 600px);
+}
+
+.workspace-tree,
+.workspace-preview {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: auto;
+}
+
+.workspace-tree {
+  padding: 6px 0;
+  font-size: 13px;
+}
+
+.workspace-preview {
+  padding: 10px 12px;
+}
+
+.ws-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ws-row:hover {
+  background: var(--accent-soft);
+}
+
+.ws-row.active {
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.ws-row.ws-muted {
+  cursor: default;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ws-row.ws-muted:hover {
+  background: none;
+}
+
+.ws-marker {
+  flex: none;
+  width: 12px;
+  color: var(--muted);
+}
+
+.ws-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ws-size {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ws-file-head {
+  margin-bottom: 8px;
+}
+
+.ws-file-name {
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.ws-file-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ws-text {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ws-image {
+  max-width: 100%;
+  border-radius: 4px;
+}
+
+.ws-link {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}

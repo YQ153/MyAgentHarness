@@ -52,6 +52,11 @@
     memoryClose: document.getElementById('memory-close'),
     memoryRefresh: document.getElementById('memory-refresh'),
     memoryList: document.getElementById('memory-list'),
+    workspaceOpen: document.getElementById('workspace-open'),
+    workspaceModal: document.getElementById('workspace-modal'),
+    workspaceClose: document.getElementById('workspace-close'),
+    workspaceTree: document.getElementById('workspace-tree'),
+    workspacePreview: document.getElementById('workspace-preview'),
   };
 
   const state = {
@@ -64,6 +69,13 @@
     /** 会话清单的过滤条件；与界面控件保持一致，刷新清单时统一从这里取。 */
     threadFilter: { query: '', includeArchived: false },
     memories: { items: [], truncated: false },
+    /**
+     * 工作区目录树状态。
+     *
+     * WHY 只存「已加载的目录」而不是整棵树：面板按需展开下一层，未展开的目录
+     * 不该存在于客户端状态里——否则「树」与「服务端实际情况」就有两份真相。
+     */
+    workspace: { dirs: {}, expanded: {}, selected: null },
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -444,6 +456,13 @@
       node.filled = true;
       node.body.textContent +=
         `\n--- 结果 ---\n${payload.preview}${payload.truncated ? '\n(输出已截断)' : ''}`;
+      if (payload.full_output_ref) {
+        // WHY 做成可点击文本而不是按钮：这是「想看全的人」的入口，不是每轮都要
+        // 做的动作——做成按钮会让人以为必须点它对话才算完成。
+        const link = el('span', 'ws-link', '\n查看完整输出');
+        link.addEventListener('click', () => showFullOutput(payload.full_output_ref));
+        node.body.appendChild(link);
+      }
       return;
     }
     // 没找到对应卡片时退化成独立块，保证结果不丢
@@ -1129,7 +1148,175 @@
     els.memoryModal.querySelector('.modal-backdrop').addEventListener('click', closeMemoryModal);
   }
 
-  async function loadAuth() {
+  /* ------------------------------------------------------------------ 工作区面板 */
+
+function formatSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function openWorkspaceModal() {
+  els.workspaceModal.style.display = '';
+  if (!state.workspace.dirs['/']) {
+    loadDirectory('/');
+  } else {
+    renderTree();
+  }
+}
+
+function closeWorkspaceModal() {
+  els.workspaceModal.style.display = 'none';
+}
+
+async function loadDirectory(path) {
+  try {
+    // WHY 编码整个 path 作为一个查询参数：虚拟路径里可能含中文与空格，
+    // 而这里它是 query value，不是路径段——整体编码才是正确做法。
+    const response = await api(`/api/workspace/files?path=${encodeURIComponent(path)}`);
+    const payload = await response.json();
+    state.workspace.dirs[payload.path] = {
+      entries: payload.entries || [],
+      truncated: !!payload.truncated,
+    };
+    renderTree();
+  } catch (err) {
+    state.workspace.dirs[path] = { entries: [], truncated: false, error: err.message };
+    renderTree();
+  }
+}
+
+async function toggleDir(path) {
+  const expanded = !state.workspace.expanded[path];
+  state.workspace.expanded[path] = expanded;
+  if (expanded && !state.workspace.dirs[path]) {
+    renderTree(); // 先画出「加载中」，避免点了没反应
+    await loadDirectory(path);
+    return;
+  }
+  renderTree();
+}
+
+function buildTreeRows(path, depth) {
+  const group = el('div', 'ws-group');
+  const node = state.workspace.dirs[path];
+  const entries = node ? node.entries : [];
+
+  entries.forEach((entry) => {
+    const row = el('div', 'ws-row');
+    row.style.paddingLeft = `${8 + depth * 14}px`;
+    if (entry.is_dir) {
+      row.appendChild(
+        el('span', 'ws-marker', state.workspace.expanded[entry.path] ? '▾' : '▸')
+      );
+      row.appendChild(el('span', 'ws-name', entry.name));
+      row.addEventListener('click', () => toggleDir(entry.path));
+      group.appendChild(row);
+      if (state.workspace.expanded[entry.path]) {
+        if (state.workspace.dirs[entry.path]) {
+          group.appendChild(buildTreeRows(entry.path, depth + 1));
+        } else {
+          const loading = el('div', 'ws-row ws-muted', '加载中…');
+          loading.style.paddingLeft = `${8 + (depth + 1) * 14}px`;
+          group.appendChild(loading);
+        }
+      }
+      return;
+    }
+    row.appendChild(el('span', 'ws-marker', ' '));
+    row.appendChild(el('span', 'ws-name', entry.name));
+    row.appendChild(el('span', 'ws-size', formatSize(entry.size)));
+    if (entry.path === state.workspace.selected) row.classList.add('active');
+    row.addEventListener('click', () => openWorkspaceFile(entry.path));
+    group.appendChild(row);
+  });
+
+  if (node && node.truncated) {
+    const more = el('div', 'ws-row ws-muted', '（条目较多，仅显示前一部分）');
+    more.style.paddingLeft = `${8 + depth * 14}px`;
+    group.appendChild(more);
+  }
+  if (node && node.error) {
+    const failed = el('div', 'ws-row ws-muted', `读取失败：${node.error}`);
+    failed.style.paddingLeft = `${8 + depth * 14}px`;
+    group.appendChild(failed);
+  }
+  return group;
+}
+
+function renderTree() {
+  els.workspaceTree.innerHTML = '';
+  els.workspaceTree.appendChild(buildTreeRows('/', 0));
+}
+
+async function openWorkspaceFile(path) {
+  state.workspace.selected = path;
+  // 展开并加载父目录，让用户能看出「我打开的这份文件在哪」
+  const parent = path.split('/').slice(0, -1).join('/') || '/';
+  state.workspace.expanded[parent] = true;
+  if (!state.workspace.dirs[parent]) await loadDirectory(parent);
+  renderTree();
+
+  els.workspacePreview.innerHTML = '';
+  els.workspacePreview.appendChild(el('div', 'workspace-empty', '加载中…'));
+  try {
+    const response = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`);
+    renderFile(await response.json());
+  } catch (err) {
+    els.workspacePreview.innerHTML = '';
+    els.workspacePreview.appendChild(
+      el('div', 'workspace-empty', `打开失败：${err.message}`)
+    );
+  }
+}
+
+function renderFile(payload) {
+  const box = els.workspacePreview;
+  box.innerHTML = '';
+
+  const head = el('div', 'ws-file-head');
+  head.appendChild(el('div', 'ws-file-name', payload.name));
+  const sub = [formatSize(payload.size)];
+  if (payload.mime_type) sub.push(payload.mime_type);
+  if (payload.truncated) sub.push('仅显示前一部分');
+  head.appendChild(el('div', 'ws-file-sub', sub.filter(Boolean).join(' · ')));
+  box.appendChild(head);
+
+  if (payload.kind === 'image') {
+    const img = document.createElement('img');
+    img.className = 'ws-image';
+    img.src = payload.text; // 后端给的 data URL，仅对图片类型填充
+    img.alt = payload.name;
+    box.appendChild(img);
+    return;
+  }
+  if (payload.kind === 'binary') {
+    box.appendChild(el('div', 'workspace-empty', '这不是文本文件，无法在面板里预览。'));
+    return;
+  }
+  if (payload.kind === 'too_large') {
+    box.appendChild(
+      el('div', 'workspace-empty', '文件过大，未做预览（以免把浏览器卡住）。')
+    );
+    return;
+  }
+  box.appendChild(el('pre', 'ws-text', payload.text || '（空文件）'));
+}
+
+/** 从工具卡片跳到完整输出。 */
+async function showFullOutput(ref) {
+  openWorkspaceModal();
+  await openWorkspaceFile(ref);
+}
+
+function bindWorkspaceEvents() {
+  els.workspaceOpen.addEventListener('click', openWorkspaceModal);
+  els.workspaceClose.addEventListener('click', closeWorkspaceModal);
+  els.workspaceModal.querySelector('.modal-backdrop').addEventListener('click', closeWorkspaceModal);
+}
+
+async function loadAuth() {
     try {
       const cfgResponse = await api('/auth/config');
       const cfg = await cfgResponse.json();
@@ -1159,6 +1346,7 @@
     bindEvents();
     bindAdminEvents();
     bindMemoryEvents();
+    bindWorkspaceEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
     // 让「URL 变化 → 同步界面」成为唯一入口，避免两处逻辑漂移

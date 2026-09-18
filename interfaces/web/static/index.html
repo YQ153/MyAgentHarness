@@ -17,6 +17,8 @@
         <select id="model-select" title="切换模型"></select>
         <!-- 记忆入口对所有人可见：记忆按主体收敛，认证关闭时是本地那一份 -->
         <button id="memory-open" type="button">记忆</button>
+        <!-- 工作区面板：Agent 产出的文件都在这里，只读 -->
+        <button id="workspace-open" type="button">工作区</button>
         <div id="auth-status" class="auth-status"></div>
       </div>
     </header>
@@ -121,6 +123,25 @@
           <button id="memory-refresh" type="button">刷新</button>
         </div>
         <div id="memory-list" class="memory-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 工作区文件面板：数据来自 GET /api/workspace/files 与 /file，只读 -->
+  <div id="workspace-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>工作区</h3>
+        <button id="workspace-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="workspace-hint">
+        Agent 的文件读写、命令产物都落在这个目录里。面板<b>只读</b>——要改动请通过对话让 Agent 做，
+        这样才会经过权限与审批链。
+      </p>
+      <div class="workspace-body">
+        <div class="workspace-tree" id="workspace-tree"></div>
+        <div class="workspace-preview" id="workspace-preview"></div>
       </div>
     </div>
   </div>

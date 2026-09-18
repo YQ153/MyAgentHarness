@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.messages import AIMessageChunk, ToolMessage
@@ -39,11 +40,18 @@ class LangGraphEventTranslator:
     流结束后调用 :meth:`flush` 取出最后一批未拼完的工具调用。
     """
 
-    def __init__(self, *, tool_result_preview_limit: int) -> None:
+    def __init__(
+        self,
+        *,
+        tool_result_preview_limit: int,
+        full_output_capture: Callable[[str, str], str] | None = None,
+    ) -> None:
         """构造翻译器。
 
         Args:
             tool_result_preview_limit: 工具结果预览的字符上限。
+            full_output_capture: 结果被截断时的留存钩子，签名为
+                ``(工具名, 完整文本) -> 引用``。``None`` 表示不留存。
 
         Raises:
             ValueError: ``tool_result_preview_limit`` 不是正整数。
@@ -62,6 +70,7 @@ class LangGraphEventTranslator:
             )
 
         self._preview_limit = tool_result_preview_limit
+        self._full_output_capture = full_output_capture
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._last_node: str | None = None
         self._usage = UsageAccumulator()
@@ -203,26 +212,49 @@ class LangGraphEventTranslator:
 
         content = message.content
         if isinstance(content, str):
+            full_text = content
             preview = content[: self._preview_limit]
             truncated = len(content) > self._preview_limit
         else:
             # WHY 非字符串一律标为已截断：无法确定其文本化后的完整长度，
             # 宁可保守标记，也不要让前端误以为拿到了全部内容。
-            preview = str(content)[: self._preview_limit]
+            full_text = str(content)
+            preview = full_text[: self._preview_limit]
             truncated = True
+
+        name = getattr(message, "name", "") or ""
+        full_output_ref = self._capture_full_output(name, full_text) if truncated else None
 
         events.append(
             AgentEvent(
                 AgentEventType.TOOL_RESULT,
                 {
-                    "name": getattr(message, "name", "") or "",
+                    "name": name,
                     "status": getattr(message, "status", "") or "",
                     "preview": preview,
                     "truncated": truncated,
+                    # 事件里只带引用不带正文：事件会被序列化成 SSE 发给浏览器，
+                    # 把完整正文塞进来等于把预览上限彻底废掉。
+                    "full_output_ref": full_output_ref,
                 },
             )
         )
         return events
+
+    def _capture_full_output(self, tool_name: str, full_text: str) -> str | None:
+        """调用留存钩子，失败时降级为「不留存」。
+
+        WHY 吞掉钩子的异常：留存是旁路能力，它失败不应让一轮已经跑完的对话崩掉——
+        界面少一个「查看完整输出」入口，远好过整轮结果全丢。但必须留日志，
+        否则「为什么没有留存」会变成只能靠猜的问题。
+        """
+        if self._full_output_capture is None:
+            return None
+        try:
+            return self._full_output_capture(tool_name, full_text)
+        except Exception:
+            logger.exception("工具输出留存钩子失败：tool=%s", tool_name)
+            return None
 
     def _on_updates(self, chunk: Any) -> list[AgentEvent]:
         """处理 updates 流：中断请求、节点进度与待办快照。"""
