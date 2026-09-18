@@ -11,11 +11,7 @@ import json
 import logging
 import os
 import secrets
-import time
-import webbrowser
 from typing import TYPE_CHECKING, Any
-
-import httpx
 
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
@@ -181,81 +177,6 @@ async def _validate_api_key_for_cli(
     raise ValueError("HARNESS_API_KEY 无效")
 
 
-async def _authenticate_oidc_device_flow(config: AppConfig) -> str:
-    """通过 OIDC Device Flow 为 CLI 换取 API Key。
-
-    流程：
-    1. CLI 调用 Web 的 ``/auth/device/authorize`` 获得 user_code。
-    2. 提示用户在浏览器中打开验证地址并输入 user_code。
-    3. 按 interval 轮询 ``/auth/device/token``，直到用户批准或超时。
-    4. 返回的 access_token 即 API Key。
-
-    Raises:
-        ValueError: 认证失败或超时。
-    """
-    base_url = config.oidc_device_flow_base_url.rstrip("/")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{base_url}/auth/device/authorize")
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.exception("Device flow 授权请求失败")
-            raise ValueError(f"无法连接认证服务：{exc}") from exc
-
-        auth_info = resp.json()
-        user_code = auth_info.get("user_code", "")
-        verification_uri = auth_info.get(
-            "verification_uri_complete",
-            auth_info.get("verification_uri", f"{base_url}/auth/device/activate"),
-        )
-        device_code = auth_info.get("device_code", "")
-        interval = auth_info.get("interval", config.device_flow_poll_interval_seconds)
-        expires_in = auth_info.get("expires_in", config.device_flow_expires_in_seconds)
-
-        print(f"\n请在浏览器中打开以下地址完成登录：")
-        print(f"  {verification_uri}")
-        print(f"用户授权码：{user_code}\n")
-
-        # WHY 尝试自动打开浏览器：降低 CLI 使用门槛；失败也不影响继续轮询
-        try:
-            webbrowser.open(verification_uri)
-        except Exception:
-            logger.debug("自动打开浏览器失败，已提示用户手动访问")
-
-        deadline = time.monotonic() + expires_in
-        while time.monotonic() < deadline:
-            await asyncio.sleep(interval)
-            try:
-                token_resp = await client.post(
-                    f"{base_url}/auth/device/token",
-                    json={"device_code": device_code},
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("Device flow 轮询失败：%s", exc)
-                continue
-
-            if token_resp.status_code == 200:
-                payload = token_resp.json()
-                access_token = payload.get("access_token")
-                if not access_token:
-                    raise ValueError("Device flow 返回的 access_token 为空")
-                print("认证成功，已获得 API Key。\n")
-                return access_token
-
-            if token_resp.status_code == 400:
-                detail = ""
-                try:
-                    detail = token_resp.json().get("detail", "")
-                except Exception:
-                    pass
-                # authorization_pending 属于正常未批准状态，继续轮询
-                if detail != "authorization_pending":
-                    raise ValueError(f"Device flow 失败：{detail}")
-            # 其它状态码继续轮询
-
-    raise ValueError("Device flow 超时，请重新运行 CLI 并再次批准")
-
-
 async def _build_cli_principal(
     config: AppConfig,
     *,
@@ -265,29 +186,16 @@ async def _build_cli_principal(
 
     - disabled：返回 ``None``，走匿名兼容路径。
     - apikey：必须提供 API Key（``HARNESS_API_KEY``），校验后返回对应主体。
-    - oidc：优先使用 ``HARNESS_API_KEY``；未设置时走 OIDC Device Flow。
     """
     if config.auth_mode == "disabled":
         return None
 
     api_key = os.environ.get("HARNESS_API_KEY", "").strip()
-    if config.auth_mode == "apikey":
-        if not api_key:
-            raise ValueError(
-                "auth_mode=apikey 时，请设置环境变量 HARNESS_API_KEY 后启动 CLI"
-            )
-        return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-
-    if config.auth_mode == "oidc":
-        if api_key:
-            return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-        # WHY Device Flow：CLI 无法跑浏览器做授权码回调，通过后端托管的
-        # device flow 让用户在浏览器里点一次批准，CLI 轮询拿到 API Key。
-        api_key = await _authenticate_oidc_device_flow(config)
-        os.environ["HARNESS_API_KEY"] = api_key
-        return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-
-    return None
+    if not api_key:
+        raise ValueError(
+            "auth_mode=apikey 时，请设置环境变量 HARNESS_API_KEY 后启动 CLI"
+        )
+    return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
 
 
 async def _run_turn(

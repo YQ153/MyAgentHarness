@@ -77,36 +77,6 @@ class APIKeyRepository(Protocol):
         ...
 
 
-class DeviceFlowRepository(Protocol):
-    """CLI 设备授权流程的状态存储能力。"""
-
-    async def create(self, *, expires_in_seconds: int = 600) -> dict[str, Any]:
-        """创建一条 pending 记录，返回 device_code 与 user_code 等字段。"""
-        ...
-
-    async def get_by_device_code(self, device_code: str) -> dict[str, Any] | None:
-        """按 device_code 查询记录。"""
-        ...
-
-    async def get_by_user_code(self, user_code: str) -> dict[str, Any] | None:
-        """按 user_code 查询记录。"""
-        ...
-
-    async def approve(
-        self,
-        user_code: str,
-        *,
-        principal: dict[str, Any],
-        api_key: str,
-    ) -> bool:
-        """批准指定 user_code，返回是否成功。"""
-        ...
-
-    async def cleanup(self, max_age_seconds: int = 86400) -> int:
-        """清理过期记录，返回清理数量。"""
-        ...
-
-
 class RateLimiterPort(Protocol):
     """按 key 的请求限流能力。"""
 

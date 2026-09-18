@@ -36,7 +36,7 @@ def make_config(tmp_path: Path, **overrides: Any) -> AppConfig:
 
     WHY ``_env_file`` 指向不存在的文件而不是 ``None``：pydantic-settings
     中 ``None`` 的语义是「不覆盖 model_config 里的 env_file」，.env 仍会被
-    加载——本机 ``AUTH_MODE=oidc`` 会静默改变测试的权限语义。
+    加载——本机 ``AUTH_MODE=apikey`` 会静默改变测试的权限语义。
 
     Args:
         tmp_path: pytest 提供的临时目录。

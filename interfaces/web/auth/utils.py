@@ -1,7 +1,7 @@
 """认证子包内的通用工具函数。
 
-只包含无状态的纯函数：请求头解析与重定向目标校验。这些函数被 ``audit``、
-``deps``、``flow`` 多个模块共用，独立出来避免它们互相导入。
+只包含无状态的纯函数：请求头解析。这些函数被 ``audit``、``deps`` 等多个模块共用，
+独立出来避免它们互相导入。
 """
 
 from __future__ import annotations
@@ -36,25 +36,6 @@ def client_ip(request: Request) -> str:
 def user_agent(request: Request) -> str:
     """提取 User-Agent，缺失时返回空串。"""
     return request.headers.get("user-agent", "") or ""
-
-
-def safe_next(next_url: str | None) -> str:
-    """校验登录后的跳转目标，防止开放重定向。
-
-    WHY 只允许以单个 ``/`` 开头：``//evil.com`` 会被浏览器解释为协议相对
-    URL 而跳出本站，因此必须同时排除双斜杠开头的情况。
-
-    Args:
-        next_url: 来自查询参数的原始跳转目标。
-
-    Returns:
-        合法的同源路径；非法或为空时返回 ``"/"``。
-    """
-    if not next_url:
-        return "/"
-    if not next_url.startswith("/") or next_url.startswith("//"):
-        return "/"
-    return next_url
 
 
 def bearer_token(request: Request) -> str | None:

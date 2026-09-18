@@ -22,12 +22,12 @@ class Principal:
     """已认证主体的不可变描述。
 
     Args:
-        user_id: 系统内稳定用户标识；OIDC 场景下取 ``sub``，API Key 场景下取 key 前缀。
+        user_id: 系统内稳定用户标识；API Key 场景下取 ``apikey:<key_id>``。
         display_name: 展示名称，可选。
         email: 邮箱，可选。
         role: 角色，决定权限集合。
         scopes: OAuth scope 集合，用于委派场景下的粗粒度校验。
-        auth_method: 认证来源，如 ``cookie``、``apikey``、``oidc``。
+        auth_method: 认证来源，如 ``apikey``、``anonymous``。
     """
 
     user_id: str

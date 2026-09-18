@@ -27,7 +27,6 @@ from config import AppConfig
 from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
-from runtime.device_flow_store import open_device_flow_store
 from runtime.store import open_store
 from runtime.thread_store import open_thread_store
 from runtime.usage_store import open_usage_store
@@ -64,7 +63,6 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         open_thread_store(config.db_path) as thread_store,
         open_audit_store(config.db_path) as audit_store,
         open_api_key_store(config.db_path) as api_key_store,
-        open_device_flow_store(config.db_path) as device_flow_store,
         open_usage_store(config.db_path) as usage_store,
         # WHY 记忆存储也走 ``async with``：它的连接生命周期必须与进程一致，
         # 否则退出时连接留到 GC 才释放，期间该 SQLite 文件可能一直持有锁。
@@ -103,7 +101,6 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             thread_store=thread_store,
             audit_store=audit_store,
             api_key_store=api_key_store,
-            device_flow_store=device_flow_store,
             graph_factory=graph_factory,
             threads=ThreadService(
                 config,

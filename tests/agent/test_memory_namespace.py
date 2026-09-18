@@ -233,7 +233,7 @@ def test_build_agent_requires_store(tmp_path):
 
 
 def test_hashed_owner_reads_back_its_own_pool(tmp_path, monkeypatch):
-    """散列过的标识也要能稳定读写自己的池子（否则 OIDC 用户一写就丢）。"""
+    """散列过的标识也要能稳定读写自己的池子（否则换一种标识来源就会一写就丢）。"""
     store = InMemoryStore()
     backend = build_backend(_config(tmp_path), store)
     runtime = _Runtime(AgentRunContext("auth0|abc"))

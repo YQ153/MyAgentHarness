@@ -17,7 +17,6 @@ from fastapi.staticfiles import StaticFiles
 from bootstrap.core import build_app_context
 from bootstrap.web import (
     build_audit_retention_worker,
-    build_http_client,
     build_rate_limiter,
     build_run_governance_worker,
 )
@@ -44,21 +43,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     config: AppConfig = app.state.config
 
     async with build_app_context(config) as context:
-        # WHY http_client 与 rate_limiter 不放进 AppContext：它们只有 Web 形态
-        # 需要，放进共享上下文会让 CLI 承担无谓的构造开销。
-        http_client = build_http_client()
+        # WHY rate_limiter 不放进 AppContext：它只有 Web 形态需要，
+        # 放进共享上下文会让 CLI 承担无谓的构造开销。
         rate_limiter = build_rate_limiter(config)
 
-        # WHY 清理过期 device flow 记录：CLI 轮询产生的过期 code 若不清理，
-        # 该表会随服务运行时长单调增长。
-        try:
-            await context.device_flow_store.cleanup()
-        except Exception:
-            logger.exception("device flow 过期记录清理失败，不影响服务启动")
-
-        # WHY 整个启动段都包在 try/finally 里：http_client 与后台任务都在
-        # yield 之前创建，若构造阶段抛错而不进 finally，这两者会连同已装配的
-        # 连接一起泄漏。
+        # WHY 整个启动段都包在 try/finally 里：后台任务在 yield 之前创建，
+        # 若构造阶段抛错而不进 finally，它们会连同已装配的连接一起泄漏。
         retention_worker = None
         governance_worker = None
         try:
@@ -83,10 +73,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
             # 保持既有路由代码不变。
             app.state.context = context
-            app.state.http_client = http_client
             app.state.rate_limiter = rate_limiter
             app.state.api_key_store = context.api_key_store
-            app.state.device_flow_store = context.device_flow_store
             app.state.threads = context.threads
             app.state.workspace = context.workspace
             app.state.runs = context.runs
@@ -113,7 +101,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await retention_worker.stop()
                 except Exception:
                     logger.exception("审计保留清理任务停止失败")
-            await http_client.aclose()
+            await _close_background_workers()
             logger.info("Web 服务已停止")
 
 

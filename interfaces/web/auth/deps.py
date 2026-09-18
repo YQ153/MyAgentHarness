@@ -21,7 +21,6 @@ from application.principal import (
 )
 from config import AppConfig
 from interfaces.web.auth.audit import log_auth_event
-from interfaces.web.auth.session import get_session
 from interfaces.web.auth.utils import bearer_token, client_ip
 
 logger = logging.getLogger(__name__)
@@ -51,9 +50,8 @@ def enforce_rate_limit(request: Request) -> None:
 async def get_principal(request: Request) -> Principal | None:
     """提取当前请求的认证主体。
 
-    - ``disabled`` 模式：返回匿名管理员主体，保持原有行为。
-    - ``apikey`` 模式：从请求头读取 API Key，失败时回退到会话 Cookie。
-    - ``oidc`` 模式：读取本地会话 Cookie。
+    - ``disabled`` 模式：返回匿名管理员主体（仅推荐本地开发）。
+    - ``apikey`` 模式：从配置的请求头或 ``Authorization: Bearer`` 读取 API Key。
 
     Args:
         request: 当前请求。
@@ -70,15 +68,6 @@ async def get_principal(request: Request) -> Principal | None:
         api_key = request.headers.get(config.auth_api_key_header) or bearer_token(request)
         if api_key:
             return await _validate_api_key(request, api_key)
-        session = get_session(request)
-        if session:
-            return _principal_from_session(session)
-        return None
-
-    if config.auth_mode == "oidc":
-        session = get_session(request)
-        if session:
-            return _principal_from_session(session)
         return None
 
     logger.warning("未知的 auth_mode：%s，按未认证处理", config.auth_mode)
@@ -151,18 +140,6 @@ async def _validate_api_key(request: Request, api_key: str) -> Principal | None:
         role=record["role"],
         scopes=frozenset((record.get("scopes") or "").split()),
         auth_method="apikey",
-    )
-
-
-def _principal_from_session(session: dict[str, Any]) -> Principal:
-    """把会话数据还原为 ``Principal``。"""
-    return Principal(
-        user_id=session["user_id"],
-        display_name=session.get("display_name", ""),
-        email=session.get("email", ""),
-        role=session.get("role", "member"),
-        scopes=frozenset(session.get("scopes", [])),
-        auth_method=session.get("auth_method", "cookie"),
     )
 
 

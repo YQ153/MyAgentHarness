@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
     # 只绑回环：默认不把 Agent 暴露到局域网。要让别的机器访问时改成 "8000:8000"，
-    # 并同时确认 AUTH_MODE 与 AUTH_SESSION_SECRET 都已按生产要求设置。
+    # 并同时确认 AUTH_MODE=apikey 且已通过 /auth/api-keys 下发可轮换的 Key。
     ports:
       - "127.0.0.1:8000:8000"
 
@@ -26,8 +26,8 @@ services:
       # 容器内必须监听 0.0.0.0，否则端口映射连不上（127.0.0.1 只对容器自己可见）
       HOST: 0.0.0.0
       PORT: "8000"
-      # 默认 apikey；把 .env 里的 AUTH_MODE 改成 oidc 并带上 --profile oidc 即切换到
-      # 本项目自带的 Authentik（见 docker-compose.yml 末尾的 oidc 档位与 README）。
+      # 默认 apikey：容器会把端口映射到宿主机，网络边界比本机进程宽得多。
+      # 允许由 .env 覆盖，便于本机临时用 disabled 做一次性排查。
       AUTH_MODE: ${AUTH_MODE:-apikey}
       DB_PATH: /app/.data/agent.db
       WORKSPACE: /app/workspace
@@ -49,107 +49,6 @@ services:
     # 探活沿用镜像内的 HEALTHCHECK（打 /health）。此处不重复声明：
     # 同一个判据写在两处，改一处忘一处时编排行为会与文档分叉。
 
-    networks:
-      - default
-      # 与 IdP 同网络：OIDC 的 token / JWKS 请求由容器自己发出，必须能解析到 provider。
-      # 只要 IdP 没起（无 --profile oidc），这里就是一个空网络，不影响默认路径。
-      - oidc
-
-  # ---------------------------------------------------------------- IdP 档位（可选）
-  # 用 `docker compose --profile oidc up -d` 才会启动。默认 `up` 只有 agent 一个服务，
-  # 这是刻意的：一个 1.9 GB 的 IdP 不该在只想聊两句时被拉起来。
-  #
-  # 结构与版本复刻自一份已被证明能 healthy 的既有部署（server / worker / postgresql，
-  # 不需要 Redis），两处刻意的改动：
-  #   1. 不挂 docker.sock —— 挂进容器等于把宿主的 root 交出去，而它只服务于 outpost，
-  #      本部署没有 outpost；
-  #   2. 数据用命名卷而非绑定挂载 —— 与本文件其余卷一致，也避开 Windows 绑定挂载的属主问题。
-  postgresql:
-    profiles: [oidc]
-    image: docker.io/library/postgres:16-alpine
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      POSTGRES_DB: ${PG_DB:-authentik}
-      POSTGRES_USER: ${PG_USER:-authentik}
-      POSTGRES_PASSWORD: ${PG_PASS:?PG_PASS 必须设置：IdP 的数据库密码}
-    healthcheck:
-      # WHY 探 pg_isready 而不是端口：postgres 完成初始化前端口就已经在监听了，
-      # 那时 server 连上去必然失败；靠这个探针把「初始化完成」与「进程起来了」分开。
-      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    volumes:
-      - authentik-database:/var/lib/postgresql/data
-    networks:
-      - oidc
-
-  # 对外提供 OIDC 声明与登录页
-  server:
-    profiles: [oidc]
-    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.2}
-    command: server
-    restart: unless-stopped
-    shm_size: 512mb
-    env_file:
-      - .env
-    environment:
-      AUTHENTIK_POSTGRESQL__HOST: postgresql
-      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
-      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
-      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?PG_PASS 必须设置}
-      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?AUTHENTIK_SECRET_KEY 必须设置}
-    depends_on:
-      postgresql:
-        condition: service_healthy
-    ports:
-      # WHY 绑所有网卡而不是回环：OIDC 的 issuer 必须是一个**浏览器与容器都解析得到、
-      # 且不被本机代理接走**的名字。实测这个集合里只剩宿主的地址：容器里的「回环」是它
-      # 自己（127.0.0.1 到不了宿主），而任何带点的域名会被本机代理拦下（实测 502）。
-      # 因此以宿主地址作 issuer，端口就必须对外可达——这与既有部署的暴露面一致
-      # （原编排同样绑 0.0.0.0）。要收回局域网暴露的做法见 README「容器化运行」。
-      - "${COMPOSE_PORT_HTTP:-9000}:9000"
-      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
-    volumes:
-      - authentik-data:/data
-      - authentik-templates:/templates
-    networks:
-      - oidc
-
-  # 后台任务（迁移、通知、清理）。不给它端口：它不对外提供服务
-  worker:
-    profiles: [oidc]
-    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.2}
-    command: worker
-    restart: unless-stopped
-    shm_size: 512mb
-    env_file:
-      - .env
-    environment:
-      AUTHENTIK_POSTGRESQL__HOST: postgresql
-      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
-      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
-      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?PG_PASS 必须设置}
-      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?AUTHENTIK_SECRET_KEY 必须设置}
-    depends_on:
-      postgresql:
-        condition: service_healthy
-    volumes:
-      - authentik-data:/data
-    networks:
-      - oidc
-
-networks:
-  # 专供 agent ↔ IdP 的内部网络。没有 IdP 时它也存在，但只有 agent 一个成员。
-  oidc:
-    driver: bridge
-
 volumes:
   agent-data:
   agent-workspace:
-  authentik-database:
-  authentik-data:
-  authentik-templates:

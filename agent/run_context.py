@@ -49,7 +49,7 @@ _NAMESPACE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 
 与 deepagents ``StoreBackend._validate_namespace`` 的规则保持一致：它会在
 每次读写时校验命名空间，含非法字符则抛 ``ValueError``——而那条路径是工具
-调用，报错表现为「Agent 写不了记忆」，与真实原因（某个 OIDC ``sub`` 里有个
+    调用，报错表现为「Agent 写不了记忆」，与真实原因（某个标识里有个
 ``|``）相距甚远。对齐方式见 ``tests/agent/test_memory_namespace.py``：用例
 直接拿 deepagents 的校验函数验证本模块的输出。
 """

@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from config import AppConfig
     from runtime.api_key_store import APIKeyStore
     from runtime.audit_store import AuditStore
-    from runtime.device_flow_store import DeviceFlowStore
     from runtime.thread_store import ThreadMetaStore
     from runtime.usage_store import UsageStore
 
@@ -39,7 +38,6 @@ class AppContext:
         thread_store: 会话元数据存储。
         audit_store: 审计日志存储。
         api_key_store: API Key 存储。
-        device_flow_store: CLI 设备授权流程状态存储。
         graph_factory: 按模型别名提供已装配图的工厂。
         threads: 会话元数据服务。
         runs: 运行推进服务。
@@ -57,7 +55,6 @@ class AppContext:
     thread_store: ThreadMetaStore
     audit_store: AuditStore
     api_key_store: APIKeyStore
-    device_flow_store: DeviceFlowStore
     graph_factory: AgentFactory
     threads: ThreadService
     runs: RunService

@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--owner-id",
         required=True,
-        help="目标所有者标识，例如 oidc 用户的 sub 或 apikey:dev",
+        help="目标所有者标识，例如 apikey:dev 或 apikey:<key_id>",
     )
     parser.add_argument(
         "--dry-run",

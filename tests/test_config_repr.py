@@ -23,9 +23,7 @@ _SECRETS: dict[str, str] = {
     "deepseek_api_key": "sk-deepseek-PLAINTEXT-0001",
     "openai_api_key": "sk-openai-PLAINTEXT-0002",
     "anthropic_api_key": "sk-ant-PLAINTEXT-0003",
-    "auth_session_secret": "session-PLAINTEXT-0004-0123456789abcdef",
     "auth_api_key_dev": "devkey-PLAINTEXT-0005",
-    "oidc_client_secret": "oidc-PLAINTEXT-0006",
 }
 """每个字段一个独特且可 grep 的明文哨兵，失败时能一眼看出是哪个字段漏了。"""
 

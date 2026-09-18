@@ -191,55 +191,6 @@ docker compose exec -e HARNESS_API_KEY="$AUTH_API_KEY_DEV" agent python main.py 
 
 Web 接口在同一个容器里，无需另起进程。
 
-#### 可选：自带的 Authentik（OIDC 登录）
-
-`oidc` 档位会在同一个编排里再起一套 Authentik（`server` + `worker` + `postgresql`，
-版本钉在 `2026.8.2`；实测这套配置**不需要 Redis**）。默认不启动——一个近 2 GB 的 IdP
-不该在只想聊两句时被拉起来。
-
-```bash
-# 1) .env 里打开 OIDC，并把 issuer 指向本机地址（下面解释为什么必须是地址）
-AUTH_MODE=oidc
-OIDC_ISSUER=http://<本机局域网地址>:9000/application/o/myagentharness/
-
-# 2) 起 IdP + 应用
-docker compose --profile oidc up -d
-
-# 3) 在 IdP 里声明应用与提供方（可重复执行）
-docker compose --profile oidc cp scripts/bootstrap_authentik.py server:/tmp/bootstrap_authentik.py
-docker compose --profile oidc exec -T server ak shell -c "exec(open('/tmp/bootstrap_authentik.py').read())"
-```
-
-然后浏览器打开 `http://localhost:8000` 点登录，用 **`akadmin`** 登录——初始密码在 `.env`
-的 `AUTHENTIK_BOOTSTRAP_PASSWORD`（首次启动时生成，请按密钥对待）。
-
-##### issuer 为什么必须是本机地址
-
-OIDC 的 discovery 文档里，`authorization_endpoint` 给**浏览器**用、`token_endpoint` 与
-`jwks_uri` 给**容器**用，而它们是同一个 host——所以这个 host 必须两侧都解析得到。
-实测三种取法（Authentik 未设品牌域名时，issuer 跟随请求 Host）：
-
-| issuer 里的 host | 浏览器 | 容器 | 结果 |
-| --- | --- | --- | --- |
-| `127.0.0.1` | ✓（且绕过本机代理） | ✗ 容器里的回环是它自己 | 不可用 |
-| `xxx.localtest.me`（解析到回环的公共通配域名） | ✗ 被本机代理接走（实测 502） | ✓ | 不可用 |
-| `<本机局域网地址>` | ✓（`192.168.*` 等私有段默认在代理绕过列表里） | ✓ | **可用** |
-
-代价是 IdP 的登录页监听在宿主所有网卡上（这与既有部署一致：原编排同样绑 `0.0.0.0`）。
-要收回局域网暴露，给它一个专用名字并同时绕过代理：在 hosts 里加
-`127.0.0.1 authentik.local`，在「Internet 选项 → 代理 → 不走代理的地址」里加
-`authentik.local`，然后改用 `OIDC_ISSUER=http://authentik.local:9000/...`。
-
-##### 已验证到什么程度
-
-已验证：容器能取到 discovery 且 issuer 与配置逐字符一致；`/auth/login` 会 307 到
-Authentik 的授权地址（带 PKCE/nonce/state）；IdP 接受该请求并 302 进入登录流程。
-**未验证**：在浏览器里实际输入用户名密码完成整条登录链——那一步需要你的凭据。
-
-过程中一处只有真机才会暴露的坑已写进 `scripts/bootstrap_authentik.py` 的注释：用 ORM 直接
-创建的提供方 `grant_types` 是空列表（界面上是勾选项），授权码流程会被 IdP 拒绝，
-而调用方只看到一句 `invalid_request`。
-
 #### 一次性维护命令
 
 ```bash

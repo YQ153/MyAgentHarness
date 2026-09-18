@@ -131,11 +131,10 @@
   async function api(path, options) {
     const response = await fetch(path, options);
     if (!response.ok) {
-      // WHY 认证模式下 401 直接跳转登录页：SSE / fetch 的 401 不便展示登录弹窗，
-      // 让浏览器走完整 OIDC 授权码流程是最稳的做法；disabled 模式下保持原错误提示。
-      if (response.status === 401 && state.auth.mode !== 'disabled') {
-        window.location.href = state.auth.login_url || '/auth/login';
-        throw new Error('未认证，即将跳转登录页');
+      // WHY 401 不跳任何登录页：凭据由调用方持有（客户端保存 API Key），
+      // 服务端没有登录页可跳；把「未认证」如实报出来，比跳到一个不存在的地址更有用。
+      if (response.status === 401) {
+        throw new Error('未认证：请在请求头带上有效的 API Key');
       }
       let detail = `HTTP ${response.status}`;
       try {
@@ -1064,9 +1063,7 @@
 
     const principal = state.auth.principal;
     if (!principal) {
-      const login = el('a', 'auth-link', '登录');
-      login.href = state.auth.login_url || '/auth/login';
-      container.appendChild(login);
+      // 没有登录入口：apikey 模式下凭据由调用方自己携带
       return;
     }
 
@@ -1568,7 +1565,6 @@ async function loadAuth() {
       const cfgResponse = await api('/auth/config');
       const cfg = await cfgResponse.json();
       state.auth.mode = cfg.auth_mode || 'disabled';
-      state.auth.login_url = cfg.login_url;
 
       if (state.auth.mode !== 'disabled') {
         try {
