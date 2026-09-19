@@ -64,6 +64,17 @@
     workspaceClose: document.getElementById('workspace-close'),
     workspaceTree: document.getElementById('workspace-tree'),
     workspacePreview: document.getElementById('workspace-preview'),
+    knowledgeOpen: document.getElementById('knowledge-open'),
+    knowledgeModal: document.getElementById('knowledge-modal'),
+    knowledgeClose: document.getElementById('knowledge-close'),
+    knowledgeRefresh: document.getElementById('knowledge-refresh'),
+    knowledgeIndex: document.getElementById('knowledge-index'),
+    knowledgeCaps: document.getElementById('knowledge-caps'),
+    knowledgeList: document.getElementById('knowledge-list'),
+    attach: document.getElementById('attach'),
+    attachInput: document.getElementById('attach-input'),
+    attachmentStrip: document.getElementById('attachment-strip'),
+    attachmentHint: document.getElementById('attachment-hint'),
   };
 
   const state = {
@@ -96,6 +107,18 @@
     editTarget: null,
     /** 正在查看的分支标识；null 表示会话的当前分支。 */
     branch: null,
+    /**
+     * 待发送附件：{file, url, status, id, error}。
+     *
+     * WHY 保存在本地而不是选完就上传：草稿态还没有会话（会话在首条消息发出时
+     * 才诞生），而上传接口的路径里必须带会话 ID。等到发送时再传，既避免了
+     * 提前建会话，也让「取消发送」不会在工作区里留下孤儿附件。
+     */
+    attachments: [],
+    /** 附件上限；来自 /api/attachments/limits。取不到时为 null，此时不做本地预校验。 */
+    attachLimits: null,
+    /** 模型别名 → 是否接受图片输入；来自 /api/models。 */
+    modelVision: {},
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -602,12 +625,20 @@
       const content = typeof message.content === 'string' ? message.content : '';
 
       if (role === 'human') {
-        const bubble = el('div', 'msg user', content);
+        const refs = (message.attachments || []).map((item) => ({
+          path: item.path,
+          alt: item.filename,
+        }));
+        const bubble = el('div', 'msg user');
+        if (refs.length) bubble.appendChild(renderAttachmentThumbs(refs));
+        if (content) bubble.appendChild(el('div', 'user-text', content));
         // WHY 用渲染下标当 message_index：历史按后端同一顺序渲染，两边不必再对一次 id
         const edit = el('span', 'msg-action', '编辑');
         edit.addEventListener('click', () => beginEdit(order, content));
         bubble.appendChild(edit);
         els.messages.appendChild(bubble);
+        // WHY 先渲染再逐张取图：等所有图片取完才渲染会让一段长历史卡在一个慢请求上
+        if (refs.length) loadHistoryAttachmentImages(bubble, refs);
         return;
       }
 
@@ -906,6 +937,232 @@
     }
   }
 
+  /* ------------------------------------------------------------------ 附件 */
+
+  async function loadAttachmentLimits() {
+    try {
+      const response = await api('/api/attachments/limits');
+      state.attachLimits = await response.json();
+    } catch (err) {
+      // WHY 拿不到上限不挡住发消息：本地预校验只是为了省一次往返，真正的判定
+      // 始终在服务端。把「上限查询失败」升级成「不能发消息」是拿一个次要故障
+      // 换掉主要功能。
+      state.attachLimits = null;
+    }
+  }
+
+  function applyLocalValidation(entry) {
+    const limits = state.attachLimits;
+    if (!limits) {
+      entry.status = 'ready';
+      entry.error = '';
+      return;
+    }
+    if (entry.file.size > limits.max_bytes) {
+      entry.status = 'failed';
+      entry.error = `超过 ${Math.round(limits.max_bytes / 1024)} KB`;
+      return;
+    }
+    if (limits.allowed_mime_types.indexOf(entry.file.type) < 0) {
+      entry.status = 'failed';
+      entry.error = '不支持的类型';
+      return;
+    }
+    entry.status = 'ready';
+    entry.error = '';
+  }
+
+  function pickFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+
+    const limits = state.attachLimits;
+    const max = limits ? limits.max_per_thread : Infinity;
+    files.forEach((file) => {
+      const entry = {
+        file: file,
+        url: URL.createObjectURL(file),
+        status: 'ready',
+        id: null,
+        error: '',
+      };
+      // 张数上限在选中时就要判：否则用户会一路选到发送时才被告知「太多了」
+      if (state.attachments.length >= max) {
+        entry.status = 'failed';
+        entry.error = `最多 ${max} 张`;
+      } else {
+        applyLocalValidation(entry);
+      }
+      state.attachments.push(entry);
+    });
+    renderAttachmentStrip();
+  }
+
+  function retryAttachment(index) {
+    const entry = state.attachments[index];
+    if (!entry) return;
+    applyLocalValidation(entry);
+    renderAttachmentStrip();
+  }
+
+  function removeAttachment(index) {
+    const entry = state.attachments[index];
+    if (!entry) return;
+    // 只有从未上传成功的条目才回收 object URL：已发送的条目其 URL 正被消息
+    // 气泡里的 <img> 引用着，回收会让那条消息的图片当场变成裂图
+    if (entry.status !== 'uploaded') URL.revokeObjectURL(entry.url);
+    state.attachments.splice(index, 1);
+    renderAttachmentStrip();
+  }
+
+  function renderAttachmentStrip() {
+    const strip = els.attachmentStrip;
+    strip.innerHTML = '';
+    if (!state.attachments.length) {
+      strip.hidden = true;
+      return;
+    }
+    strip.hidden = false;
+
+    state.attachments.forEach((entry, index) => {
+      const chip = el('div', 'attach-chip' + (entry.status === 'failed' ? ' failed' : ''));
+      const img = el('img');
+      img.src = entry.url;
+      img.alt = entry.file.name;
+      chip.appendChild(img);
+
+      const remove = el('button', 'attach-remove', '×');
+      remove.type = 'button';
+      remove.title = '移除';
+      remove.addEventListener('click', () => removeAttachment(index));
+      chip.appendChild(remove);
+
+      if (entry.status === 'failed') {
+        const retry = el('button', 'attach-retry', '↻');
+        retry.type = 'button';
+        retry.title = '重试';
+        retry.addEventListener('click', () => retryAttachment(index));
+        chip.appendChild(retry);
+        chip.appendChild(el('div', 'attach-state', entry.error || '失败'));
+      } else if (entry.status === 'uploading') {
+        chip.appendChild(el('div', 'attach-state', '上传中'));
+      }
+      strip.appendChild(chip);
+    });
+  }
+
+  async function uploadOne(threadId, entry) {
+    const form = new FormData();
+    form.append('file', entry.file, entry.file.name);
+    // WHY 不手写 Content-Type：multipart 的 boundary 必须由浏览器生成，自己拼头
+    // 会得到一个缺 boundary 的类型串，服务端解析直接失败。
+    const response = await api(`/api/threads/${threadId}/attachments`, {
+      method: 'POST',
+      body: form,
+    });
+    return response.json();
+  }
+
+  async function uploadPendingAttachments(threadId) {
+    const pending = state.attachments.filter((entry) => !entry.id);
+    for (const entry of pending) {
+      if (entry.status === 'failed') {
+        throw new Error(`附件「${entry.file.name}」未通过校验：${entry.error}`);
+      }
+      entry.status = 'uploading';
+      renderAttachmentStrip();
+      try {
+        const info = await uploadOne(threadId, entry);
+        entry.id = info.id;
+        entry.status = 'uploaded';
+      } catch (err) {
+        entry.status = 'failed';
+        entry.error = err.message || '上传失败';
+        renderAttachmentStrip();
+        throw new Error(`附件「${entry.file.name}」上传失败：${entry.error}`);
+      }
+    }
+    renderAttachmentStrip();
+    return state.attachments.map((entry) => entry.id).filter(Boolean);
+  }
+
+  function currentModelName() {
+    return els.modelSelect.value || '';
+  }
+
+  function updateAttachAvailability() {
+    const names = Object.keys(state.modelVision);
+    const name = currentModelName();
+    const capable = names.filter((key) => state.modelVision[key]);
+    const hint = els.attachmentHint;
+
+    if (names.length && state.modelVision[name] !== true) {
+      els.attach.disabled = true;
+      els.attach.title = '当前模型不支持图片输入';
+      hint.hidden = false;
+      hint.className = 'composer-hint warn';
+      hint.textContent = capable.length
+        ? `当前模型 ${name} 不支持图片输入，请切换到 ${capable.join(' / ')}`
+        : '当前没有支持图片输入的模型（见 VISION_MODEL_ALIASES）';
+      return;
+    }
+
+    els.attach.disabled = false;
+    els.attach.title = '添加图片';
+    hint.hidden = true;
+    hint.textContent = '';
+  }
+
+  function renderAttachmentThumbs(items) {
+    const box = el('div', 'msg-attachments');
+    items.forEach((item) => {
+      const img = el('img');
+      // WHY 允许 src 为空：历史消息的图片要按虚拟路径现取，先占位再回填，
+      // 否则得等所有图片取完才渲染（一张慢就把整段历史卡住）。
+      if (item.src) img.src = item.src;
+      img.alt = item.alt || '附件';
+      box.appendChild(img);
+    });
+    return box;
+  }
+
+  function renderUserBubble(content, attachments) {
+    const bubble = el('div', 'msg user');
+    if (attachments && attachments.length) {
+      bubble.appendChild(
+        renderAttachmentThumbs(
+          attachments.map((entry) => ({ src: entry.url, alt: entry.file.name }))
+        )
+      );
+    }
+    if (content) bubble.appendChild(el('div', 'user-text', content));
+    els.messages.appendChild(bubble);
+    scrollToBottom();
+    return bubble;
+  }
+
+  /** 历史消息里的附件按虚拟路径取回内容，逐张回填（失败只影响那一张）。 */
+  async function loadHistoryAttachmentImages(container, refs) {
+    const images = container.querySelectorAll('.msg-attachments img');
+    for (let index = 0; index < refs.length; index += 1) {
+      const target = images[index];
+      if (!target) continue;
+      try {
+        const response = await api(
+          '/api/workspace/file?path=' + encodeURIComponent(refs[index].path)
+        );
+        const payload = await response.json();
+        if (payload.kind === 'image' && payload.text) {
+          target.src = payload.text;
+        } else {
+          target.alt = `${refs[index].alt || '附件'}（已不可预览）`;
+        }
+      } catch (err) {
+        target.alt = '附件加载失败';
+      }
+    }
+  }
+
   /* ------------------------------------------------------------------ 交互 */
 
   async function send() {
@@ -924,24 +1181,45 @@
       const hint = els.messages.querySelector('.thread-empty');
       if (hint) hint.remove();
 
-      els.messages.appendChild(el('div', 'msg user', content));
+      const editing = state.editTarget;
+      // WHY 附件先传再发：上传失败就不该发出这条消息。反过来（先发消息再补图）会
+      // 留下一条「发出去了但图没带上」的记录，而那看起来像模型没看懂图。
+      // 编辑与重新生成不带附件——它们是从历史检查点分叉，附件已在原消息里。
+      let attachmentIds = [];
+      let sentAttachments = [];
+      if (editing === null && state.attachments.length) {
+        attachmentIds = await uploadPendingAttachments(state.threadId);
+        sentAttachments = state.attachments.slice();
+      }
+
+      renderUserBubble(content, sentAttachments);
       els.input.value = '';
       els.input.style.height = 'auto';
-      scrollToBottom();
 
-      const editing = state.editTarget;
       const response = await submitRun(
         editing === null
           ? `/api/threads/${state.threadId}/runs`
           : `/api/threads/${state.threadId}/edit`,
         editing === null
-          ? { content: content, model: els.modelSelect.value || null }
+          ? {
+              content: content,
+              model: els.modelSelect.value || null,
+              attachment_ids: attachmentIds,
+            }
           : {
               message_index: editing,
               content: content,
               model: els.modelSelect.value || null,
             }
       );
+
+      if (sentAttachments.length) {
+        // WHY 不回收这些 object URL：上面那条用户气泡的缩略图正引用着它们。
+        // 置空只为清掉输入区的待发送列表。
+        state.attachments = [];
+        renderAttachmentStrip();
+      }
+
       await handleStream(response);
       // WHY 分叉后重载而不是就地拼接：编辑与重新生成会切到一条**新的**分支，
       // 就地拼出来的画面仍是旧分支的历史加上新回复，看着像接错了上下文。
@@ -1061,11 +1339,16 @@
       const response = await api('/api/models');
       const models = await response.json();
       els.modelSelect.innerHTML = '';
+      state.modelVision = {};
       models.forEach((item) => {
         const option = el('option', null, `${item.name} (${item.provider})`);
         option.value = item.name;
         els.modelSelect.appendChild(option);
+        state.modelVision[item.name] = item.supports_vision === true;
       });
+      // 能力表一变，上传入口的可用性就得跟着变：否则新挂上的纯文本模型仍会显示
+      // 「＋」按钮，用户点了才发现不行。
+      updateAttachAvailability();
     } catch (err) {
       appendError('模型列表加载失败：' + err.message);
     }
@@ -1074,6 +1357,26 @@
   function bindEvents() {
     els.send.addEventListener('click', send);
     els.stop.addEventListener('click', stopRun);
+
+    els.attach.addEventListener('click', () => els.attachInput.click());
+    els.attachInput.addEventListener('change', () => {
+      pickFiles(els.attachInput.files);
+      // WHY 每次选完清空 input.value：不清的话连续选同一个文件不会再触发 change
+      // 事件，「重试」也就无从谈起。
+      els.attachInput.value = '';
+    });
+    els.modelSelect.addEventListener('change', updateAttachAvailability);
+
+    // 拖拽落点覆盖消息区与输入区：只认其中一个会让「拖到对话框上」变成浏览器
+    // 直接打开该文件。必须 preventDefault 才能接管这个默认行为。
+    [els.messages, els.attachmentStrip].forEach((target) => {
+      target.addEventListener('dragover', (event) => event.preventDefault());
+      target.addEventListener('drop', (event) => {
+        event.preventDefault();
+        if (els.attach.disabled) return;
+        pickFiles(event.dataTransfer && event.dataTransfer.files);
+      });
+    });
 
     els.input.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {
@@ -1524,6 +1827,145 @@
     els.memoryModal.querySelector('.modal-backdrop').addEventListener('click', closeMemoryModal);
   }
 
+  /* ------------------------------------------------------------------ 知识库面板 */
+
+  function openKnowledgeModal() {
+    els.knowledgeModal.style.display = '';
+    loadKnowledge();
+  }
+
+  function closeKnowledgeModal() {
+    els.knowledgeModal.style.display = 'none';
+  }
+
+  async function loadKnowledge() {
+    els.knowledgeList.innerHTML = '';
+    els.knowledgeList.appendChild(el('div', 'knowledge-empty', '加载中…'));
+    try {
+      const response = await api('/api/knowledge');
+      state.knowledge = await response.json();
+      renderKnowledge();
+    } catch (err) {
+      state.knowledge = null;
+      els.knowledgeCaps.innerHTML = '';
+      els.knowledgeList.innerHTML = '';
+      els.knowledgeList.appendChild(el('div', 'knowledge-empty', `加载失败：${err.message}`));
+    }
+  }
+
+  function renderKnowledge() {
+    const payload = state.knowledge;
+    if (!payload) return;
+    const caps = payload.capabilities || {};
+    const stats = payload.stats || {};
+
+    // 能力条：把「这次到底走不走语义」摆出来。面板若只显示文档清单，用户会以为
+    // 检索一直是语义的——而 EMBEDDING_BACKEND=none 时它只是关键词匹配。
+    els.knowledgeCaps.innerHTML = '';
+    els.knowledgeCaps.appendChild(
+      el(
+        'span',
+        'knowledge-chip',
+        caps.vector_enabled
+          ? `语义检索：${caps.embedding_backend || '已启用'}`
+          : '语义检索：未启用（仅关键词）'
+      )
+    );
+    els.knowledgeCaps.appendChild(
+      el('span', 'knowledge-chip', `分块 ${caps.chunk_chars} 字 · 重叠 ${caps.chunk_overlap_chars} 字`)
+    );
+    els.knowledgeCaps.appendChild(el('span', 'knowledge-chip', `检索返回 ${caps.top_k} 条`));
+
+    els.knowledgeList.innerHTML = '';
+    els.knowledgeList.appendChild(
+      el(
+        'div',
+        'knowledge-stats',
+        `已索引 ${stats.document_count || 0} 份文档 · ${stats.chunk_count || 0} 个分块 · ${stats.vector_count || 0} 条向量`
+      )
+    );
+
+    const items = payload.items || [];
+    if (!items.length) {
+      els.knowledgeList.appendChild(
+        el(
+          'div',
+          'knowledge-empty',
+          '还没有索引任何文档。点「索引工作区」把工作区里的 Markdown、笔记与代码注释收进来。'
+        )
+      );
+      return;
+    }
+
+    items.forEach((item) => {
+      const row = el('div', 'knowledge-row');
+      const main = el('div', 'knowledge-main');
+      main.appendChild(el('div', 'knowledge-path', item.source_path));
+      main.appendChild(
+        el('div', 'knowledge-sub', `${item.chunk_count} 个分块 · ${formatTime(item.indexed_at)}`)
+      );
+      row.appendChild(main);
+
+      const remove = el('button', 'danger small', '移除');
+      remove.type = 'button';
+      remove.addEventListener('click', () => removeKnowledge(item));
+      row.appendChild(remove);
+      els.knowledgeList.appendChild(row);
+    });
+  }
+
+  async function indexKnowledge() {
+    // WHY 在请求期间禁用按钮：一次整区索引可能要调用几百次嵌入，重复点击会并发起
+    // 多份相同的工作，而它们之间没有任何互斥。
+    els.knowledgeIndex.disabled = true;
+    try {
+      const response = await api('/api/knowledge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const summary = await response.json();
+      // WHY 把「跳过」也报出来：索引 3 个与跳过 3 个是完全不同的结果，只报成功的
+      // 数字会让用户以为全都进去了，之后检索不到又无从解释。
+      const parts = [
+        `扫描 ${summary.scanned} 个文件`,
+        `新索引 ${summary.indexed} 个`,
+        `未变化 ${summary.unchanged} 个`,
+      ];
+      if (summary.empty) parts.push(`无可索引内容 ${summary.empty} 个`);
+      if (summary.skipped) parts.push(`跳过 ${summary.skipped} 个`);
+      window.alert(`${parts.join('，')}。`);
+      await loadKnowledge();
+    } catch (err) {
+      window.alert(`索引失败：${err.message}`);
+    } finally {
+      els.knowledgeIndex.disabled = false;
+    }
+  }
+
+  async function removeKnowledge(item) {
+    // 二次确认与记忆面板同一理由：移除后 Agent 就检索不到这份文档了，而这一步不可撤销。
+    if (!window.confirm(`从知识库移除这份文档？\n${item.source_path}\n\n工作区里的源文件不会被删除。`)) {
+      return;
+    }
+    try {
+      // WHY 用查询参数而不是路径段：虚拟路径本身含 `/`，放进路径段要靠百分号编码
+      // 才能传对，而那正是最容易写错、且在日志里最难辨认的写法。
+      await api(`/api/knowledge?path=${encodeURIComponent(item.source_path)}`, { method: 'DELETE' });
+      await loadKnowledge();
+    } catch (err) {
+      window.alert(`移除失败：${err.message}`);
+    }
+  }
+
+  function bindKnowledgeEvents() {
+    els.knowledgeOpen.addEventListener('click', openKnowledgeModal);
+    els.knowledgeClose.addEventListener('click', closeKnowledgeModal);
+    els.knowledgeRefresh.addEventListener('click', () => loadKnowledge());
+    els.knowledgeIndex.addEventListener('click', indexKnowledge);
+    els.knowledgeModal.querySelector('.modal-backdrop').addEventListener('click', closeKnowledgeModal);
+  }
+
   /* ------------------------------------------------------------------ 工作区面板 */
 
 function formatSize(bytes) {
@@ -1783,6 +2225,7 @@ async function loadAuth() {
     bindAdminEvents();
     bindMemoryEvents();
     bindWorkspaceEvents();
+    bindKnowledgeEvents();
     bindAuthEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
@@ -1792,6 +2235,8 @@ async function loadAuth() {
     });
 
     await loadModels();
+    // 上限在模型之后加载：两者都只影响输入区的可用性，而模型决定了「能不能传」
+    await loadAttachmentLimits();
     await loadThreads();
     // 刷新时按 URL 恢复：带会话 ID 则拉历史，否则进入草稿态（不创建任何东西）
     await syncWithUrl();

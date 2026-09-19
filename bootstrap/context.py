@@ -9,7 +9,9 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
     from agent.graph import AgentFactory
+    from application.attachment_service import AttachmentService
     from application.health import HealthService
+    from application.knowledge_service import KnowledgeService
     from application.memory_service import MemoryService
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
@@ -48,6 +50,8 @@ class AppContext:
         tools: 生效工具目录（内置 + 自定义 + MCP）。
         memories: 长期记忆管理服务（查看 / 删除）。
         workspace: 工作区文件服务（Web 文件面板的列目录与读文件）。
+        attachments: 会话附件服务（上传 / 列举 / 删除，以及多模态消息构造）。
+        knowledge: 知识库服务（工作区文档的索引与检索）。
     """
 
     config: AppConfig
@@ -65,3 +69,5 @@ class AppContext:
     tools: ToolCatalog
     memories: MemoryService
     workspace: WorkspaceService
+    attachments: AttachmentService
+    knowledge: KnowledgeService

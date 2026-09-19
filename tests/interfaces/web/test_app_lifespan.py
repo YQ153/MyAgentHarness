@@ -76,6 +76,8 @@ def _stub_context() -> SimpleNamespace:
         usage=object(),
         tools=object(),
         memories=object(),
+        attachments=object(),
+        knowledge=object(),
     )
 
 
@@ -135,6 +137,7 @@ async def test_lifespan_shutdown_runs_to_completion(
             assert app.state.context is context
             assert app.state.runs is context.runs
             assert app.state.memories is context.memories
+            assert app.state.knowledge is context.knowledge
             # WHY 单列这一项：它就是漏铺过的那个——审计查询端点因此 500，而
             # auth/audit.py 的宽容读取还把全部认证审计悄悄丢掉了。
             assert app.state.audit_store is context.audit_store

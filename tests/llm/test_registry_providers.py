@@ -88,8 +88,15 @@ def test_anthropic_registered_when_key_present(tmp_path: Path, _clean_provider_e
             "name": "anthropic",
             "provider": "anthropic",
             "model": "claude-3-5-sonnet-latest",
+            # 图片能力随模型清单一起下发：前端据此决定「能不能上传附件」
+            "supports_vision": True,
         },
-        {"name": "deepseek-flash", "provider": "deepseek", "model": "deepseek-flash"},
+        {
+            "name": "deepseek-flash",
+            "provider": "deepseek",
+            "model": "deepseek-flash",
+            "supports_vision": False,
+        },
     ]
 
 

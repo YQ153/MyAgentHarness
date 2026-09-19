@@ -78,11 +78,17 @@ class _StubStream:
 
 
 class _StubClient:
-    """按请求顺序返回预置响应的客户端替身，并记录每一次被请求的地址。"""
+    """按请求顺序返回预置响应的客户端替身，并记录每一次请求。
+
+    记录的是**完整请求**（含 ``params`` / ``json``），而不只是地址：检索适配器
+    一旦漏掉 ``format=json`` 或把关键词放错字段，真实实例会返回错误结果或直接
+    403，而「地址对得上」的断言抓不到这类问题。
+    """
 
     def __init__(self, *responses: _StubResponse) -> None:
         self._responses = list(responses)
         self.requested: list[str] = []
+        self.requests: list[dict[str, Any]] = []
 
     async def __aenter__(self) -> _StubClient:
         return self
@@ -90,20 +96,21 @@ class _StubClient:
     async def __aexit__(self, *exc: object) -> bool:
         return False
 
-    def _next(self, url: str) -> _StubResponse:
+    def _next(self, url: str, **kwargs: Any) -> _StubResponse:
         self.requested.append(url)
+        self.requests.append({"url": url, **kwargs})
         if not self._responses:
             raise AssertionError(f"请求次数超出预置响应：{url}")
         return self._responses.pop(0)
 
     def stream(self, method: str, url: str, **kwargs: Any) -> _StubStream:
-        return _StubStream(self._next(url))
+        return _StubStream(self._next(url, **kwargs))
 
     async def get(self, url: str, **kwargs: Any) -> _StubResponse:
-        return self._next(url)
+        return self._next(url, **kwargs)
 
     async def post(self, url: str, **kwargs: Any) -> _StubResponse:
-        return self._next(url)
+        return self._next(url, **kwargs)
 
 
 class _StubHttpx:
@@ -173,6 +180,30 @@ def test_skips_search_when_provider_none(tmp_path, caplog):
         _tools(make_config(tmp_path))
 
     assert "未选择 provider" in caplog.text
+
+
+def test_warns_when_key_present_but_provider_unset(tmp_path, caplog):
+    """「配了密钥却没选 provider」是一次误配置，必须告警而不是静默缺席。
+
+    WHY：这是实际踩过的坑——密钥就位、检索工具却没出现在清单里，而当时只有一条
+    INFO，看不出到底缺什么。provider 决定调用哪家服务，不能因密钥存在就替用户选，
+    所以只能把这条线索喊出来。
+    """
+    config = make_config(tmp_path, web_search_api_key="tvly-x")
+
+    with caplog.at_level(logging.WARNING):
+        names = _tools(config)
+
+    assert sorted(names) == ["web_fetch"]
+    assert "WEB_SEARCH_PROVIDER=none" in caplog.text
+
+
+def test_no_warning_when_search_intentionally_off(tmp_path, caplog):
+    """确实不打算开联网（无密钥 + provider=none）不该被喊成误配置。"""
+    with caplog.at_level(logging.WARNING):
+        _tools(make_config(tmp_path))
+
+    assert "WEB_SEARCH_API_KEY 已配置" not in caplog.text
 
 
 def test_registers_search_when_key_present(tmp_path):
@@ -592,6 +623,56 @@ async def test_searxng_uses_configured_loopback_address(tmp_path, monkeypatch):
     await _tool(config, "web_search").ainvoke({"query": "q"})
 
     assert stub.client.requested == ["http://127.0.0.1:8888/search"]
+
+
+async def test_tavily_posts_key_query_and_limit(tmp_path, monkeypatch):
+    """断言请求体本身，而不只是地址。
+
+    WHY：密钥放错字段、上限没传、关键词没去空白，都不会让「地址正确」的断言转红，
+    但在真实 Tavily 上分别是 401、结果条数失控、查询词带噪音。这些是替身唯一
+    能提前替真实服务挡住的一类错误。
+    """
+    config = make_config(
+        tmp_path,
+        web_search_provider="tavily",
+        web_search_api_key="tvly-test",
+        web_search_max_results=3,
+    )
+    stub = _patch_http(
+        monkeypatch, _StubResponse(headers={"content-type": "application/json"}, body=_tavily_body([]))
+    )
+
+    await _tool(config, "web_search").ainvoke({"query": "  python asyncio  "})
+
+    request = stub.client.requests[0]
+    assert request["url"] == "https://api.tavily.com/search"
+    assert request["json"] == {
+        "api_key": "tvly-test",
+        "query": "python asyncio",
+        "max_results": 3,
+        "search_depth": "basic",
+    }
+
+
+async def test_searxng_sends_query_and_json_format(tmp_path, monkeypatch):
+    """断言 SearXNG 请求带 ``q`` 与 ``format=json``。
+
+    WHY 必须钉住 ``format``：SearXNG 默认只输出 HTML，缺了它真实实例会返回 HTML
+    （或直接 403），表现为「实例可达、适配器却解析失败」——最容易与被误判成实例
+    配置问题的一类故障。JSON 输出还需在实例侧显式开启，两处缺一不可。
+    """
+    config = make_config(
+        tmp_path, web_search_provider="searxng", web_search_base_url="http://127.0.0.1:8888"
+    )
+    stub = _patch_http(
+        monkeypatch, _StubResponse(headers={"content-type": "application/json"}, body=_tavily_body([]))
+    )
+
+    await _tool(config, "web_search").ainvoke({"query": "asyncio"})
+
+    request = stub.client.requests[0]
+    assert request["url"] == "http://127.0.0.1:8888/search"
+    assert request["params"] == {"q": "asyncio", "format": "json"}
 
 
 async def test_searxng_rejects_address_without_scheme(tmp_path, monkeypatch):

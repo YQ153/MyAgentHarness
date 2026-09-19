@@ -283,7 +283,7 @@ class RunService:
     async def stream(
         self,
         thread_id: str,
-        user_input: str,
+        user_input: str | list[dict[str, Any]],
         *,
         principal: Principal | None = None,
         model_name: str | None = None,
@@ -298,7 +298,9 @@ class RunService:
 
         Args:
             thread_id: 会话 ID。
-            user_input: 用户本轮输入，不能为空。
+            user_input: 用户本轮输入。纯文本时为字符串；带附件时是多模态内容块列表
+                （由 ``AttachmentService.build_user_content`` 构造）。两种形态都必须
+                含非空文本——标题、日志与「轮次是否成立」都依赖它。
             principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
 
@@ -319,9 +321,7 @@ class RunService:
         self._check_run_limits(principal)
 
         normalized = normalize_thread_id(thread_id)
-        if not isinstance(user_input, str) or not user_input.strip():
-            raise ValueError("user_input 必须是非空字符串")
-        text = user_input.strip()
+        text, content = _split_user_input(user_input)
 
         # WHY 先鉴权再初始化模型：权限不足应快速失败，避免浪费模型调用。
         # 首条消息可能还未登记元数据，允许当前主体认领该会话。
@@ -377,7 +377,7 @@ class RunService:
             actor_id=actor_id,
         )
 
-        payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
+        payload: dict[str, Any] = {"messages": [{"role": "user", "content": content}]}
         return self._consume(graph, payload, handle)
 
     # ------------------------------------------------------------ 编辑与分叉
@@ -1301,3 +1301,42 @@ class RunService:
         if text is None:
             return None
         return build_title(text, self._config.thread_title_max_chars) or None
+
+
+def _split_user_input(
+    user_input: str | list[dict[str, Any]],
+) -> tuple[str, str | list[dict[str, Any]]]:
+    """把入口参数拆成「纯文本」与「真正进入图的内容」。
+
+    WHY 需要两种形态：标题、日志与轮次判定要的都是文本，而带附件的消息必须是
+    多模态内容块列表。只留文本会让附件丢失；只留列表会让标题变成
+    ``[{'type': 'text', ...}]`` 这样的字符串——两者都不是「少个字段」，而是
+    用户能直接看到的结果变错。
+
+    Args:
+        user_input: 纯文本，或由 ``AttachmentService`` 构造的内容块列表。
+
+    Returns:
+        ``(用于标题与日志的文本, 用于图的内容)``。
+
+    Raises:
+        ValueError: 两种形态都不含非空文本。
+    """
+    if isinstance(user_input, str):
+        text = user_input.strip()
+        if not text:
+            raise ValueError("user_input 必须是非空字符串")
+        return text, text
+
+    if isinstance(user_input, list) and user_input:
+        # WHY 从内容块里取文本而不是接受「只有图片」：本轮运行需要一段能当标题、
+        # 能进日志、也能让模型理解意图的文本；纯图片消息会让会话标题为空、
+        # 审计里也看不出用户要做什么。
+        text = "".join(
+            str(part.get("text", "")) for part in user_input if isinstance(part, dict)
+        ).strip()
+        if not text:
+            raise ValueError("消息内容必须包含文本（图片不能单独成条）")
+        return text, user_input
+
+    raise ValueError("user_input 必须是非空字符串或多模态内容块列表")

@@ -11,10 +11,36 @@ Markdown」看起来一模一样。
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "interfaces" / "web" / "static"
+
+_ELEMENT_BY_ID = re.compile(r"""getElementById\(\s*['"](?P<id>[^'"]+)['"]\s*\)""")
+_HTML_ID = re.compile(r"""\bid="(?P<id>[^"]+)\"""")
+
+
+def test_every_getelementbyid_target_exists_in_html() -> None:
+    """``app.js`` 引用的每个元素 id 都必须在 ``index.html`` 里真实存在。
+
+    WHY 需要这条：``app.js`` 没有构建步骤也没有运行期类型检查，``getElementById``
+    写错一个字母只返回 ``null``，随后 ``els.xxx.addEventListener`` 会在**初始化时**
+    抛错——而它抛在最外层，表现是「整页都点不动」，不是「某个按钮没反应」。两者排查
+    方向完全不同，现场又几乎没有可读的线索。
+
+    WHY 与 ``test_static_js_contract`` 分开：那一条管「调用的函数声明过」（名字层面），
+    这一条管「引用的元素存在」（DOM 层面）；它们挡的是两类不同的错误，合并之后
+    任何一处的白名单调整都会牵动另一处。
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    declared = {match.group("id") for match in _HTML_ID.finditer(html)}
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+    referenced = {match.group("id") for match in _ELEMENT_BY_ID.finditer(script)}
+
+    missing = sorted(referenced - declared)
+
+    assert not missing, f"app.js 引用了 index.html 中不存在的 id：{missing}"
 
 
 def test_index_loads_renderer_before_app() -> None:

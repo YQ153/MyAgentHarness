@@ -8,16 +8,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
+import hashlib
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from application.attachment_service import attachment_info
 from application.audit_context import audit_client_info, audit_trace_id
 from application.dto import (
     EXPORT_VERSION,
+    AttachmentInfo,
     BranchListResult,
     BranchSummary,
     DeleteOutcome,
@@ -32,6 +40,11 @@ from application.errors import NotFoundError, OwnershipError
 from application.ownership import effective_owner_id, ensure_thread_access
 from application.principal import Principal
 from application.runnable import build_runnable_config
+from runtime.attachments import (
+    AttachmentRecord,
+    delete_thread_attachments,
+    index_by_sha256,
+)
 from runtime.audit_store import AuditStore
 from runtime.thread_store import (
     ThreadMetaStore,
@@ -343,7 +356,12 @@ class ThreadService:
             return []
 
         messages = getattr(state, "values", {}).get("messages") or []
-        return [self._message_to_dto(message) for message in messages]
+        # WHY 先建一次索引而不是每条消息各自查一次：附件目录的列举要扫目录，
+        # 一条消息查一次会把一次历史读取放大成 N 次目录扫描。
+        attachment_index = await asyncio.to_thread(
+            index_by_sha256, Path(self._config.workspace), normalized
+        )
+        return [self._message_to_dto(message, attachment_index) for message in messages]
 
     # ------------------------------------------------------------------ 分支
 
@@ -706,6 +724,9 @@ class ThreadService:
             meta_error = str(exc) or type(exc).__name__
 
         checkpoint_removed = await self._delete_checkpoints(normalized)
+        # WHY 一并删附件：它们是工作区里的真实文件，而会话已不再被任何界面引用——
+        # 留着不占功能，只占磁盘，且没有任何入口能看到或清掉它们。
+        attachments_removed = await self._delete_attachments(normalized)
 
         if meta_deleted and checkpoint_removed:
             outcome = DeleteOutcome.DELETED
@@ -734,7 +755,11 @@ class ThreadService:
             target_id=normalized,
             action="delete",
             outcome=outcome.value,
-            details={"checkpoint_removed": checkpoint_removed, "detail": detail},
+            details={
+                "checkpoint_removed": checkpoint_removed,
+                "attachments_removed": attachments_removed,
+                "detail": detail,
+            },
         )
 
         logger.info(
@@ -750,6 +775,24 @@ class ThreadService:
             checkpoint_removed=checkpoint_removed,
             detail=detail,
         )
+
+    async def _delete_attachments(self, thread_id: str) -> int:
+        """删除该会话的附件文件。
+
+        WHY 失败不上抛：会话删除的主结果由元数据决定，附件残留只是空间问题；
+        把它升级成一次失败的删除，会让用户为了几个文件重试一次已经成功的操作。
+        删除失败会写日志，并随审计的 ``details`` 一并留痕。
+
+        Returns:
+            实际删除的附件数；出错时为 0。
+        """
+        try:
+            return await asyncio.to_thread(
+                delete_thread_attachments, Path(self._config.workspace), thread_id
+            )
+        except Exception:
+            logger.exception("删除会话附件失败：thread=%s", thread_id)
+            return 0
 
     async def _delete_checkpoints(self, thread_id: str) -> bool:
         """删除该会话的全部检查点。
@@ -915,16 +958,20 @@ class ThreadService:
         return collapsed
 
     @staticmethod
-    def _message_to_dto(message: Any) -> HistoryMessage:
-        """把 LangChain 消息转成对外 DTO。"""
+    def _message_to_dto(
+        message: Any, attachment_index: dict[str, AttachmentRecord] | None = None
+    ) -> HistoryMessage:
+        """把 LangChain 消息转成对外 DTO。
+
+        WHY 必须显式处理列表型 content：带附件的用户消息是多模态内容块列表，而旧
+        实现用 ``str(content)`` 转换——那会把 base64 图片内容整个塞进历史响应
+        （一条消息几 MB），而且它在界面上「看起来有内容」，不会报错。
+        """
         tool_calls = getattr(message, "tool_calls", None) or []
+        content = getattr(message, "content", "")
         return HistoryMessage(
             role=getattr(message, "type", "") or "",
-            content=(
-                message.content
-                if isinstance(message.content, str)
-                else str(message.content)
-            ),
+            content=_content_text(content),
             name=getattr(message, "name", "") or "",
             tool_calls=[
                 {
@@ -938,4 +985,85 @@ class ThreadService:
                 for call in tool_calls
             ],
             tool_call_id=getattr(message, "tool_call_id", "") or "",
+            attachments=_attachments_of(content, attachment_index or {}),
         )
+
+
+_TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
+"""内容块里属于「文本」的类型名。
+
+WHY 同时认 ``input_text``：它是 LangChain 标准内容块的另一种写法，只认 ``text``
+会让某些 provider 回写的消息在历史里变成空正文。
+"""
+
+_IMAGE_BLOCK_TYPES = frozenset({"image_url", "input_image"})
+"""内容块里属于「图片」的类型名；与 ``_TEXT_BLOCK_TYPES`` 对称。"""
+
+_DATA_URL_RE = re.compile(
+    r"^data:(?P<mime>[^;,]+)(?P<params>[^,]*);base64,(?P<payload>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _content_text(content: Any) -> str:
+    """取消息正文的文本部分。
+
+    WHY 只取文本块而不是把整个列表转成字符串：列表里可能含着 base64 图片内容，
+    转成字符串会把几 MB 的编码塞进历史响应与导出文件——而且它看起来「有内容」，
+    不会报错，只会在某天变成一次超时或一次 OOM。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in _TEXT_BLOCK_TYPES
+        )
+    return str(content or "")
+
+
+def _image_url_of(part: dict[str, Any]) -> str:
+    """从图片内容块里取出 URL 字符串；取不到时返回空串。"""
+    raw = part.get("image_url")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        url = raw.get("url")
+        return url if isinstance(url, str) else ""
+    return ""
+
+
+def _attachments_of(
+    content: Any, index: dict[str, AttachmentRecord]
+) -> list[AttachmentInfo]:
+    """从多模态内容块里回填附件信息。
+
+    WHY 用内容摘要（sha256）匹配而不是在块里塞一个 ID 字段：内容块会被原样发给
+    模型，多出来的字段要么被拒绝、要么被当作未知参数透传；而摘要由内容算出，
+    两侧都不需要额外约定。匹配不到的图片直接略过——那通常意味着附件已被删除。
+    """
+    if not isinstance(content, list) or not index:
+        return []
+
+    found: list[AttachmentInfo] = []
+    seen: set[str] = set()
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in _IMAGE_BLOCK_TYPES:
+            continue
+        match = _DATA_URL_RE.match(_image_url_of(part))
+        if match is None:
+            continue
+        try:
+            payload = base64.b64decode(match.group("payload"), validate=True)
+        except (binascii.Error, ValueError):
+            # 不是合法的 base64：可能是 provider 回写的其它形态，跳过而不是让整次
+            # 历史读取失败——一张图显示不出来不该让整个会话打不开。
+            logger.debug("历史消息里的图片块不是合法 data URL，已跳过")
+            continue
+        record = index.get(hashlib.sha256(payload).hexdigest())
+        if record is None or record.id in seen:
+            continue
+        seen.add(record.id)
+        found.append(attachment_info(record))
+    return found

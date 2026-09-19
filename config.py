@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -49,6 +50,19 @@ WHY 定义在配置层而非 runtime 层：``runtime.sandbox`` 需要引用它�
 NETWORK_MODE_NONE = "none"
 NETWORK_MODE_HOST = "host"
 """沙箱网络模式；``none`` 表示不向子进程传递代理类变量。"""
+
+DEFAULT_ATTACHMENT_MIME_TYPES: tuple[str, ...] = (
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+)
+"""默认允许上传的附件类型。
+
+WHY 只放图片：这一项的实质约束是「模型能不能收下这种内容」。四种图片类型是各
+provider 的多模态接口共同支持的集合；把 PDF / 文本也放进来会得到一个「上传成功、
+但构造消息时才失败」的入口，而那正是本任务要消除的静默失败。
+"""
 
 
 class ExecutionMode(StrEnum):
@@ -99,6 +113,24 @@ class MCPTransport(StrEnum):
     SSE = "sse"
     HTTP = "streamable_http"
     WEBSOCKET = "websocket"
+
+
+class EmbeddingBackendKind(StrEnum):
+    """知识库的嵌入后端档位。
+
+    none:          不装配后端。知识库仍可用，但退化为关键词检索——**这是一等
+                   档位，不是故障**，因此检索路径要按「有没有嵌入」分支，而不是
+                   把「没有」当成异常。
+    openai-compat: 调用任意兼容 ``POST /v1/embeddings`` 的服务（OpenAI、TEI、
+                   Ollama、各家云厂商）。**容器内加载模型走这一档**——应用不做
+                   容器编排（那属 T24），只管往一个地址发请求。
+    subprocess:    本机自托管。在独立 venv 内拉起瘦服务进程，按 stdio 通信；
+                   主进程不引入 onnxruntime，模型可在空闲时整个回收。
+    """
+
+    NONE = "none"
+    OPENAI_COMPAT = "openai-compat"
+    SUBPROCESS = "subprocess"
 
 
 class MCPServerSpec(BaseModel):
@@ -311,6 +343,19 @@ class AppConfig(BaseSettings):
     llm_timeout: float = Field(default=60.0, gt=0.0)
     llm_max_retries: int = Field(default=2, ge=0)
 
+    vision_model_aliases: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["openai", "anthropic"]
+    )
+    """哪些**模型别名**支持图片输入（多模态）。
+
+    WHY 做成配置而不是写死在 ``ModelSpec`` 里：能力取决于**实际模型**，而模型名
+    是可配置的（``OPENAI_MODEL`` 可以被指向一个纯文本模型）。写死会在「照着文档
+    换了个模型」之后继续允许上传，直到构造消息时才失败——那正是本任务要消除的
+    静默失败。默认值只覆盖各 provider 的官方默认模型。
+    """
+
+
+
     # ---------------- 运行时路径 ----------------
     workspace: Path = Path("./workspace")
     memory_file: Path = Path("./workspace/AGENTS.md")
@@ -342,6 +387,32 @@ class AppConfig(BaseSettings):
 
     WHY 用降级标记而不是报错：文件确实存在、也确实读得到，只是不适合整份塞进
     浏览器。当成错误会让界面只能显示一句失败，而用户真正想知道的是「它有多大」。
+    """
+
+    # ---------------- 附件（上传与多模态） ----------------
+    attachment_max_bytes: int = Field(default=2_000_000, ge=1024, le=50_000_000)
+    """单个附件的字节上限。
+
+    WHY 默认只有 2 MB（远小于 ``workspace_file_max_bytes``）：附件的内容会以
+    data URL 形式进入**用户消息**，而消息要被写进检查点并在后续每一轮里重新发给
+    模型。上限放宽一倍，检查点与每次请求的体积就跟着翻一倍——这个开销是持续的，
+    不是一次性的。
+    """
+
+    attachment_max_per_thread: int = Field(default=8, ge=1, le=100)
+    """单个会话允许保留的附件数上限。
+
+    WHY 需要它：附件目录在工作区里只增不减（会话存续期间），而没有上限时一次
+    误操作就能把工作区塞满；上限也顺带把「一次请求塞多少图片给模型」框住了。
+    """
+
+    attachment_allowed_mime_types: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: list(DEFAULT_ATTACHMENT_MIME_TYPES)
+    )
+    """允许上传的 MIME 白名单。
+
+    WHY 白名单而不是黑名单：MIME 是调用方自己声明的，黑名单永远补不全；
+    而这里真正的约束是「模型能不能收下这种内容」，只有少数几种图片类型成立。
     """
 
     # ---------------- 会话 ----------------
@@ -594,6 +665,90 @@ class AppConfig(BaseSettings):
     web_user_agent: str = ""
     """出站请求的 User-Agent；留空时用内置默认值。"""
 
+    # ---------------- 嵌入后端（知识库的语义能力） ----------------
+    embedding_backend: EmbeddingBackendKind = EmbeddingBackendKind.NONE
+    """嵌入后端档位；各档位取舍见 ``EmbeddingBackendKind``。
+
+    WHY 默认 ``none``：与 ``web_search_provider`` 同一口径——语义嵌入要么把文档内容
+    发给第三方服务，要么在本机常驻一个实测 189 MB 的模型进程，两者都是「替用户做的
+    决定」，不应跟着默认值开启。
+    """
+
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    """嵌入模型名。
+
+    ``openai-compat`` 档位下它作为请求体的 ``model`` 字段原样发出（服务端据此定位
+    要用的模型）；``subprocess`` 档位下它是 fastembed 的模型标识。
+    """
+
+    embedding_base_url: str = ""
+    """``openai-compat`` 档位的服务地址（不含 ``/v1``，由实现拼接）。"""
+
+    embedding_api_key: str = Field(default="", repr=False)
+    """嵌入服务密钥；本地服务（TEI / Ollama）通常不需要。"""
+
+    embedding_dims: int = Field(default=512, ge=1, le=8192)
+    """向量维度。
+
+    WHY 必须是**配置**而不是从首次响应里读回来：维度在建表时就要固定（向量表的列宽），
+    而读回来的时机在插入之后——那时表已经建错了。它同时是「换了模型必须重建索引」的
+    显式表达：换模型却不改这一项，插入会因维度不符而报错，而不是静默写进一批语义上
+    无法互相比较的向量。
+    """
+
+    embedding_batch_size: int = Field(default=32, ge=1, le=256)
+    """单次嵌入请求的文本条数上限。"""
+
+    embedding_timeout_seconds: float = Field(default=30.0, gt=0)
+    """单次嵌入往返（HTTP 请求或子进程一次问答）的超时秒数。
+
+    WHY 比 ``llm_timeout`` 短：嵌入处在索引与检索的**同步阻塞**路径上，超时过长会让
+    一次检索把整轮对话拖住。
+    """
+
+    embedding_idle_seconds: int = Field(default=600, ge=0)
+    """``subprocess`` 档位下子进程的空闲回收秒数；``0`` 表示不回收。
+
+    WHY 需要回收：知识库检索是偶发动作（一轮对话可能只在开头检索一次），而模型常驻
+    内存实测 189 MB；不回收等于让一次偶发操作永久占住这份内存。
+    """
+
+    embedding_python: str = ""
+    """``subprocess`` 档位使用的解释器路径。
+
+    留空时用 ``.data/embed-venv`` 下的约定路径（由 ``scripts/setup_embed_venv.py``
+    准备）。显式提供是为了让人能把模型装在自己选好的环境里，而不必迁就本项目的约定。
+    """
+
+    # ---------------- 知识库（工作区文档索引与检索） ----------------
+    knowledge_chunk_chars: int = Field(default=800, ge=100, le=8000)
+    """单个分块的目标字符数。
+
+    WHY 以**字符**而不是 token 计量：切分发生在嵌入之前、模型之外，这一层拿不到
+    分词器；而中英文的 token/字符比差异很大，用字符才能给出跨语言一致的行为。
+    """
+
+    knowledge_chunk_overlap_chars: int = Field(default=120, ge=0, le=2000)
+    """相邻分块的重叠字符数。
+
+    WHY 需要重叠：一句话被切断会同时毁掉两边的语义——左块丢了句尾、右块丢了句首，
+    于是这句话在两个块里都检索不到。重叠让边界句在某一侧保持完整。
+    """
+
+    knowledge_search_top_k: int = Field(default=6, ge=1, le=50)
+    """检索返回的块数上限。
+
+    WHY 必须有上限：检索结果整体进入上下文，条数不设限时一次检索就能挤掉对话历史，
+    也直接决定上游计费量。
+    """
+
+    knowledge_max_chunks_per_document: int = Field(default=500, ge=1, le=10000)
+    """单个文档允许的分块数上限。
+
+    WHY 必须有：分块数直接决定嵌入调用次数与向量表体积，而工作区里出现一份几 MB 的
+    日志或生成文件是常事。超限时截断并记日志，而不是让一次索引把配额打满。
+    """
+
     # ---------------- HTTP 服务 ----------------
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
@@ -727,6 +882,53 @@ class AppConfig(BaseSettings):
         """按逗号切分环境变量白名单，口径见 ``parse_list_config``。"""
         return parse_list_config(value, field="sandbox_env_allowlist", separators=(",",))
 
+    @field_validator("attachment_allowed_mime_types", "vision_model_aliases", mode="before")
+    @classmethod
+    def _parse_csv_lists(cls, value: object) -> object:
+        """按逗号切分这两个列表项，口径见 ``parse_list_config``。
+
+        WHY 与 ``sandbox_env_allowlist`` 分开注册：分隔符相同但语义不同，合并成
+        一个 validator 会让日后其中一个改口径时把另一个一起改掉。
+        """
+        return parse_list_config(value, field="attachment_allowed_mime_types", separators=(",",))
+
+    @field_validator("attachment_allowed_mime_types", mode="after")
+    @classmethod
+    def _normalize_mime_types(cls, value: list[str]) -> list[str]:
+        """归一 MIME 写法（去空白、转小写、去重保序）。
+
+        WHY 必须归一：白名单要与上传请求声明的 MIME 做**精确比较**，而
+        ``Image/PNG`` 与 ``image/png`` 在字符串层面不同、在语义上相同——不归一
+        就会表现为「明明配了却拒绝上传」。
+        """
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for item in value:
+            candidate = str(item).split(";", 1)[0].strip().lower()
+            if not candidate:
+                continue
+            if not re.match(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$", candidate):
+                raise ValueError(f"attachment_allowed_mime_types 含非法 MIME：{item!r}")
+            if candidate not in seen:
+                seen.add(candidate)
+                normalized.append(candidate)
+        if not normalized:
+            raise ValueError("attachment_allowed_mime_types 不能为空，否则任何附件都无法上传")
+        return normalized
+
+    @field_validator("vision_model_aliases", mode="after")
+    @classmethod
+    def _normalize_aliases(cls, value: list[str]) -> list[str]:
+        """归一模型别名（去空白、去重保序）；允许为空（表示没有任何多模态模型）。"""
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for item in value:
+            candidate = str(item).strip()
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                normalized.append(candidate)
+        return normalized
+
     @field_validator("skill_dirs", mode="after")
     @classmethod
     def _expand_dirs(cls, value: list[Path]) -> list[Path]:
@@ -747,6 +949,50 @@ class AppConfig(BaseSettings):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+    @model_validator(mode="after")
+    def _validate_knowledge_chunking(self) -> AppConfig:
+        """校验分块参数的自洽性。
+
+        WHY 在加载期拦下：重叠大于等于块长时，切分会在同一处反复推进而无法前进
+        ——表现为索引卡死或产出满天飞的重复块，而原因要到切分器内部才看得出来。
+
+        Raises:
+            ValueError: 重叠字符数不小于块长。
+        """
+        if self.knowledge_chunk_overlap_chars >= self.knowledge_chunk_chars:
+            raise ValueError(
+                f"KNOWLEDGE_CHUNK_OVERLAP_CHARS（{self.knowledge_chunk_overlap_chars}）"
+                f"必须小于 KNOWLEDGE_CHUNK_CHARS（{self.knowledge_chunk_chars}），"
+                "否则切分会原地打转"
+            )
+        return self
+
+    @field_validator("embedding_backend", mode="before")
+    @classmethod
+    def _normalize_embedding_backend(cls, value: object) -> object:
+        """容错大小写与空白，与 ``execution_mode`` 保持同一口径。"""
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @model_validator(mode="after")
+    def _validate_embedding_backend(self) -> AppConfig:
+        """按档位校验必需字段。
+
+        WHY 在加载期拦而不是等首次嵌入：``openai-compat`` 缺地址时，异常会发生在
+        一次索引或检索的深处，栈顶指向网络层；而配置自身的问题应当在启动时就能被
+        指出来（与 ``MCPServerSpec`` 按传输方式校验同一个理由）。
+
+        Raises:
+            ValueError: ``openai-compat`` 档位未提供 ``embedding_base_url``。
+        """
+        if self.embedding_backend is EmbeddingBackendKind.OPENAI_COMPAT and not self.embedding_base_url.strip():
+            raise ValueError(
+                "EMBEDDING_BACKEND=openai-compat 必须提供 EMBEDDING_BASE_URL"
+                "（例：容器内的嵌入服务 http://embed:80）"
+            )
+        return self
 
     @field_validator("mcp_servers", mode="after")
     @classmethod

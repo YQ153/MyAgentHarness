@@ -145,6 +145,16 @@ def _search_unavailable_reason(config: AppConfig) -> str | None:
     return None
 
 
+def _key_present_but_provider_unset(config: AppConfig) -> bool:
+    """是否「配了检索密钥，却没选 provider」——一个会导致工具静默缺席的组合。
+
+    WHY 判定与 ``_search_unavailable_reason`` 分开：后者回答「为什么没注册」，
+    这里回答「这是不是一次误配置」。合并成一句会把「确实不想开联网」也喊成告警。
+    """
+    provider = (config.web_search_provider or "none").strip().lower()
+    return provider == "none" and bool(config.web_search_api_key.strip())
+
+
 def _search_base_url(config: AppConfig, default: str) -> str:
     """取检索服务地址：配置优先，其次 provider 官方地址。"""
     configured = (config.web_search_base_url or "").strip()
@@ -278,8 +288,8 @@ def _html_to_text(raw: str, *, is_html: bool) -> str:
     """把 HTML 压成纯文本。
 
     WHY 自己剥标签而不引第三方库：这里只需要「读到正文」，不需要完整的 DOM 语义，
-    真正的正文抽取（readability 那类）要引重型依赖，而依赖越重越难在本项目的
-    零新增依赖口径下维护。
+    而规则总共三条（去 script/style、去标签、解实体），写成十行比读一遍 readability
+    的实现更省事——它的价值在正文抽取的启发式，而那部分这里用不上。
 
     WHY 先去标签再解实体：顺序反了的话，正文里被转义的 ``&lt;div&gt;`` 会在解实体
     之后被当成真标签删掉——那是内容丢失，不是清洗。
@@ -484,5 +494,13 @@ def register_tools(registry: ToolRegistry, config: AppConfig | None = None) -> N
         # WHY 明确记一条日志：模块被加载了却少一个工具，如果不写原因，运维只能
         # 靠翻源码猜是哪个配置项没填。
         logger.info("联网检索工具未注册：%s", reason)
+        if _key_present_but_provider_unset(config):
+            # WHY 单独告警：这是实际踩过的坑——密钥已配好，只因 provider 仍是默认
+            # ``none``，工具就静默缺席。而「provider 决定调用哪家服务」必须由运营方
+            # 显式选择，不能因密钥存在就替他决定，所以只能把这条线索喊出来。
+            logger.warning(
+                "检测到 WEB_SEARCH_API_KEY 已配置，但 WEB_SEARCH_PROVIDER=none："
+                "检索工具不会注册。要启用请把 WEB_SEARCH_PROVIDER 设为 tavily。"
+            )
 
     registry.register(_build_fetch_tool(config), source=ToolSource.CUSTOM)

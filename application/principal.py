@@ -68,6 +68,8 @@ PERMISSIONS = {
     "file:read": "FilesystemBackend read",
     "file:write": "FilesystemBackend write",
     "file:execute": "execute tool in sandbox/local mode",
+    "attachment:write": "POST/DELETE /api/threads/{id}/attachments（上传与删除会话附件）",
+    "knowledge:write": "POST/DELETE /api/knowledge（索引工作区文档 / 移除已索引文档）",
     "system:models": "GET /api/models",
     "usage:read": "GET /api/usage（用量统计）",
     "tool:read": "GET /api/tools（生效工具清单与 MCP 服务器状态）",
@@ -99,6 +101,15 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
             "thread:update",
             "hitl:approve",
             "file:read",
+            # WHY member 也有 attachment:write：把图片附到自己的会话上，与「发起一轮
+            # 对话」同量级。不复用 file:write——那一项语义是「Agent 的文件写入能力」，
+            # 权限对齐的是「往哪个资源写」，把两者合并会让日后收紧其一时连带另一项。
+            "attachment:write",
+            # WHY 知识库索引单独一项权限而不复用 file:write：索引只**读**工作区文件，
+            # 它写的是知识库自己那份索引，并且要消耗嵌入调用。与 attachment:write
+            # 同一个理由——权限对齐的是「往哪个资源写」，合并会让日后收紧其一时
+            # 连带另一项。查看清单仍走 file:read（与文件面板同一口径）。
+            "knowledge:write",
             "usage:read",
             # WHY member 也有 tool:read：工具清单回答的是「这个助手能做什么」，
             # 是使用者的基本知情项；它不含任何他人数据，收紧到 admin 只会

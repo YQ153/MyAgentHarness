@@ -148,20 +148,35 @@ curl -s http://127.0.0.1:8000/ready
 `EXECUTION_MODE=disabled`，容器因此以该档位启动，`execute` 工具调用会直接返回错误
 （启动日志里有 `执行档位=disabled：execute 工具调用将返回错误`）；文件类工具不受影响。
 
-**当前不要改用 `local` 档位**：在本仓库钉住的 `deepagents 0.7.14` 下，`local`
-（提供命令执行的 backend）与工具级权限配置**互不兼容**，Agent 构建阶段就会失败：
+**`local` / `sandbox` 档位下不再应用工具级文件权限。** 上游 `deepagents 0.7.14` 拒绝
+「文件权限规则 + 可提供命令执行的 backend」这一组合，并在装配期直接抛：
 
 ```
 NotImplementedError: FilesystemMiddleware does not yet support permissions with backends
 that provide command execution (SandboxBackendProtocol).
 ```
 
-这不是容器特有的——在宿主机上以同样的档位运行 `main.py cli` 会得到同一处报错。
-上游要么支持该组合、要么我们放弃工具级权限，二选一之前 `local` 与 `sandbox`
-都用不了。这是独立于容器化的既有问题，已知限制见 `docs/planning`。
+这不是上游的实现缺漏，而是刻意的口径：权限只作用于 `read_file` / `write_file` 等
+**工具**，而 `execute` 走 shell，一条 `cat .env` 就能绕过全部路径规则——上游拒绝放行
+一条纸面防线。本项目的处理是**显式裁剪**（不静默降级）：`agent/guardrails.py` 的
+`build_permissions(backend)` 在 backend 具备执行能力时返回空规则并打 WARNING
+（启动日志可见），凭据防护改由 `execute` 的人工审批与沙箱隔离承担。
+
+因此两档的防护口径不同：
+
+| 档位 | 工具级文件权限 | 敏感路径读取（工作区内的 `.env` / `.git` / 私钥） |
+| --- | --- | --- |
+| `disabled`（默认） | 生效 | 被**拒绝** |
+| `local` / `sandbox` | 停用（有 WARNING） | 规则不再生效，防护由 `execute` 审批承担 |
+
+**推论：不要把密钥放进 `workspace/`。** 仓库根的 `.env` 在虚拟根之外，两种口径下都
+不会被 Agent 读到。
 
 WHY 编排不替使用者改这个值：镜像里有模型密钥、容器有网络出口，而允许执行命令意味着
 一次提示词注入就能在容器里跑命令。这类开关应按各自的威胁模型显式打开，不跟着编排文件默认开启。
+
+回归验证：`python scripts/smoke_execution_modes.py`（三档装配与真实命令执行）、
+`python scripts/probe_permissions_backend.py`（上游约束本身与豁免条件）。
 
 #### 卷
 
@@ -213,6 +228,10 @@ docker compose down            # 保留卷；加 -v 会连数据一起删
 | `sandbox` | 在沙箱内执行 shell，隔离强度由 `SANDBOX_TIER` 决定 | 需要命令能力、又不愿裸跑宿主机的场景 |
 
 > 安全边界：把 `local` 档位暴露到公网，等同于把宿主机 shell 开放出去，请务必谨慎。
+>
+> 权限口径：工具级文件权限（敏感路径拒绝）只在 `disabled` 档位生效。`local` /
+> `sandbox` 档位下 `execute` 可经 shell 绕过路径规则，因此权限被显式停用（启动
+> 日志有 WARNING），防护由审批承担——理由见第 四 章「容器化运行」中的说明。
 
 ### 沙箱档位（`SANDBOX_TIER`，仅 `sandbox` 档位生效）
 
@@ -368,11 +387,22 @@ Web 形态对外提供以下接口（均以 `/api` 为前缀）：
 | `POST` | `/api/threads/{thread_id}/runs` | 发起一轮对话，**以 SSE 流式返回** |
 | `POST` | `/api/threads/{thread_id}/resume` | 提交人工审批结果，继续被中断的运行（需 `hitl:approve` 权限） |
 | `POST` | `/api/threads/{thread_id}/stop` | 请求停止当前运行；幂等返回 200，未运行时 `stopped=false` |
+| `GET` | `/api/attachments/limits` | 附件上限（大小 / 张数 / MIME 白名单）；不依赖会话，草稿态也能取 |
+| `POST` | `/api/threads/{thread_id}/attachments` | 上传附件（`multipart/form-data`，字段名 `file`） |
+| `GET` | `/api/threads/{thread_id}/attachments` | 该会话的附件清单及其上限 |
+| `DELETE` | `/api/threads/{thread_id}/attachments/{attachment_id}` | 删除附件；幂等，不存在时 `deleted=false` |
 
 发起对话的请求体：
 
 ```json
 { "content": "帮我看一下 workspace 里有什么", "model": null }
+```
+
+带图片时把上传得到的 `id` 放进 `attachment_ids`（目标模型必须支持图片输入，否则
+整体返回 400 并指明可用的多模态模型——**不会静默丢弃图片**）：
+
+```json
+{ "content": "这张图里是什么？", "model": "openai", "attachment_ids": ["<上传返回的 id>"] }
 ```
 
 提交审批的请求体（`type` 取 `approve` / `edit` / `reject` / `respond`）：
@@ -392,6 +422,21 @@ SSE 事件类型：
 | `interrupt` | 请求人工审批，携带 `action_requests` 与 `review_configs` |
 | `error` | 运行期错误 |
 | `done` | 本轮运行结束 |
+
+### 附件与多模态输入
+
+- **存放**：`workspace/.attachments/<thread_id>/`，每个附件两个文件（内容 + 元数据）。
+  路径校验复用工作区文件面板的同一套口径——附件不是第二个目录穿越入口。
+- **上限**：`ATTACHMENT_MAX_BYTES`（默认 2 MB）、`ATTACHMENT_MAX_PER_THREAD`（默认 8）、
+  `ATTACHMENT_ALLOWED_MIME_TYPES`（默认四种图片类型），全部走配置，不硬编码。
+- **能力判定**：`VISION_MODEL_ALIASES`（默认 `openai,anthropic`）声明哪些**模型别名**
+  接受图片输入——能力取决于实际模型名，而模型名是可改的，写死会在换模型后继续放行上传。
+  `GET /api/models` 会下发 `supports_vision`，前端据此禁用上传入口。
+- **审计**：上传落一条 `attachment_upload`，含文件名 / 大小 / MIME / sha256，
+  **不含文件内容**（图片字节只存在于工作区）。
+- **前端**：拖拽或点「＋」选图，缩略图贴在输入区上方；上传在**发送时**发生（草稿态还没有
+  会话 ID）。上传失败的条目留在原地，可点角标重试，且这条消息不会发出去——
+  「发出去了但图没带上」比一次失败更难察觉。
 
 ### 长期记忆：Agent 记住了什么，用户说了算
 
@@ -450,6 +495,15 @@ MyAgentHarness/
 - 删除会话会**保留**其用量记录：成本台账不应随会话消失，否则「花了多少」会随着
   用户清理清单而变小。代价是删除后无法再按该会话 ID 过滤用量（聚合里仍在）。
 - `docker` 沙箱档位尚未实现，显式指定会直接报错（不静默降级）。
+- 附件的回收挂在「删除会话」上（`workspace/.attachments/<thread_id>/`）。若一次上传之后
+  运行**没能真正开始**（被限流、因模型不支持图片被 400 拒绝、或发送途中关掉页面），
+  而该会话又是**从未登记过的草稿**，那批附件就会留在工作区里无人清理——草稿没有
+  元数据行，也就没有可触发的删除入口。每个草稿最多 `ATTACHMENT_MAX_PER_THREAD` 个附件、
+  单个不超过 `ATTACHMENT_MAX_BYTES`。前端在模型不支持图片时已禁用上传入口；
+  通过 API 直接调用的场景需自行注意。
+- 联网检索：**tavily 适配器已对真实服务验证**（`python scripts/smoke_web_chain.py` 可复跑）；
+  **SearXNG 适配器仍未经真实实例验证**——本机无自建实例，公网实例全部不可达、Docker 也拉不到
+  镜像。其请求构造（含 `format=json`）与响应解析已由用例钉住，接上可达实例后跑同一条脚本即可补齐。
 - 检查点为单机 SQLite，多副本部署需另行替换为共享存储（如 PostgreSQL 检查点）；
   长期记忆与它共用同一个文件，多副本部署时需一并替换。
 - 长期记忆按主体隔离，但**没有**「管理员查看/清理他人记忆」的入口：跨主体读取属于

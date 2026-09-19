@@ -85,8 +85,20 @@ async def usage_store(tmp_path: Path) -> AsyncIterator[UsageStore]:
         yield store
 
 
-_HOST_ENV_LEAKS = ("CUSTOM_TOOL_MODULES", "MCP_SERVERS")
-"""会被 shell 导出、且会改变装配结果的列表型变量。"""
+_HOST_ENV_LEAKS = (
+    # 列表型：为试跑联网工具而导出过，会改变扩展工具的装配结果
+    "CUSTOM_TOOL_MODULES",
+    "MCP_SERVERS",
+    # 嵌入后端：任何一项被导出都会让「默认档位不装配后端」的断言失败，而失败形态
+    # 看起来像代码坏了，实际只是本机环境不同——与上面两个变量同一类问题
+    "EMBEDDING_BACKEND",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+    "EMBEDDING_DIMS",
+    "EMBEDDING_PYTHON",
+)
+"""会被 shell 导出、且会改变装配结果的环境变量。"""
 
 
 @pytest.fixture(autouse=True)

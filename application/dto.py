@@ -43,6 +43,43 @@ class ModelInfo(BaseModel):
     name: str = Field(description="模型别名，切换模型时使用")
     provider: str = Field(description="langchain provider 标识")
     model: str = Field(description="provider 侧的原始模型名")
+    supports_vision: bool = Field(
+        default=False, description="是否接受图片输入；前端据此决定能否上传附件"
+    )
+
+
+class AttachmentInfo(BaseModel):
+    """一个已上传的附件。"""
+
+    id: str = Field(description="附件标识，发起运行时用它引用")
+    thread_id: str = Field(description="所属会话")
+    filename: str = Field(description="上传时的原始文件名，仅用于展示")
+    mime_type: str = Field(description="内容类型")
+    size: int = Field(description="字节数")
+    sha256: str = Field(description="内容摘要，用于审计与去重比对")
+    created_at: str = Field(description="上传时刻（ISO8601 UTC）")
+    path: str = Field(description="工作区内的虚拟路径，前端可直接交给文件接口预览")
+
+
+class AttachmentLimits(BaseModel):
+    """附件相关的上限，随清单一起下发。
+
+    WHY 与清单同一个响应：前端要在**用户选文件的那一刻**就给出「太大 / 类型不支持」
+    的提示，而不是等上传请求失败。让它多打一次接口只会多一条「配置与提示不一致」
+    的分叉路径。
+    """
+
+    max_bytes: int = Field(description="单个附件的字节上限")
+    max_per_thread: int = Field(description="单会话附件数上限")
+    allowed_mime_types: list[str] = Field(description="允许上传的 MIME 白名单")
+
+
+class AttachmentListResult(BaseModel):
+    """某会话的附件清单及其上限。"""
+
+    thread_id: str = Field(description="会话标识")
+    items: list[AttachmentInfo] = Field(default_factory=list, description="按上传时间升序")
+    limits: AttachmentLimits = Field(description="当前生效的上限")
 
 
 class WorkspaceEntryInfo(BaseModel):
@@ -124,6 +161,10 @@ class HistoryMessage(BaseModel):
     tool_call_id: str = Field(
         default="",
         description="工具消息对应的调用标识；非工具消息为空串。导出后要能原样导回，缺了它工具消息无法重建",
+    )
+    attachments: list[AttachmentInfo] = Field(
+        default_factory=list,
+        description="该消息携带的图片附件；正文只保留文字，图片内容在附件目录里独立存放",
     )
 
 

@@ -90,6 +90,49 @@ class PermissionDeniedError(RuntimeError):
         self.permission = permission
 
 
+class VisionUnsupportedError(ValueError):
+    """当前模型不接受图片输入，带附件的请求被拒绝。
+
+    WHY 必须显式拒绝而不是把图片丢掉继续跑：静默丢弃会让用户以为「模型看到了图」，
+    从而按「它看过这张图」去解读回答——错误结论比一次明确的失败危险得多。这条与
+    计划里「不静默退化」的要求一一对应。
+
+    继承 ``ValueError`` 是因为它本质上是「这次请求的输入不被接受」；路由会先按本
+    类型映射，以便给出可操作的提示（换哪个模型）。
+
+    对应 HTTP 400 Bad Request。
+    """
+
+    def __init__(self, model: str, supported: list[str]) -> None:
+        if supported:
+            hint = "、".join(supported)
+        else:
+            hint = "当前没有任何已注册的多模态模型（见 VISION_MODEL_ALIASES）"
+        super().__init__(
+            f"模型 {model} 不支持图片输入，本次请求未发送图片。请切换到支持多模态的模型：{hint}"
+        )
+        self.model = model
+        self.supported = supported
+
+
+class UnsupportedDocumentError(ValueError):
+    """目标文件不是可索引的文本文档，本次索引被拒绝。
+
+    WHY 显式拒绝而不是跳过：静默跳过会让用户以为「这份文档已经进知识库了」，于是
+    检索不到时他会去怀疑检索算法，而不是怀疑「它从来没被索引过」。
+
+    继承 ``ValueError``：它本质上是「这次请求指定的文件不适合做这件事」。路由按 400
+    映射并带上原因，用户据此换一份文件或先转换格式。
+
+    对应 HTTP 400 Bad Request。
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        super().__init__(f"{path} 无法作为文本文档索引：{reason}")
+        self.path = path
+        self.reason = reason
+
+
 class InterruptExpiredError(RuntimeError):
     """待审批的中断已超过挂起 TTL，本次审批不再被接受。
 

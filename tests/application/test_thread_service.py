@@ -7,14 +7,17 @@ WHY 单独成文件：这三件事都在「所有者对自己会话清单的处�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
 import pytest
 
+from application.dto import DeleteOutcome
 from application.errors import NotFoundError, OwnershipError
 from application.principal import Principal
 from application.thread_service import ThreadService
+from runtime.attachments import attachment_dir, save_attachment
 from runtime.thread_store import ThreadMetaStore
 from tests.application.test_audit_enrichment import FakeCheckpointer, FakeGraphFactory
 from tests.application.test_run_governance import RecordingAuditStore
@@ -249,3 +252,30 @@ async def test_list_archived_scope_respects_owner(tmp_path, thread_store):
 
     assert [item.thread_id for item in alice.items] == ["a1"]
     assert [item.thread_id for item in bob.items] == ["b1"]
+
+
+# ------------------------------------------------------------------ 删除与附件
+
+
+async def test_delete_removes_attachments(tmp_path, thread_store):
+    """会话删除必须连带清掉附件目录。
+
+    WHY 单列一条：附件是工作区里的真实文件，而会话一旦删除，它们不再被任何消息
+    引用、界面上也没有入口能看到——留下的每一个都是纯泄漏，且不会有人发现。
+    """
+    config = make_config(tmp_path)
+    config.ensure_directories()
+    workspace = Path(config.workspace)
+    service = _service(tmp_path, thread_store)
+    await thread_store.create("a" * 32)
+    save_attachment(
+        workspace, "a" * 32, filename="shot.png", mime_type="image/png", data=b"\x89PNG\r\n"
+    )
+    assert attachment_dir(workspace, "a" * 32).is_dir()
+
+    result = await service.delete_thread("a" * 32, _principal("alice"))
+
+    # 结果分类取决于 checkpointer 是否支持删除（本用例的替身不支持 → PARTIAL），
+    # 而附件清理与它无关：会话记录一旦删掉，附件就必须一并消失。
+    assert result.outcome in (DeleteOutcome.DELETED, DeleteOutcome.PARTIAL)
+    assert not attachment_dir(workspace, "a" * 32).exists()

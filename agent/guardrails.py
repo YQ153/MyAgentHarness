@@ -10,9 +10,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from deepagents import FilesystemPermission
+from deepagents.middleware.filesystem import supports_execution
 from langchain.agents.middleware import InterruptOnConfig
 
 if TYPE_CHECKING:
+    from deepagents.backends.protocol import BackendProtocol
+
     from config import ExecutionMode, SandboxTier
 
 logger = logging.getLogger(__name__)
@@ -58,16 +61,32 @@ WHY 用黑名单而非白名单：虚拟根目录已经把可见范围限制在�
 """
 
 
-def build_permissions() -> list[FilesystemPermission]:
+def build_permissions(backend: BackendProtocol | None = None) -> list[FilesystemPermission]:
     """构造文件系统权限规则。
 
     规则按声明顺序匹配，首个命中即生效，因此**窄而严的规则必须写在宽而松的
     规则之前**。
 
-    注意：这里的路径是虚拟文件系统路径（相对于 backend 的根目录），
-    不是宿主机绝对路径。
+    WHY 必须按 backend 能力裁剪：工具级权限只作用于 ``ls`` / ``read_file`` /
+    ``write_file`` 这些**工具**，而 ``execute`` 走的是 shell——一条 ``cat .env``
+    能绕过全部路径规则。deepagents 因此在「可执行 backend + 权限规则」组合上
+    直接抛 ``NotImplementedError``（拒绝假装权限仍然生效），而不是放行一条纸面
+    防线。可执行 backend 下只能返回空列表，把凭据防护交给 ``execute`` 的人工
+    审批（``build_interrupt_on``）与沙箱隔离本身；该取舍会被显式告警，**不做
+    静默降级**。
+
+    Args:
+        backend: 已装配的 backend。``None`` 表示调用方自行保证不会执行命令
+            （例如纯配置校验），按「不执行命令」处理并返回完整规则。
+
+    Note:
+        能力判定看的是 ``backend`` 的**默认后端**——``supports_execution`` 对
+        ``CompositeBackend`` 会下钻到 ``default``，与生产装配同形。
+
+    Returns:
+        权限规则列表；backend 具备命令执行能力时为空列表。
     """
-    return [
+    rules = [
         # 1. 窄规则：敏感文件一律拒绝
         FilesystemPermission(
             operations=[_OPERATION_READ, _OPERATION_WRITE],
@@ -87,6 +106,17 @@ def build_permissions() -> list[FilesystemPermission]:
             mode="allow",
         ),
     ]
+
+    if backend is None or not supports_execution(backend):
+        return rules
+
+    logger.warning(
+        "backend 具备命令执行能力：已停用工具级文件权限规则（含 %d 条敏感路径拒绝）。"
+        "execute 经 shell 执行，无法被路径规则约束，deepagents 拒绝该组合；"
+        "凭据防护改由 execute 的人工审批与沙箱隔离承担。",
+        len(_SECRET_PATTERNS),
+    )
+    return []
 
 
 def build_interrupt_on(

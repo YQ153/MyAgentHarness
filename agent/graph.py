@@ -129,7 +129,10 @@ def build_agent(
             tools=list(tools) if tools else None,
             skills=config.skill_source_paths() or None,
             memory=config.memory_paths or None,
-            permissions=build_permissions(),
+            # WHY 传 backend 而不是直接取规则：可执行 backend 下工具级权限
+            # 无法约束 execute，deepagents 会拒绝该组合；由 build_permissions
+            # 按能力裁剪并告警，见其 docstring。
+            permissions=build_permissions(backend),
             interrupt_on=build_interrupt_on(
                 config.execution_mode,
                 config.sandbox_tier,

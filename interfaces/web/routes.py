@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
+from application.attachment_service import AttachmentService
 from application.dto import (
     BranchListResult,
     ImportResult,
@@ -32,6 +34,7 @@ from application.errors import (
     PermissionDeniedError,
     RunRejectedError,
     ThreadBusyError,
+    VisionUnsupportedError,
 )
 from application.events import AgentEvent
 from application.memory_service import MemoryService
@@ -99,6 +102,16 @@ def get_tool_catalog(request: Request) -> ToolCatalog:
 def get_memory_service(request: Request) -> MemoryService:
     """取出记忆管理服务单例。"""
     return require_state(request, "memories", "记忆管理服务")
+
+
+def get_attachments(request: Request) -> AttachmentService:
+    """取出附件服务单例。
+
+    WHY 运行端点需要它：带附件的消息必须在**进入图之前**被构造成多模态内容块——
+    这段构造包含了「模型是否接受图片」的判定，放在运行服务里会让运行服务同时
+    承担会话编排与多模态形态转换两件事。
+    """
+    return require_state(request, "attachments", "附件服务")
 
 
 def _validate_thread_id(thread_id: str) -> str:
@@ -480,6 +493,7 @@ async def run_agent(
     thread_id: str,
     body: ChatRequest,
     runs: RunService = Depends(get_runs),
+    attachments: AttachmentService = Depends(get_attachments),
     principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """发起一轮对话，以 SSE 流式返回事件。
@@ -487,11 +501,29 @@ async def run_agent(
     WHY 不再需要单独的就绪检查：``RunService.stream`` 是普通协程，参数校验与
     模型初始化都在 ``await`` 时同步完成，因此错误能在响应开始之前被映射成
     正常的状态码，不必再为一个 SSE 的传输限制而在服务层额外开一个 API。
+
+    带上 ``attachment_ids`` 时，消息会先被构造成多模态内容块；若目标模型不接受
+    图片，这里直接返回 400 并说明可用的多模态模型，**不会**把图片静默丢掉。
     """
     normalized = _validate_thread_id(thread_id)
 
     try:
-        events = await runs.stream(normalized, body.content, principal=principal, model_name=body.model)
+        content: str | list[dict[str, Any]] = body.content
+        if body.attachment_ids:
+            content = await attachments.build_user_content(
+                normalized,
+                body.content,
+                body.attachment_ids,
+                model_name=body.model,
+                principal=principal,
+            )
+        events = await runs.stream(normalized, content, principal=principal, model_name=body.model)
+    except VisionUnsupportedError as exc:
+        # WHY 单独先接：它是 ValueError 的子类，落到下面那条分支就只会得到
+        # 一句裸错误文本，而这里要保证「换哪个模型」这个关键信息一定被回出去。
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)

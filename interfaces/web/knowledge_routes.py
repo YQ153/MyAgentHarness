@@ -1,0 +1,147 @@
+"""知识库端点：查看索引清单、索引工作区文档、移除单份文档。
+
+约定：
+
+- **归属校验在服务层**（``application.ownership.effective_owner_id``）：路由只把失败
+  映射成状态码，不在这一层再判一次「谁的数据」。
+- **索引是写操作**，用 ``knowledge:write``；查看清单沿用 ``file:read``（与文件面板、
+  会话附件同一口径——知识库的来源就是工作区里的文件）。
+- **切分与嵌入都不在这里**：本模块只把参数交给 ``KnowledgeService``。索引是一项耗时
+  操作（要调用嵌入），把它写在路由里会让「HTTP 层管了业务」这件事从第一天就成立。
+
+WHY 没有检索端点：检索已经以工具形式交付（``search_documents``，见 ``knowledge_tools``），
+Agent 与使用者走的是同一条实现。再加一个 REST 检索端点会形成第二条路径，两条路径的
+排序与融合策略迟早分叉；面板若需要预览，应复用服务层的 ``search``。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+
+from application.knowledge_service import KnowledgeService
+from application.principal import Principal
+from interfaces.web.auth import require_permission
+from interfaces.web.deps import require_state
+from interfaces.web.schemas import (
+    KnowledgeDeleteResponse,
+    KnowledgeIndexItem,
+    KnowledgeIndexRequest,
+    KnowledgeIndexResponse,
+    KnowledgeListResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["knowledge"])
+
+_STATUS_KEYS = ("indexed", "unchanged", "empty", "skipped")
+"""逐份文档的可能状态；与 ``KnowledgeService.index_workspace`` 的汇总口径一致。"""
+
+
+def get_knowledge(request: Request) -> KnowledgeService:
+    """取出知识库服务单例。
+
+    WHY 与工具取的是同一份：它由 ``knowledge_runtime`` 持有整进程唯一的一份，接口与
+    工具共用同一个连接与同一份索引视图（理由见该模块 docstring）。
+    """
+    return require_state(request, "knowledge", "知识库服务")
+
+
+def _as_response(summary: dict[str, Any]) -> KnowledgeIndexResponse:
+    """把服务层的汇总整理成响应模型。
+
+    WHY 需要这一层转换：服务层返回的是普通字典（它不认识 HTTP 模型），而单文档索引
+    与工作区索引的返回形状不同——把两者的归一放在路由里，服务层就不必为了 HTTP 的
+    形状而改变自己的返回。
+    """
+    items = [KnowledgeIndexItem.model_validate(item) for item in summary.get("items", [])]
+    return KnowledgeIndexResponse(
+        scanned=int(summary.get("scanned", len(items))),
+        indexed=int(summary.get("indexed", 0)),
+        unchanged=int(summary.get("unchanged", 0)),
+        empty=int(summary.get("empty", 0)),
+        skipped=int(summary.get("skipped", 0)),
+        items=items,
+    )
+
+
+def _single_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """把单文档索引结果整理成与工作区索引同形的汇总。"""
+    state = str(result.get("status", ""))
+    summary: dict[str, Any] = {"scanned": 1, "items": [result]}
+    for key in _STATUS_KEYS:
+        summary[key] = 1 if state == key else 0
+    return summary
+
+
+@router.get("/api/knowledge", response_model=KnowledgeListResponse)
+async def list_knowledge(
+    service: KnowledgeService = Depends(get_knowledge),
+    principal: Principal = Depends(require_permission("file:read")),
+) -> KnowledgeListResponse:
+    """返回当前主体已索引的文档、索引规模与知识库能力。
+
+    只包含本主体的文档；认证关闭时全部归属同一个空 ``owner_id``。
+    """
+    return KnowledgeListResponse.model_validate(await service.list_documents(principal=principal))
+
+
+@router.post("/api/knowledge", response_model=KnowledgeIndexResponse)
+async def index_knowledge(
+    payload: KnowledgeIndexRequest | None = Body(default=None),
+    service: KnowledgeService = Depends(get_knowledge),
+    principal: Principal = Depends(require_permission("knowledge:write")),
+) -> KnowledgeIndexResponse:
+    """索引工作区中的文本文档；给出 ``path`` 时只索引那一份。
+
+    无法索引的文件（二进制、非 UTF-8、超过字节上限）按条跳过并计入 ``skipped``，
+    逐条原因在 ``items[].detail`` 里——一份怪文件不该让整次索引失败。
+
+    Raises:
+        HTTPException: 400 路径非法 / 文件不适合索引；404 指定文件不存在。
+    """
+    request_body = payload or KnowledgeIndexRequest()
+    try:
+        if request_body.path:
+            summary = _single_summary(
+                await service.index_document(
+                    request_body.path, principal=principal, force=request_body.force
+                )
+            )
+        else:
+            summary = await service.index_workspace(
+                principal=principal, force=request_body.force
+            )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        # ``UnsupportedDocumentError`` 与 ``WorkspacePathError`` 都是它的子类：
+        # 前者是「这个文件不适合做文档」，后者是「这个路径不合法」，处置相同。
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return _as_response(summary)
+
+
+@router.delete("/api/knowledge", response_model=KnowledgeDeleteResponse)
+async def delete_knowledge(
+    source_path: str = Query(alias="path", description="要移除的源文件虚拟路径"),
+    service: KnowledgeService = Depends(get_knowledge),
+    principal: Principal = Depends(require_permission("knowledge:write")),
+) -> KnowledgeDeleteResponse:
+    """从知识库移除一份文档；**不影响工作区里的源文件**。
+
+    WHY 用查询参数而不是路径参数：虚拟路径本身含 ``/``，放进路径段就得靠百分号编码
+    才能传对，而编码错的形式在日志里几乎无法辨认。
+
+    Raises:
+        HTTPException: 400 路径非法。
+    """
+    try:
+        deleted = await service.remove_document(source_path, principal=principal)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return KnowledgeDeleteResponse(source_path=source_path, deleted=deleted)

@@ -21,8 +21,10 @@ from bootstrap.web import (
     build_run_governance_worker,
 )
 from config import AppConfig
+from interfaces.web.attachment_routes import router as attachment_router
 from interfaces.web.auth import router as auth_router
 from interfaces.web.health import router as health_router
+from interfaces.web.knowledge_routes import router as knowledge_router
 from interfaces.web.request_context import RequestContextMiddleware
 from interfaces.web.routes import router
 from interfaces.web.workspace_routes import router as workspace_router
@@ -89,6 +91,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.usage = context.usage
             app.state.tools = context.tools
             app.state.memories = context.memories
+            app.state.attachments = context.attachments
+            # WHY 挂的是 context 里那一个：工具侧（knowledge_runtime）取的就是它，
+            # 接口另建一份会让「工具检索得到、清单里没有」这类矛盾同时成立。
+            app.state.knowledge = context.knowledge
 
             logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
             yield
@@ -152,6 +158,8 @@ def create_app(config: AppConfig) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(router)
     app.include_router(workspace_router)
+    app.include_router(attachment_router)
+    app.include_router(knowledge_router)
 
     if _STATIC_DIR.is_dir():
         # WHY 静态挂载必须放在路由注册之后：挂载 "/" 会吞掉之后注册的所有

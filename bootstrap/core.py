@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from agent.graph import AgentFactory, get_registry
 from agent.profiles import ensure_profiles_registered
 from agent.tooling import build_tool_bundle
+from application.attachment_service import AttachmentService
 from application.health import HealthService
 from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
@@ -24,6 +25,7 @@ from application.usage_service import UsageService
 from application.workspace_service import WorkspaceService
 from bootstrap.context import AppContext
 from config import AppConfig
+from knowledge_runtime import close_service, ensure_service
 from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
@@ -75,6 +77,10 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         # 只会把失败推迟到某次具体对话。
         tool_bundle = await build_tool_bundle(config)
         tool_catalog = ToolCatalog(tool_bundle)
+        # WHY 知识库在这里装配：它的连接要活到进程结束，而自定义工具扩展点只把
+        # ``config`` 交给工具模块、没有注入依赖的通道——因此由 knowledge_runtime
+        # 持有整进程唯一的一份，工具与接下来的接口都取用它（理由见该模块 docstring）。
+        knowledge = await ensure_service(config)
         graph_factory = AgentFactory(
             config,
             checkpointer=checkpointer,
@@ -134,13 +140,29 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             # WHY 与 Agent 共享同一个工作区根：文件面板要展示的正是 Agent 读写
             # 的那片目录，指向不同根会出现「Agent 写了但面板看不见」。
             workspace=WorkspaceService(config, audit_store=audit_store),
+            # WHY 复用同一个 registry 实例：附件能不能发给某个模型，取决于它是否
+            # 接受图片；另建一份注册表会让「/api/models 说支持、上传却说不行」。
+            attachments=AttachmentService(
+                config,
+                registry=registry,
+                thread_store=thread_store,
+                audit_store=audit_store,
+            ),
+            knowledge=knowledge,
         )
 
         logger.info(
-            "核心依赖装配完成：db=%s auth_mode=%s tools=%d",
+            "核心依赖装配完成：db=%s auth_mode=%s tools=%d 向量检索=%s",
             config.db_path,
             config.auth_mode,
             len(tool_bundle.tools),
+            knowledge.capabilities()["vector_enabled"],
         )
-        yield context
-        logger.info("核心依赖已释放")
+        try:
+            yield context
+        finally:
+            # WHY 单独关闭知识库：它的连接由 knowledge_runtime 的退出栈持有（工具与
+            # 接口要用同一份实例），不在上面的 ``async with`` 组里。放在 finally 里，
+            # 异常退出时也能收干净。
+            await close_service()
+            logger.info("核心依赖已释放")

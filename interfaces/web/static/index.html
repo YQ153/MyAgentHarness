@@ -19,6 +19,12 @@
         <button id="memory-open" type="button">记忆</button>
         <!-- 工作区面板：Agent 产出的文件都在这里，只读 -->
         <button id="workspace-open" type="button">工作区</button>
+        <!--
+          知识库面板：索引工作区文档供 Agent 检索。
+          与记忆入口同理对所有人可见——索引按主体收敛（knowledge:write 是 member 的默认权限），
+          放进「仅管理员可见」的管理面板会让普通成员管不了自己那份索引。
+        -->
+        <button id="knowledge-open" type="button">知识库</button>
         <div id="auth-status" class="auth-status"></div>
       </div>
     </header>
@@ -50,14 +56,27 @@
     </div>
 
     <footer class="composer">
-      <textarea
-        id="input"
-        rows="1"
-        placeholder="输入任务，Enter 发送，Shift+Enter 换行"
-        autocomplete="off"
-      ></textarea>
-      <button id="stop" type="button" class="danger" hidden>停止</button>
-      <button id="send" type="button">发送</button>
+      <div id="attachment-strip" class="composer-attachments" hidden></div>
+      <div id="attachment-hint" class="composer-hint" hidden></div>
+      <div class="composer-row">
+        <button id="attach" type="button" class="icon-btn" title="添加图片">＋</button>
+        <!-- accept 只作引导：真正的类型判定在服务端白名单，改这里不构成放行 -->
+        <input
+          id="attach-input"
+          type="file"
+          accept="image/png,image/jpeg,image/webp,image/gif"
+          multiple
+          hidden
+        />
+        <textarea
+          id="input"
+          rows="1"
+          placeholder="输入任务，Enter 发送，Shift+Enter 换行"
+          autocomplete="off"
+        ></textarea>
+        <button id="stop" type="button" class="danger" hidden>停止</button>
+        <button id="send" type="button">发送</button>
+      </div>
     </footer>
   </div>
   <!-- 管理面板：仅管理员可见 -->
@@ -143,6 +162,27 @@
         <div class="workspace-tree" id="workspace-tree"></div>
         <div class="workspace-preview" id="workspace-preview"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- 知识库面板：数据来自 GET /api/knowledge，按主体收敛 -->
+  <div id="knowledge-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>知识库</h3>
+        <button id="knowledge-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="knowledge-hint">
+        索引工作区里的文本文档后，Agent 可通过 <code>search_documents</code> 检索到它们。
+        索引只<b>读</b>工作区文件；「移除」只清掉索引，<b>不会删除源文件</b>。
+      </p>
+      <div class="knowledge-toolbar">
+        <button id="knowledge-index" type="button" class="primary">索引工作区</button>
+        <button id="knowledge-refresh" type="button">刷新</button>
+      </div>
+      <div id="knowledge-caps" class="knowledge-caps"></div>
+      <div id="knowledge-list" class="knowledge-list"></div>
     </div>
   </div>
 
