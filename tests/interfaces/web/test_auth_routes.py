@@ -44,11 +44,41 @@ class _StubKeyStore:
         return self._records.get(key)
 
 
-def _build_client(config: Any, *, api_key_store: Any = None) -> TestClient:
-    """构造只挂认证路由 + 一个受权限保护的探针的最小应用。"""
+class _StubAuditStore:
+    """审计存储替身：只回答「列出事件」，用于验证端点确实取到了装配好的存储。"""
+
+    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+        self.events = events or []
+        self.calls: list[dict[str, Any]] = []
+
+    async def list(
+        self,
+        *,
+        actor_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """记录调用参数并返回预置事件。"""
+        self.calls.append(
+            {"actor_id": actor_id, "event_type": event_type, "limit": limit, "offset": offset}
+        )
+        return self.events
+
+
+def _build_client(
+    config: Any, *, api_key_store: Any = None, audit_store: Any = None
+) -> TestClient:
+    """构造只挂认证路由 + 一个受权限保护的探针的最小应用。
+
+    注意 ``audit_store`` 为 ``None`` 时**不**挂该项——这正是「lifespan 漏铺」在真机上
+    的下场，用来断言此时端点的行为（503 而不是 500）。
+    """
     app = FastAPI()
     app.state.config = config
     app.state.api_key_store = api_key_store
+    if audit_store is not None:
+        app.state.audit_store = audit_store
     app.include_router(auth_router)
 
     @app.get("/probe")
@@ -196,3 +226,37 @@ def test_api_key_store_unavailable_yields_401(tmp_path):
     client = _build_client(_apikey_config(tmp_path, auth_api_key_dev=""))
 
     assert client.get("/probe", headers={"X-API-Key": "anything"}).status_code == 401
+
+
+# ------------------------------------------------------------------ /auth/audit
+
+
+def test_audit_endpoint_reads_events_from_wired_store(tmp_path):
+    """审计查询端点必须能取到 lifespan 铺好的存储。
+
+    WHY 单独立一条：``app.state.audit_store`` 曾经漏铺，这个端点在真机上直接 500
+    （AttributeError），而单元测试里没人挂过它、也就没人发现。
+    """
+    store = _StubAuditStore(
+        [{"event_type": "apikey_auth_success", "actor_id": "apikey:dev"}]
+    )
+    client = _build_client(
+        _apikey_config(tmp_path), api_key_store=_StubKeyStore(), audit_store=store
+    )
+
+    response = client.get("/auth/audit?limit=10", headers={"X-API-Key": _DEV_KEY})
+
+    assert response.status_code == 200
+    assert response.json()[0]["event_type"] == "apikey_auth_success"
+    # 查询参数必须原样透传：limit 被吞掉的表现是「面板永远只显示 50 条」
+    assert store.calls[0]["limit"] == 10
+
+
+def test_audit_endpoint_reports_503_when_store_missing(tmp_path):
+    """存储未装配是 503（暂时不可用），不是 500——后者会把「漏装配」说成「服务有 bug」。"""
+    client = _build_client(_apikey_config(tmp_path), api_key_store=_StubKeyStore())
+
+    response = client.get("/auth/audit", headers={"X-API-Key": _DEV_KEY})
+
+    assert response.status_code == 503
+    assert "未初始化" in response.json()["detail"]

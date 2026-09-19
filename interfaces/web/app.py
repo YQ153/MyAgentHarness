@@ -72,9 +72,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
             # 保持既有路由代码不变。
-            app.state.context = context
+            # WHY 凡是路由会读的依赖都必须在这里铺开：漏掉一项时，宽容的读取点
+            # （``getattr(state, name, None)``）会静默降级——``auth/audit.py`` 就因此
+            # 把**全部认证审计**（登录成功/失败、权限拒绝、logout、key 增删）丢了很久，
+            # 而严格的读取点（``state.audit_store``）会在真机上直接 500。
+            # 这条约束由 tests/interfaces/web/test_app_state_contract.py 静态兜住。
+            app.state.audit_store = context.audit_store
             app.state.rate_limiter = rate_limiter
             app.state.api_key_store = context.api_key_store
+            app.state.context = context
             app.state.threads = context.threads
             app.state.workspace = context.workspace
             app.state.runs = context.runs

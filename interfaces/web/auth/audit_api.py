@@ -10,9 +10,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
-from application.ports import AuditSink
 from application.principal import Principal
 from interfaces.web.auth.deps import require_permission
+from interfaces.web.deps import require_state
 
 router = APIRouter()
 
@@ -29,9 +29,12 @@ async def list_audit(
     """读取审计日志（仅管理员）。
 
     Raises:
-        HTTPException: 401/403 由 ``require_permission`` 抛出。
+        HTTPException: 401/403 由 ``require_permission`` 抛出；503 表示审计存储未装配。
     """
-    audit_store: AuditSink = request.app.state.audit_store
+    # WHY 走 require_state 而不是直接取属性：直接取会在「lifespan 漏铺一项」时抛
+    # AttributeError，由框架兜成 500 + 一屏栈——运维看到的是「服务端有 bug」，而这
+    # 其实是「依赖没装配」。503 才是这条事实的准确表达，也让探活系统能正确摘除实例。
+    audit_store = require_state(request, "audit_store", "审计日志存储")
     return await audit_store.list(
         actor_id=actor_id,
         event_type=event_type,
