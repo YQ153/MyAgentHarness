@@ -36,6 +36,12 @@ def test_markdown_suite_passes() -> None:
         [NODE, "--test", str(SUITE)],
         capture_output=True,
         text=True,
+        # WHY 显式指定编码：node 的报告里带中文用例名，而 Windows 上 subprocess 默认按
+        # locale（cp936）解码，会在读取线程里抛 UnicodeDecodeError——表现为本用例失败，
+        # 且失败信息与「渲染器是否安全」毫无关系。errors="replace" 是兜底：即便上游输出
+        # 里混进别的编码，也要把断言跑完再判，而不是在解码处中断。
+        encoding="utf-8",
+        errors="replace",
         cwd=ROOT,
         timeout=180,
     )
