@@ -344,7 +344,7 @@
 │       ├── app.py          ★ FastAPI 工厂与 lifespan 资源管理
 │       ├── routes.py       ★ REST 与 SSE 端点
 │       ├── schemas.py      请求/响应 Pydantic 模型
-│       └── static/         前端三件套（index.html / app.js / styles.css）
+│       └── static/         前端静态资源（无构建步骤：index.html / app.js / styles.css / markdown.js / auth_credential.js）
 ├── llm/                    模型层
 │   ├── registry.py         ★ 模型注册表与构造
 │   └── __init__.py         对外仅暴露 ModelRegistry / ModelSpec
@@ -1015,6 +1015,39 @@ ON CONFLICT(thread_id) DO UPDATE SET
   否则流式输出会退化成一次性返回。
 </p>
 
+<h4>认证与凭据（<code>auth/</code> 与 <code>auth_credential.js</code>）</h4>
+<p>
+  认证只有两件事：<code>get_principal</code> 把请求翻译成 <code>Principal</code>，
+  <code>require_permission</code> 逐端点施加权限（任何路由都必须经过它，不允许自写角色判断）；
+  <code>/auth/*</code> 提供前端所需的配置与 API Key 管理。
+</p>
+<table>
+  <thead><tr><th>档位</th><th>凭据来源</th><th>得到的主体</th></tr></thead>
+  <tbody>
+    <tr><td><code>disabled</code></td><td>不需要凭据</td><td>匿名管理员（本地开发形态）</td></tr>
+    <tr><td><code>apikey</code></td>
+      <td>配置指定的请求头（默认 <code>X-API-Key</code>），或 <code>Authorization: Bearer</code></td>
+      <td>dev key → <code>apikey:dev</code>（admin）；库中的 key → 该记录里的 role</td></tr>
+  </tbody>
+</table>
+<p>
+  <code>GET /auth/config</code> 是前端唯一需要的认证配置：<code>auth_mode</code> 决定
+  「要不要凭据」，<code>auth_api_key_header</code> 决定「放进哪个头」。WHY 要回请求头名：
+  它是可配置项，前端写死 <code>X-API-Key</code> 会在这条配置被改掉时表现为
+  「界面一直说未认证、<code>curl</code> 却能用」——两处用的是不同的头，而报错里看不出这一点。
+</p>
+<div class="box">
+  <span class="t">浏览器怎么持凭据</span>
+  apikey 模式的凭据不进服务端（<code>/auth/logout</code> 也只剩「记一笔审计 + 回首页」），
+  所以没有登录页可跳——<strong>浏览器本身就是一种「持有密钥的调用方」</strong>。
+  <code>static/auth_credential.js</code> 把这把 key 存在本机 <code>localStorage</code>，
+  <code>app.js</code> 的 <code>api()</code> 在每一个请求上注入它（不覆盖调用方显式给出的同名头）；
+  收到 401 时清掉失效凭据并弹出「设置 API Key」对话框，顶栏常驻入口，退出 = 先记一条
+  <code>logout</code> 审计再清本机凭据。未认证且手上无凭据时首屏会主动弹一次对话框——
+  否则用户面对的是满屏 401 与零条可操作的线索。凭据的两种来源见
+  <code>docs/auth/认证与鉴权体系.md</code>「本项目的凭据流转」。
+</div>
+
 <h4><code>schemas.py</code>：请求/响应模型</h4>
 <ul>
   <li><code>ChatRequest</code>（<code>:29</code>）：<code>content</code>（<code>min_length=1</code>）+ 可选 <code>model</code>；</li>
@@ -1363,6 +1396,9 @@ StreamingResponse(text/event-stream)
     <tr><td><code>DB_PATH</code></td><td><code>./.data/agent.db</code></td><td>展开为绝对路径</td><td>SQLite 数据库（检查点表 + 会话元数据表）</td></tr>
     <tr><td><code>THREAD_TITLE_MAX_CHARS</code></td><td><code>24</code></td><td>1–200</td><td>会话列表标题的字符上限，超出以省略号截断</td></tr>
     <tr><td>HOST / PORT</td><td><code>127.0.0.1</code> / <code>8000</code></td><td>端口 1–65535</td><td>Web 监听地址与端口</td></tr>
+    <tr><td><code>AUTH_MODE</code></td><td><code>disabled</code></td><td><code>disabled</code> / <code>apikey</code></td><td>认证档位；绑非回环地址却仍为 <code>disabled</code> 时启动告警</td></tr>
+    <tr><td><code>AUTH_API_KEY_HEADER</code></td><td><code>X-API-Key</code></td><td>非空字符串</td><td>apikey 模式下凭据所在的请求头名；前端从 <code>/auth/config</code> 读它，不写死</td></tr>
+    <tr><td><code>AUTH_API_KEY_DEV</code></td><td><code>（空）</code></td><td>非空即启用</td><td>开发用静态 key（admin 全权限）；用于引导出第一把库内 key，生产应置空</td></tr>
     <tr><td><code>LOG_LEVEL</code></td><td><code>INFO</code></td><td>—</td><td>日志级别</td></tr>
   </tbody>
 </table>

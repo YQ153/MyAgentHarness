@@ -58,7 +58,9 @@ def _now() -> str:
 def _generate_key() -> str:
     """生成高熵 API Key。
 
-    格式：``harness_<随机 43 字符>``，总共约 51 字符，便于用户识别来源。
+    格式：``harness_<随机 32 字符>``，共 40 字符，便于用户识别来源
+    （``harness_`` 前缀 + ``_KEY_BYTES`` 个 ``[_ALPHABET]`` 字符；
+    每字符 log2(62) ≈ 5.95 bit，合计约 190 bit 熵，远超暴力枚举的门槛）。
     """
     return "harness_" + "".join(secrets.choice(_ALPHABET) for _ in range(_KEY_BYTES))
 

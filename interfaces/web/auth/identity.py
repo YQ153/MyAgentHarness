@@ -65,10 +65,17 @@ async def me(principal: Principal | None = Depends(get_principal)) -> dict[str, 
 
 @router.get("/config")
 async def auth_config(request: Request) -> dict[str, Any]:
-    """返回前端所需的认证配置。"""
+    """返回前端所需的认证配置。
+
+    WHY 要暴露 ``auth_api_key_header``：请求头名可配置（``AUTH_API_KEY_HEADER``），
+    浏览器端必须知道该把凭据放进哪个头才能自己发起请求。前端硬编码 ``X-API-Key``
+    会在这条配置被改掉时表现为「界面一直说未认证、curl 却能用」——两边用的是
+    不同的头，而错误信息里看不出这一点。
+    """
     config: AppConfig = request.app.state.config
     return {
         "auth_mode": config.auth_mode,
+        "auth_api_key_header": config.auth_api_key_header,
         "logout_url": "/auth/logout",
         "me_url": "/auth/me",
     }

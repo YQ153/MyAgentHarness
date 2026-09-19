@@ -163,6 +163,44 @@
     </div>
   </div>
 
+  <!--
+    API Key 凭据对话框：apikey 模式下浏览器唯一的凭据入口。
+    服务端没有登录页（凭据不在服务端），因此这里要的不是「登录」，而是「把调用方
+    手里的 key 交给这个页面」——它只写进本机浏览器的 localStorage。
+  -->
+  <div id="auth-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-small">
+      <div class="modal-header">
+        <h3>设置 API Key</h3>
+        <button id="auth-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="hint">
+        这里要的是<strong>本服务的访问凭据</strong>，<strong>不是</strong>模型供应商
+        （DeepSeek / OpenAI）的 API Key：填 <code>.env</code> 里
+        <code>AUTH_API_KEY_DEV</code> 的值，或在「管理」面板创建一条
+        （形如 <code>harness_…</code>，明文只显示一次）。凭据只保存在本机浏览器的
+        localStorage，不会发给其它站点。
+      </p>
+      <form id="auth-form" class="auth-form">
+        <label for="auth-key">请求头 <code id="auth-header-name">X-API-Key</code></label>
+        <input
+          id="auth-key"
+          type="password"
+          autocomplete="off"
+          placeholder="粘贴 AUTH_API_KEY_DEV 的值，或 harness_…"
+        />
+        <div class="auth-actions">
+          <button id="auth-clear" type="button">清除凭据</button>
+          <button type="submit" class="primary">保存</button>
+        </div>
+      </form>
+      <p id="auth-msg" class="auth-msg"></p>
+    </div>
+  </div>
+
+  <!-- 必须在 app.js 之前：请求头注入依赖它的全局 AuthCredential -->
+  <script src="/auth_credential.js"></script>
   <!-- 必须在 app.js 之前：助手消息的渲染依赖它的全局 Markdown -->
   <script src="/markdown.js"></script>
   <script src="/app.js"></script>

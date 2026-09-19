@@ -45,6 +45,13 @@
     apikeyCopy: document.getElementById('apikey-copy'),
     popupClose: document.getElementById('popup-close'),
     copyMsg: document.getElementById('copy-msg'),
+    authModal: document.getElementById('auth-modal'),
+    authClose: document.getElementById('auth-close'),
+    authForm: document.getElementById('auth-form'),
+    authKey: document.getElementById('auth-key'),
+    authClear: document.getElementById('auth-clear'),
+    authHeaderName: document.getElementById('auth-header-name'),
+    authMsg: document.getElementById('auth-msg'),
     auditRefresh: document.getElementById('audit-refresh'),
     auditTableBody: document.querySelector('#audit-table tbody'),
     memoryOpen: document.getElementById('memory-open'),
@@ -66,7 +73,14 @@
     /** 助手气泡里的正文容器；用量标签与工具卡片是它的兄弟节点。 */
     assistantBody: null,
     toolNodes: [],
-    auth: { mode: 'disabled', principal: null },
+    auth: {
+      mode: 'disabled',
+      principal: null,
+      /** 请求头名；由 /auth/config 给出（服务端可配置），默认取模块里的兜底值。 */
+      header: 'X-API-Key',
+      /** 当前凭据；来自本机 localStorage，读不到时为空串。 */
+      credential: '',
+    },
     admin: { apikeys: [] },
     /** 会话清单的过滤条件；与界面控件保持一致，刷新清单时统一从这里取。 */
     threadFilter: { query: '', includeArchived: false },
@@ -129,12 +143,35 @@
   }
 
   async function api(path, options) {
-    const response = await fetch(path, options);
+    // WHY 在这里统一注入凭据而不是让每个调用点自己拼头：本文件有二十多处 fetch，
+    // 漏一处的表现是「某一个面板莫名其妙一直未认证」，而那种失败只在使用该面板时
+    // 才出现。集中在一处之后，"谁需要认证" 只剩服务端的权限规则一个真相。
+    const merged = Object.assign({}, options || {});
+    merged.headers = AuthCredential.headersWithCredential(
+      merged.headers,
+      state.auth.credential,
+      state.auth.header
+    );
+
+    const response = await fetch(path, merged);
     if (!response.ok) {
-      // WHY 401 不跳任何登录页：凭据由调用方持有（客户端保存 API Key），
+      // WHY 401 不跳任何登录页：凭据由调用方持有（本机浏览器保存 API Key），
       // 服务端没有登录页可跳；把「未认证」如实报出来，比跳到一个不存在的地址更有用。
       if (response.status === 401) {
-        throw new Error('未认证：请在请求头带上有效的 API Key');
+        // WHY 只有「本轮真的带了凭据」才判定为凭据失效：未带凭据的 401 是正常的
+        // 未认证态（例如首屏的 /auth/me 探测），若也清凭据、弹对话框，用户会看到
+        // 一个凭空出现的报错，却根本没设置过任何东西。
+        if (state.auth.credential) {
+          AuthCredential.clear(window.localStorage);
+          state.auth.credential = '';
+          // WHY 连主体一起置空：主体是用那把**已经失效**的凭据换来的，留着它会让顶栏
+          // 继续显示「已认证」，而实际每个请求都在 401——界面与事实相反时，用户会先
+          // 怀疑网络，而不是怀疑凭据。
+          state.auth.principal = null;
+          renderAuth();
+          openAuthDialog('凭据已失效或已被吊销，请重新粘贴 API Key。');
+        }
+        throw new Error('未认证：请在右上角「设置 API Key」里粘贴凭据');
       }
       let detail = `HTTP ${response.status}`;
       try {
@@ -398,9 +435,23 @@
     }
   }
 
-  /** 加载历史会话的消息并重绘。 */
-  async function openThread(threadId) {
-    if (state.running || !threadId) return;
+  /**
+   * 加载历史会话的消息并重绘。
+   *
+   * Args:
+   *   threadId: 要打开的会话。
+   *   force: 允许在 `state.running` 为真时重载。默认 `false` —— 守卫的用途是
+   *     「运行中不要切走会话」，否则流式渲染会被清掉。
+   *
+   * WHY 需要 `force`：本轮流的**收尾**处（编辑分叉、重新生成之后）也要重载，
+   * 而那一刻 `state.running` 仍为真（`setRunning(false)` 在 `finally` 里）。
+   * 如果没有这个开关，那三处调用就只能二选一：要么被守卫挡成静默空转（界面停在
+   * 旧分支上，用户以为操作没生效），要么去掉守卫、把「运行中切会话」这个保护一并
+   * 丢掉。`force` 把「同一会话的收尾重载」与「切到另一个会话」这两种意图分开。
+   */
+  async function openThread(threadId, { force = false } = {}) {
+    if (!threadId) return;
+    if (state.running && !force) return;
 
     state.threadId = threadId;
     state.assistantEl = null;
@@ -894,8 +945,9 @@
       await handleStream(response);
       // WHY 分叉后重载而不是就地拼接：编辑与重新生成会切到一条**新的**分支，
       // 就地拼出来的画面仍是旧分支的历史加上新回复，看着像接错了上下文。
+      // WHY force：此刻仍在 `setRunning(true)` 的区间内，不带 force 会被守卫挡掉。
       if (editing !== null) {
-        await loadThread(state.threadId);
+        await openThread(state.threadId, { force: true });
       }
     } catch (err) {
       appendError(err.message);
@@ -922,7 +974,9 @@
         model: els.modelSelect.value || null,
       });
       await handleStream(response);
-      await loadThread(state.threadId);
+      // WHY force：重新生成一定落在一条**新的**分支上，旧画面必须换掉；而这里仍在
+      // `setRunning(true)` 区间内，不带 force 会被 openThread 的守卫挡掉。
+      await openThread(state.threadId, { force: true });
     } catch (err) {
       appendError('重新生成失败：' + err.message);
     } finally {
@@ -995,7 +1049,8 @@
         { method: 'POST' }
       );
       state.branch = branchId || null;
-      await loadThread(state.threadId);
+      // 本函数开头已经挡掉运行中的情况，因此这里无需 force：守卫与它同义。
+      await openThread(state.threadId);
     } catch (err) {
       appendError('切换分支失败：' + err.message);
     }
@@ -1063,12 +1118,18 @@
 
     const principal = state.auth.principal;
     if (!principal) {
-      // 没有登录入口：apikey 模式下凭据由调用方自己携带
+      // WHY 给一个入口而不是留空：apikey 模式下没有登录页可跳，凭据必须由使用者
+      // 交给这个页面。留空的话，用户面对的是一整屏「未认证」报错和零条可操作的线索。
+      container.appendChild(authEntry('设置 API Key'));
       return;
     }
 
     const name = el('span', 'auth-name', principal.display_name || principal.user_id);
     container.appendChild(name);
+
+    // 已认证时也保留入口：凭据可能被吊销、也可能要换成另一把（例如从 dev key 换成
+    // 面向调用方签发的 key），那时唯一的办法就是重新粘贴。
+    container.appendChild(authEntry('API Key'));
 
     // 仅管理员显示管理入口
     if ((principal.permissions || []).includes('apikey:manage')) {
@@ -1081,9 +1142,125 @@
       container.appendChild(manage);
     }
 
-    const logout = el('a', 'auth-link', '退出');
-    logout.href = '/auth/logout';
-    container.appendChild(logout);
+    const logoutEntry = el('a', 'auth-link', '退出');
+    logoutEntry.href = '#';
+    logoutEntry.addEventListener('click', (event) => {
+      event.preventDefault();
+      logout();
+    });
+    container.appendChild(logoutEntry);
+  }
+
+  /* ------------------------------------------------------------------ API Key 凭据 */
+
+  /** 顶栏的凭据入口；未认证时是「设置 API Key」，已认证时用来换/清凭据。 */
+  function authEntry(text) {
+    const entry = el('a', 'auth-link', text);
+    entry.href = '#';
+    entry.addEventListener('click', (event) => {
+      event.preventDefault();
+      openAuthDialog('');
+    });
+    return entry;
+  }
+
+  /**
+   * 打开凭据对话框。
+   *
+   * Args:
+   *   message: 显示在对话框底部的提示；用来说明「为什么要你现在粘贴」，
+   *     例如凭据刚被吊销、或清除后需要重新提供。空串表示没有额外上下文。
+   */
+  function openAuthDialog(message) {
+    els.authHeaderName.textContent = state.auth.header;
+    els.authMsg.textContent = message || '';
+    // WHY 不回填已保存的凭据：把 key 重新显示在输入框里等于给它多一个暴露面
+    // （截屏、投屏、旁人一眼看到），而需要换 key 的人本来就能从 .env 或管理面板再取。
+    els.authKey.value = '';
+    els.authModal.style.display = '';
+    els.authKey.focus();
+  }
+
+  function closeAuthDialog() {
+    els.authModal.style.display = 'none';
+    els.authMsg.textContent = '';
+    els.authKey.value = '';
+  }
+
+  function submitAuthKey(event) {
+    event.preventDefault();
+    const result = AuthCredential.save(window.localStorage, els.authKey.value);
+    if (!result.value) {
+      els.authMsg.textContent = '请先粘贴 API Key。';
+      return;
+    }
+    state.auth.credential = result.value;
+
+    if (!result.stored) {
+      // storage 不可用（隐私模式 / 禁止站点数据）：本次页面仍可用，但刷新后要重贴。
+      // 因此这里不能重载页面——那会把刚拿到的凭据立刻丢掉。
+      closeAuthDialog();
+      appendNotice('浏览器拒绝了本地存储：凭据只在本次页面有效，刷新后需要重新粘贴。');
+      loadAuth();
+      loadThreads();
+      return;
+    }
+
+    // WHY 保存后整页重载：凭据影响此后每一个请求，而当前页面上渲染出来的内容
+    // （会话清单、记忆、工作区、错误气泡）全都来自未认证时的失败路径。逐块刷新会把
+    // 「哪些块依赖凭据」散到各处，重载只有一个入口，也顺带清掉上一轮的报错。
+    location.reload();
+  }
+
+  /**
+   * 清除本机保存的凭据。
+   *
+   * WHY 与保存相反、这里不整页重载：保存是「从无到有」，页面上此前渲染的一切都来自
+   * 失败路径，必须整体重来；而清除是「从有到无」，此后任何一次读取都会 401 并走
+   * ``api()`` 的统一处理，界面不会停留在「看起来还认证着」的状态。
+   */
+  function clearCredential() {
+    const cleared = AuthCredential.clear(window.localStorage);
+    state.auth.credential = '';
+    state.auth.principal = null;
+    renderAuth();
+    closeAuthDialog();
+    // WHY 连 storage 不可用的情况也照样说明：此时凭据只存在于内存，这一次清除同样
+    // 生效，只是下次打开页面本来也不会有残留——两句话对应两件事，不合并。
+    appendNotice(
+      cleared
+        ? '已清除本机保存的 API Key：此后每个请求都以未认证身份发出。'
+        : '已清除本次页面使用的 API Key（浏览器未允许本地存储，本无残留）。'
+    );
+    if (state.auth.mode !== 'disabled') {
+      openAuthDialog('凭据已清除。粘贴新的 key 即可继续使用。');
+    }
+  }
+
+  /**
+   * 退出：先让服务端记一笔审计，再清掉本机凭据。
+   *
+   * WHY 顺序不能颠倒：主体是靠凭据换来的，先清凭据会让这条 ``logout`` 审计的 actor
+   * 变成 ``anonymous``——等于把「谁退出了」这件事丢掉。
+   * WHY 不能只依赖服务端：apikey 模式的凭据根本不在服务端（它在浏览器的
+   * localStorage 里），真正让「退出」生效的只有本机这一步。
+   */
+  async function logout() {
+    try {
+      await api('/auth/logout');
+    } catch (err) {
+      // WHY 只提示、不阻断：审计没写成不该让用户卡在「退不出去」的状态；本机凭据
+      // 照样清掉，只是这一次退出没有留下服务端记录。
+      appendNotice('服务端未记录本次退出：' + err.message);
+    }
+    clearCredential();
+  }
+
+  function bindAuthEvents() {
+    els.authClose.addEventListener('click', closeAuthDialog);
+    els.authModal.querySelector('.modal-backdrop').addEventListener('click', closeAuthDialog);
+    els.authForm.addEventListener('submit', submitAuthKey);
+    els.authClear.addEventListener('click', clearCredential);
   }
 
   /* ------------------------------------------------------------------ 管理面板 */
@@ -1561,17 +1738,26 @@ function bindWorkspaceEvents() {
 }
 
 async function loadAuth() {
+    // WHY 先读本机凭据再问服务端：/auth/me 要靠它才有结果，顺序反了首屏必然多一次
+    // 注定 401 的请求。
+    state.auth.credential = AuthCredential.read(window.localStorage);
+
     try {
       const cfgResponse = await api('/auth/config');
       const cfg = await cfgResponse.json();
       state.auth.mode = cfg.auth_mode || 'disabled';
+      // WHY 头名取自服务端而不是写死 X-API-Key：它是可配置项（AUTH_API_KEY_HEADER），
+      // 写死会在该配置被改掉时表现为「界面一直说未认证、curl 却能用」——两处用的是
+      // 不同的头，而报错里看不出这一点。
+      state.auth.header = cfg.auth_api_key_header || AuthCredential.DEFAULT_HEADER;
 
       if (state.auth.mode !== 'disabled') {
         try {
           const meResponse = await api('/auth/me');
           state.auth.principal = await meResponse.json();
         } catch (err) {
-          // /auth/me 401 属于正常未登录态，无需报错
+          // /auth/me 401 属于正常未认证态：若本轮带了凭据，api() 已经把它清掉并弹出了
+          // 对话框，这里只需把主体置空。
           state.auth.principal = null;
         }
       }
@@ -1580,16 +1766,24 @@ async function loadAuth() {
       state.auth.mode = 'disabled';
     }
     renderAuth();
+
+    // WHY 未认证且手上没有凭据时主动弹一次：apikey 模式下浏览器不带凭据，整个界面
+    // 都是 401；让用户自己去找入口等于把他丢在一堆「未认证」报错里。只弹一次、允许
+    // 关闭，关闭后顶栏的入口仍在。
+    if (state.auth.mode !== 'disabled' && !state.auth.principal && !state.auth.credential) {
+      openAuthDialog('本服务启用了 API Key 认证：粘贴凭据后界面才能读取会话与模型。');
+    }
   }
 
   async function init() {
-    // WHY 先加载认证配置：后续所有 API 调用都依赖 401 处理逻辑
+    // WHY 先加载认证配置：后续所有 API 调用都依赖 401 处理逻辑与凭据注入
     await loadAuth();
 
     bindEvents();
     bindAdminEvents();
     bindMemoryEvents();
     bindWorkspaceEvents();
+    bindAuthEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
     // 让「URL 变化 → 同步界面」成为唯一入口，避免两处逻辑漂移

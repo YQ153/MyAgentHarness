@@ -658,6 +658,41 @@ button.small {
   min-height: 18px;
 }
 
+/* ---------- API Key 凭据对话框 ---------- */
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 18px 6px;
+}
+
+.auth-form label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.auth-form input {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.auth-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.auth-msg {
+  margin: 0;
+  padding: 0 18px 14px;
+  font-size: 13px;
+  min-height: 18px;
+  color: var(--danger);
+}
+
 .audit-toolbar {
   margin-bottom: 10px;
 }
