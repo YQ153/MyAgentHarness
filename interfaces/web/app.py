@@ -101,7 +101,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await retention_worker.stop()
                 except Exception:
                     logger.exception("审计保留清理任务停止失败")
-            await _close_background_workers()
+            # WHY 这里不再关闭其它共享资源：本行原先调用一个关闭 OIDC httpx 客户端的
+            # 辅助函数，OIDC 移除后那个客户端与函数一起消失了，调用点却留了下来——
+            # 结果是**进程退出必失败**（NameError），而日志会把它显示成「Web 服务已停止」
+            # 之前的一堆存储初始化失败，把排查引向无关方向。两个后台任务已在上面显式
+            # 收尾，它们与各存储的连接由 ``build_app_context`` 退出时统一关闭（在本次
+            # finally 之后发生）。若将来新增需要显式关闭的资源，请在此**就地**关闭并
+            # 写明理由，不要引入一个跨模块的“统一清理”间接层。
             logger.info("Web 服务已停止")
 
 
