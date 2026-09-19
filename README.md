@@ -197,12 +197,23 @@ mkdir -p ./workspace && sudo chown -R 10001:10001 ./workspace
 
 #### 容器内跑 CLI（apikey 模式）
 
-CLI 通过 `HARNESS_API_KEY` 取凭据。最省事的入口是 `.env` 里的 `AUTH_API_KEY_DEV`
-（单 key 快速通道，角色为 `admin`）；生产环境应把它留空，改用管理面板创建真实 Key：
+CLI 通过 `HARNESS_API_KEY` 取凭据，它和其余配置一样写在 `.env` 里（compose 的
+`env_file` 会把它带进容器），不需要再往命令行传参。最省事的入口是 `.env` 里的
+`AUTH_API_KEY_DEV`（单 key 快速通道，角色为 `admin`）；生产环境应把它留空，
+改用管理面板创建真实 Key：
 
 ```bash
-docker compose exec -e HARNESS_API_KEY="$AUTH_API_KEY_DEV" agent python main.py cli
+docker compose exec agent python main.py cli
 ```
+
+只想临时换一次凭据（不动 `.env`）时，仍可用同名环境变量顶掉 `.env` 里的值——
+它优先级更高：
+
+```bash
+docker compose exec -e HARNESS_API_KEY="$SOME_KEY" agent python main.py cli
+```
+
+本机（非容器）同理：在 `.env` 里填好 `HARNESS_API_KEY`，直接 `python main.py cli`。
 
 Web 接口在同一个容器里，无需另起进程。
 
@@ -237,30 +248,96 @@ docker compose down            # 保留卷；加 -v 会连数据一起删
 
 | 档位 | 状态 | 隔离能力 |
 | --- | --- | --- |
-| `auto` | 默认 | 按 `wsl → process` 顺序探测，选中首个可用的最强档位 |
+| `auto` | 默认 | 按 `wsl → process` 顺序探测，选中首个可用的最强档位。**不含 `docker`**，理由见下 |
+| `docker` | **已实现（Tier 2）** | 一次性容器：**只有镜像与挂载进来的工作区可见**，网络默认切断，进程随容器结束而消失，内存 / CPU / 进程数上限，丢弃全部 capabilities |
 | `wsl` | **已实现（Tier 1）** | 命令跑在 WSL2 发行版内：utility VM 边界 + Linux rlimit（进程数 / 内存 / CPU 时间），超时由 GNU `timeout` 终止整个进程组 |
 | `process` | **已实现（Tier 0）** | Windows Job Object：进程树管控、活动进程数/内存/CPU 上限、超时终止整棵树；零新增依赖 |
-| `docker` | 未实现 | 计划中：容器内执行 |
 
-> **Tier 0 与 Tier 1 都不是安全边界。** 它们只解决「命令失控」：fork bomb、
-> 无限输出、超时残留进程、环境变量泄漏。挡不住本地提权，也挡不住命令主动
-> 读取宿主机上的其他文件——Tier 1 的发行版经 `/mnt` 仍能读写宿主文件，且
-> 通过 WSL interop 可反向启动 Windows 程序。
-> 因此两者**默认强制开启人工审批**（`SANDBOX_REQUIRE_APPROVAL=true`），
-> 审批才是主防线。
+> **三个档位都不是「强隔离」，都不能替代安全边界。** 它们解决的是「命令失控」：
+> fork bomb、无限输出、超时残留进程、环境变量泄漏。
 >
-> 选择未实现的档位会**直接报错**，不会静默降级到更弱的隔离——否则等同于
-> 伪造安全边界。`auto` 档位在更强档位探测失败而回落时，会在日志里写明
-> 跳过了哪些档位。
+> - Tier 0 / Tier 1 挡不住本地提权，也挡不住命令主动读取宿主上的其他文件——
+>   Tier 1 的发行版经 `/mnt` 仍能读写宿主文件，且通过 WSL interop 可反向启动
+>   Windows 程序。
+> - Tier 2 **是第一档真正限制「命令能看见什么」的**：宿主其余路径在容器内不存在
+>   （连仓库根的 `.env` 都读不到）。但它共享宿主内核，因此**挡不住内核漏洞逃逸、
+>   侧信道，以及 Docker 守护进程本身被攻破**；容器内一条 `rm` 照样能删掉挂载进来的
+>   工作区。
+>
+> 因此三个档位**都默认强制开启人工审批**（`SANDBOX_REQUIRE_APPROVAL=true`）。
+> 审批回答的是「这条命令该不该跑」，隔离回答的是「跑起来失控了会怎样」——
+> 两个问题，不能互相替代。
+
+> 档位不可用时（宿主无 Docker、执行镜像未构建、WSL 发行版缺失）会**直接报错**，
+> 不会静默降级到更弱的隔离——否则等同于伪造安全边界。`auto` 档位在候选探测失败
+> 而回落时，会在日志里写明跳过了哪些档位。
 
 回归验证：
 
 ```bash
-python scripts/smoke_sandbox.py
+python scripts/smoke_sandbox.py          # Tier 0 / Tier 1，两档共 21 项
+python scripts/smoke_docker_sandbox.py   # Tier 2，19 项（含中止与残留检查）
 ```
 
-覆盖 Tier 0 与 Tier 1 两档共 21 项：基本执行、环境变量清洗、超时终止、输出截断、
-进程数上限、工作目录换算、写入工作区、backend 集成与护栏联动。
+`smoke_sandbox.py` 覆盖基本执行、环境变量清洗、超时终止、输出截断、进程数上限、
+工作目录换算、写入工作区、backend 集成与护栏联动；`smoke_docker_sandbox.py` 覆盖
+容器内执行、挂载范围越界被拒、断网、超时、中止无残留、失败即报错。
+
+### Docker 沙箱（Tier 2）
+
+**宿主需求**
+
+- **Linux 容器模式**（`docker info` 的 `OSType=linux`）。Windows 宿主需 Docker Desktop +
+  WSL2 后端。Windows 容器模式下起 Linux 镜像的报错是 `no matching manifest`，与
+  「镜像不存在」长得一模一样——档位探测会先判掉它并给出明确原因。
+- 实测可用：Docker Desktop 4.41.2 / Engine 28.1.1（`OSType=linux`）。所需特性
+  （`--rm`、`--network none`、`-v ...:ro`、`docker kill`）都是老特性，但**没有实测过更低
+  版本**，因此探测失败时给明确错误，而不是宣称「≥ 某版本即可」。
+- 磁盘约 190 MB（执行镜像）。
+
+**准备执行镜像**
+
+```bash
+python scripts/setup_sandbox_image.py
+# 内网或镜像源受限时换基础镜像：
+python scripts/setup_sandbox_image.py --base <可用的基础镜像>
+```
+
+镜像由 `docker/sandbox.Dockerfile` 定义，与**应用自身**的根 `Dockerfile` 分开：
+那份的受众是「跑应用」，这份是「跑命令」，而后者越空越好——一次成功逃逸能碰到的东西，
+就等于镜像里有什么。它只带 Python 与 coreutils，不预装编译器与网络工具。
+
+**实际施加的约束**
+
+| 约束 | 说明 |
+| --- | --- |
+| 挂载 | **仅** `workspace/` 一个目录，挂到容器内 `/work`。工作区之外的 `cwd` 直接报错，不额外挂载迁就——多挂一个宿主目录，可见面就当场退回 Tier 0 的形态 |
+| 只读挂载 | `SANDBOX_DOCKER_WORKSPACE_READ_ONLY=true` 时以 `:ro` 挂载。**默认读写**：`execute` 的主要用途就是跑脚本与构建，产物本来就落在工作区里，只读会让这个档位不可用 |
+| 网络 | 默认 `--network none`；`SANDBOX_NETWORK_MODE=host` 时用 `--network host`。注意 `host` **仅在 Linux 宿主上语义正确**——Docker Desktop 下它指向 Linux VM，而不是 Windows 宿主 |
+| 资源 | `--memory` / `--cpus` / `--pids-limit` 由 `SANDBOX_*` 策略换算 |
+| 加固 | `--cap-drop ALL` + `--security-opt no-new-privileges` |
+| 身份 | `SANDBOX_DOCKER_USER`（形如 `1000:1000`），留空用镜像默认身份。**Linux 宿主建议显式设置**：容器内以 root 写出文件时宿主侧属主是 root，之后宿主进程可能改不动挂载目录。Windows 宿主由 Docker Desktop 代为处理属主，留空即可 |
+| 收尾 | `--rm` + 无论成败都显式 `docker rm -f`，保证宿主无残留容器 |
+| 超时 / 中止 | 两者都走 `docker kill`（实测 0.32 s），并登记进 `abort_scope`。超时返回 `timed_out=True` + 退出码 124；中止**不会**被误记为超时 |
+
+**为什么 `auto` 不含 `docker`**
+
+`auto` 的既有候选（`wsl` / `process`）之间差异是渐进的，而容器档位一次性改变三件事：
+网络被切断、宿主文件系统不可见、shell 从宿主方言变成 POSIX `sh`。把它放进 `auto`，
+会让升级到本版本的用户在毫无预期的情况下遇到「我的构建命令突然连不上网」。那属于
+**部署决定**，应当显式写下 `SANDBOX_TIER=docker`。
+
+代价说清楚：`auto` 因此在装有 Docker 的机器上可能选到比实际可用的更弱的档位。
+
+**已知的坑（真机验收踩出来的两条）**
+
+- 容器的 `PATH` 只能来自镜像。宿主的 `PATH`（Windows 上是 `C:\...` 一串）被 `-e` 进
+  Linux 容器后会覆盖镜像里正确的值，于是 `sleep` / `python` 全部找不到、命令以 127
+  立即返回；这个缺陷**只在「Windows 宿主 + Linux 容器」下出现**（正是 Docker Desktop
+  的默认形态），不报错也不告警。故本档位只透传平台中立的 `TZ` / `LANG`。
+- 判断「镜像在不在」不能用 `docker image inspect <tag>`：本机实测它对**真实存在且能正常
+  运行**的镜像返回 `No such image`（`docker image ls --filter` 与 `docker run` 均正常）。
+  拿它当判据会把「镜像已就绪」误判成「镜像缺失」，从而把一个能跑的档位判死。
 
 ---
 
@@ -285,6 +362,9 @@ JSON 数组（元素是对象，没有分隔符能表达）。
 | `EXECUTION_MODE` | `disabled` | 执行档位，见上一节 |
 | `SANDBOX_TIER` | `auto` | 沙箱档位：`auto`/`process`/`wsl`/`docker` |
 | `SANDBOX_WSL_DISTRO` | 空 | WSL 档位使用的发行版；留空则自动挑选首个满足要求的发行版 |
+| `SANDBOX_DOCKER_IMAGE` | `harness-sandbox:latest` | Tier 2 的执行镜像，由 `scripts/setup_sandbox_image.py` 构建 |
+| `SANDBOX_DOCKER_WORKSPACE_READ_ONLY` | `false` | Tier 2 是否只读挂载工作区；默认读写（构建产物要落回工作区） |
+| `SANDBOX_DOCKER_USER` | 空 | Tier 2 传给 `--user` 的值；**Linux 宿主建议设为宿主的 `uid:gid`**，避免容器内写出的文件在宿主侧属于 root |
 | `SANDBOX_TIMEOUT` | `120` | 沙箱内单条命令超时（秒） |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `100000` | 沙箱 stdout/stderr 各自的截断阈值 |
 | `SANDBOX_MAX_PROCESSES` | `64` | 活动进程数上限，防 fork bomb |
@@ -482,10 +562,12 @@ MyAgentHarness/
 - 模型侧**恒定注册 DeepSeek**，OpenAI / Anthropic / Ollama 按「是否提供密钥或地址」
   条件注册（未配置则不出现在下拉框），避免把配置错误转嫁给终端用户；运行时故障
   转移（调用失败自动切换供应商）尚未实现。
-- `sandbox` 档位已实现 Tier 0（进程沙箱）与 Tier 1（WSL 发行版）：两者都只做资源与
-  进程树管控，**不是安全边界**，必须与人工审批配合使用；进程级网络隔离在 Windows 上
-  需要管理员权限建防火墙规则，本期未做。Tier 1 另有两条越出沙箱的通路：发行版经
-  `/mnt` 可读写宿主文件，且 WSL interop 允许从 Linux 侧启动 Windows 程序。
+- `sandbox` 档位已实现 Tier 0（进程沙箱）、Tier 1（WSL 发行版）与 Tier 2（容器）：
+  三者都只做资源与进程树管控，**都不是安全边界**，必须与人工审批配合使用；进程级的
+  网络隔离在 Windows 宿主上需要管理员权限建防火墙规则，本期未做。Tier 1 另有两条
+  越出沙箱的通路：发行版经 `/mnt` 可读写宿主文件，且 WSL interop 允许从 Linux 侧启动
+  Windows 程序。Tier 2 会切断网络并限制可见面，但它共享宿主内核——挡不住内核漏洞
+  逃逸与侧信道，容器内也照样能改挂载进来的工作区。
 - 会话搜索**只匹配标题**，不搜消息正文：正文存在检查点的 msgpack BLOB 里，检索需要
   逐条反序列化，成本与「查一张窄表」不是一个量级。要让正文可搜，需要额外建索引
   （单独一件事，本项未做）。

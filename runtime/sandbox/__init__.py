@@ -13,11 +13,13 @@
 - ``_winjob.py``   Windows Job Object + ``CreateProcessW`` 的 ctypes 封装；
 - ``process_runner.py``  Tier 0 进程沙箱（Windows 走 Job，POSIX 走进程组）；
 - ``wsl_runner.py``  Tier 1 WSL 发行版沙箱（Linux rlimit + GNU timeout）；
+- ``docker_runner.py``  Tier 2 容器沙箱（一次性容器 + 仅挂载工作区）；
 - ``factory.py``   档位装配与探测。
 """
 
 from __future__ import annotations
 
+from runtime.sandbox.docker_runner import DockerSandboxRunner
 from runtime.sandbox.errors import (
     SandboxError,
     SandboxPolicyError,
@@ -40,6 +42,7 @@ from runtime.sandbox.wsl_runner import WslSandboxRunner
 __all__ = [
     "CommandRequest",
     "CommandResult",
+    "DockerSandboxRunner",
     "ProcessSandboxRunner",
     "WslSandboxRunner",
     "SandboxError",

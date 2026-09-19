@@ -92,7 +92,11 @@ class SandboxTier(StrEnum):
              与独立的 Linux 权限模型，资源上限由 Linux rlimit 施加。
              发行版是持久环境（不是一次性容器），且通过 ``/mnt`` 仍能读写
              宿主文件，因此同样需要与人工审批配合。
-    docker:  Tier 2——容器内执行。尚未实现。
+    docker:  Tier 2——容器内执行。**这是第一个真正限制命令可见面的档位**：
+             默认只见镜像内容与显式挂载的工作区，宿主其余路径在容器内不存在；
+             网络默认切断（实测 ``--network none`` 下无法解析域名），进程树随
+             容器消失。仍**不宣称强隔离**——容器共享宿主内核，内核漏洞逃逸与
+             侧信道不在防护范围内。必须与人工审批配合（见 ``agent/guardrails.py``）。
     """
 
     AUTO = "auto"
@@ -526,11 +530,39 @@ class AppConfig(BaseSettings):
     则能跳过这段冷启动开销。
     """
 
+    sandbox_docker_image: str = "harness-sandbox:latest"
+    """``docker`` 档位使用的执行镜像名。
+
+    由 ``scripts/setup_sandbox_image.py`` 依据 ``docker/sandbox.Dockerfile`` 构建。
+    WHY 默认指向自建镜像而不是 ``python:3.14-slim``：自建那份以非 root 身份运行、
+    不预装任何额外工具；直接指向官方镜像会把「用哪个镜像」这件事的默认值交给一次
+    依赖联网的拉取。
+    """
+
+    sandbox_docker_workspace_read_only: bool = Field(default=False)
+    """是否把工作区以只读方式挂载进容器。
+
+    WHY 默认读写：``execute`` 的主要用途就是跑脚本与构建，产物就落在工作区里，
+    只读会让这个档位不可用。需要更严边界的部署可以打开它——那时容器内的命令改不了
+    工作区，而 Agent 自己的文件工具（走宿主侧）不受影响。
+    """
+
+    sandbox_docker_user: str = ""
+    """传给 ``--user`` 的值（形如 ``1000:1000``）；空串表示用镜像默认身份。
+
+    WHY 需要它：容器内以 root 写出文件时，在 **Linux 宿主**上文件属主是 root，之后
+    宿主进程可能改不动挂载目录；把这里设成宿主的 ``uid:gid`` 即可避免。Windows 宿主
+    由 Docker Desktop 代为处理属主，留空即可（实测容器内写入回到宿主可正常读写）。
+    """
+
     sandbox_require_approval: bool = True
     """沙箱档位下是否仍需人工审批。
 
     WHY 默认开启：Tier 0 不是安全边界，防不住本地提权与凭据嗅探；审批是
     本档位真正的主防线，关闭它等于只剩资源管控。
+    WHY 在 ``docker`` 档位上**同样**默认开启：隔离缩小的是「命令碰到了会怎样」，
+    不是「这条命令该不该跑」——一条 ``rm -rf /work`` 在容器里照样能删掉挂载进来的
+    工作区。审批与隔离回答的是两个不同问题，不可互相替代（见 T24 的定稿记录）。
     """
 
     # ---------------- 护栏 ----------------
@@ -776,6 +808,16 @@ class AppConfig(BaseSettings):
     auth_api_key_header: str = "X-API-Key"
     auth_api_key_dev: str = Field(default="", repr=False)
     """开发用 API Key；生产环境应使用可轮换的 key store，禁止长期单 key。"""
+
+    harness_api_key: str = Field(default="", repr=False)
+    """CLI 在 ``apikey`` 模式下出示的凭据（``python main.py cli``）。
+
+    WHY 做成配置字段而不是让 CLI 自己读 ``os.environ``：``.env`` 的值只进
+    ``AppConfig``、**不进**进程环境变量，CLI 若直接摸 ``os.environ``，
+    「照着 .env.example 配好了却仍提示没配」就是必然结果。同名的真实环境变量
+    照样生效——pydantic-settings 中环境变量的优先级高于 ``.env``，因此容器里
+    ``docker compose exec -e HARNESS_API_KEY=...`` 的写法不受影响。
+    """
 
     # 审计保留
     audit_retention_days: int = Field(default=180, ge=1)

@@ -222,8 +222,13 @@ explicit_runner = build_sandbox_runner(AppConfig.load())
 print(f"[21 显式 wsl 档位] tier={explicit_runner.tier.value} 期望 wsl")
 
 os.environ["SANDBOX_TIER"] = "docker"
+# WHY 用「一个不存在的镜像」而不是「一个没实现的档位」：四个档位都已实现，「未实现」
+# 这条分支不再可达；但当时要钉的性质——**档位不可用时报错，而不是就近降级到更弱的
+# 隔离**——仍然有效，只是现在只能靠探测失败来触发（T24 把它从「未实现」升级成了
+# 「已实现但探测失败时报错」）。
+os.environ["SANDBOX_DOCKER_IMAGE"] = "harness-nonexistent:latest"
 try:
     build_sandbox_runner(AppConfig.load())
-    print("[22 未实现档位] 期望抛错但成功返回，断言失败")
+    print("[22 档位不可用时不得降级] 期望抛错但成功返回，断言失败")
 except SandboxUnavailableError as exc:
-    print(f"[22 未实现档位] 正确报错：{str(exc)[:90]}")
+    print(f"[22 档位不可用时不得降级] 正确报错：{str(exc)[:90]}")
