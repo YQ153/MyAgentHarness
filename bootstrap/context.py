@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from application.memory_service import MemoryService
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
+    from application.skill_service import SkillService
     from application.thread_service import ThreadService
     from application.tool_catalog import ToolCatalog
     from application.usage_service import UsageService
@@ -52,6 +53,7 @@ class AppContext:
         workspace: 工作区文件服务（Web 文件面板的列目录与读文件）。
         attachments: 会话附件服务（上传 / 列举 / 删除，以及多模态消息构造）。
         knowledge: 知识库服务（工作区文档的索引与检索）。
+        skills: 技能库服务（技能清单、启停与物化视图重建）。
     """
 
     config: AppConfig
@@ -71,3 +73,4 @@ class AppContext:
     workspace: WorkspaceService
     attachments: AttachmentService
     knowledge: KnowledgeService
+    skills: SkillService

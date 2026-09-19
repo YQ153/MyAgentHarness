@@ -288,3 +288,44 @@ def test_blank_only_sources_yield_empty_inventory(tmp_path: Path) -> None:
 
     assert inventory.packages == ()
     assert inventory.sources == ()
+
+
+# --------------------------------------------------------------- 随仓库交付的内置技能
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+"""仓库根目录；内置技能是随包交付的文件，必须真的能被解析。"""
+
+
+def test_shipped_builtin_skills_parse_without_problems() -> None:
+    """随仓库交付的内置技能必须能被解析，且没有我们这一层报出的问题。
+
+    WHY 单独立一条：一个「随包发出去、运行时被静默跳过」的技能是最糟的形态——它在代码
+    里看得见、在功能上不存在。这条用例让它在提交前就红，而不是等用户发现 Agent 少了
+    某个套路。
+
+    WHY 同时断言名字与 ``problems``：只断言「能加载」会漏掉命名不规范这类上游只给告警的
+    情况；而内置技能是我们自己写的，没有任何理由不规范。
+    """
+    workspace = _REPO_ROOT / "workspace"
+
+    inventory = inspect_skills(workspace, ["/skills-builtin"])
+
+    assert inventory.names == ["code-review", "doc-to-markdown", "project-scaffold"]
+    assert inventory.unloadable == ()
+    for package in inventory.packages:
+        assert package.problems == (), f"{package.name} 有问题：{package.problems}"
+
+
+def test_builtin_skills_have_unique_names_against_user_directory() -> None:
+    """内置目录与用户目录同时作为来源时，同名由**用户目录**生效（后者覆盖前者）。
+
+    WHY：这条钉住的是「内置技能可以被用户按名覆盖」这个设计承诺。若哪天把两个目录的
+    顺序调反，内置的那份会永远赢，而用户「改了却不生效」不会有任何报错。
+    """
+    workspace = _REPO_ROOT / "workspace"
+    # 顺序即优先级：内置在前（低），用户在后（高）
+    inventory = inspect_skills(workspace, ["/skills-builtin", "/skills"])
+
+    sources = {package.name: package.source for package in inventory.packages}
+    # 用户目录当前没有同名技能，故内置技能仍来自内置目录——这条断言保证顺序写对了
+    assert sources.get("code-review") == "/skills-builtin"

@@ -19,6 +19,7 @@ from application.health import HealthService
 from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.run_service import RunService
+from application.skill_service import SkillService
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
@@ -29,6 +30,7 @@ from knowledge_runtime import close_service, ensure_service
 from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
+from runtime.skill_store import open_skill_store
 from runtime.store import open_store
 from runtime.thread_store import open_thread_store
 from runtime.usage_store import open_usage_store
@@ -66,6 +68,9 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         open_audit_store(config.db_path) as audit_store,
         open_api_key_store(config.db_path) as api_key_store,
         open_usage_store(config.db_path) as usage_store,
+        # 技能启停状态与其余元数据同库：它没有独立的生命周期诉求（不像知识库要加载
+        # 向量扩展、且要能整库重建），故沿用「一个 db_path 装全部元数据」的既有约定。
+        open_skill_store(config.db_path) as skill_store,
         # WHY 记忆存储也走 ``async with``：它的连接生命周期必须与进程一致，
         # 否则退出时连接留到 GC 才释放，期间该 SQLite 文件可能一直持有锁。
         open_store(config.db_path) as store,
@@ -81,6 +86,16 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         # ``config`` 交给工具模块、没有注入依赖的通道——因此由 knowledge_runtime
         # 持有整进程唯一的一份，工具与接下来的接口都取用它（理由见该模块 docstring）。
         knowledge = await ensure_service(config)
+
+        # WHY 技能视图必须在任何图被装配**之前**重建：图的技能来源指向这份派生物
+        # （见 ``runtime.skill_view``），若它还是上一次的内容，新建会话会加载到过时的
+        # 技能集——而技能索引每会话只加载一次，错了不会自愈。
+        #
+        # WHY 重建失败要拦住启动（不吞掉）：视图建不出来时 ``sources_for_graph`` 会退回
+        # 「全部技能」（见其 docstring），于是「面板说某技能已停用、Agent 却照用」会同时
+        # 成立。宁可起不来，也不要一个界面与实际互相矛盾的实例。
+        skills = SkillService(config, store=skill_store)
+        await skills.refresh_view()
         graph_factory = AgentFactory(
             config,
             checkpointer=checkpointer,
@@ -149,6 +164,7 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
                 audit_store=audit_store,
             ),
             knowledge=knowledge,
+            skills=skills,
         )
 
         logger.info(

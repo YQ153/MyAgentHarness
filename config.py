@@ -361,9 +361,19 @@ class AppConfig(BaseSettings):
     memory_file: Path = Path("./workspace/AGENTS.md")
     db_path: Path = Field(default=Path("./.data/agent.db"))
     skill_dirs: Annotated[list[Path], NoDecode] = Field(
-        default_factory=lambda: [Path("./workspace/skills")]
+        default_factory=lambda: [
+            Path("./workspace/skills-builtin"),
+            Path("./workspace/skills"),
+        ]
     )
-    """技能目录（按顺序查找，越靠前优先级越高）。
+    """技能目录（按顺序查找）。
+
+    **顺序有语义：越靠后优先级越高**（上游 ``SkillsMiddleware`` 的规则是同名技能由后面的
+    来源覆盖前面的）。因此内置目录排在**前面**（低优先级），用户才能用同名技能覆盖内置的
+    那一个；顺序反过来会让内置技能永远赢，而「我改了却不生效」不会有任何报错。
+
+    WHY 内置技能也放进工作区：``skill_source_paths()`` 只能映射工作区内的目录（后端是工作区
+    限定视图），放在包内或仓库其它位置会被跳过——表现为「内置技能装了却用不上」。
 
     环境变量支持两种写法：路径分隔符（Windows ``;`` / POSIX ``:``，与 ``PATH``
     同口径）或 JSON 数组。**不用逗号**——路径本身可能含逗号，按逗号切会把

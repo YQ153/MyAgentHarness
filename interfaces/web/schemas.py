@@ -234,6 +234,70 @@ class KnowledgeDeleteResponse(BaseModel):
     deleted: bool = Field(description="此前是否已索引（false 表示本来就没索引过）")
 
 
+class SkillInfo(BaseModel):
+    """一个已加载的技能。"""
+
+    name: str
+    description: str = ""
+    directory: str = Field(description="技能包所在目录的虚拟路径")
+    skill_md_path: str = Field(default="", description="``SKILL.md`` 的虚拟路径")
+    source: str = Field(default="", description="来自哪个技能来源目录")
+    enabled: bool = Field(description="是否参与加载；停用后不再注入模型上下文")
+    problems: list[str] = Field(
+        default_factory=list,
+        description="上游只告警不报错的问题（如 name 与目录名不符）；非空表示该技能形态可疑",
+    )
+
+
+class SkillUnloadable(BaseModel):
+    """候选目录里没能加载成技能的那一项。"""
+
+    directory: str = Field(description="目录的虚拟路径")
+    reason: str = Field(description="加载失败的原因")
+
+
+class SkillListResponse(BaseModel):
+    """``GET /api/skills`` 的响应。"""
+
+    scope: str = Field(description="状态作用域；当前固定为 global（技能集全应用共享）")
+    items: list[SkillInfo]
+    unloadable: list[SkillUnloadable] = Field(
+        default_factory=list,
+        description="被跳过 / 解析失败的候选目录——上游对它们只写日志，不报出来就无从排查",
+    )
+    load_errors: list[str] = Field(
+        default_factory=list, description="来源目录整体读取失败的原因（如目录不可读）"
+    )
+    view_path: str = Field(default="", description="物化视图目录的绝对路径")
+    view_exists: bool = Field(
+        default=False, description="视图是否存在；为 false 时建图会退回「全部技能」并告警"
+    )
+    graph_sources: list[str] = Field(
+        default_factory=list, description="下一次装配 Agent 时实际使用的技能来源目录"
+    )
+    view_warning: str = Field(
+        default="", description="视图不可用时的降级说明；非空即表示启停当前不生效"
+    )
+
+
+class SkillToggleRequest(BaseModel):
+    """``PATCH /api/skills/{name}`` 的请求体。"""
+
+    enabled: bool = Field(description="true 启用、false 停用")
+
+
+class SkillToggleResponse(BaseModel):
+    """``PATCH /api/skills/{name}`` 的响应。"""
+
+    name: str
+    enabled: bool
+    scope: str
+    updated_at: str = Field(default="", description="本次状态的写入时间（UTC ISO 8601）")
+    view: dict[str, Any] = Field(
+        default_factory=dict, description="本次重建后的视图摘要（enabled_skills / skipped）"
+    )
+
+
 __all__ = [
     "AttachmentDeleteResponse",
     "ChatRequest",
@@ -252,6 +316,11 @@ __all__ = [
     "KnowledgeStats",
     "ModelInfo",
     "ResumeRequest",
+    "SkillInfo",
+    "SkillListResponse",
+    "SkillToggleRequest",
+    "SkillToggleResponse",
+    "SkillUnloadable",
     "StopResponse",
     "ThreadListResponse",
     "ThreadResponse",

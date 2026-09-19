@@ -23,6 +23,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agent.backends import build_backend
 from agent.guardrails import build_interrupt_on, build_permissions
+from runtime.skill_view import sources_for_graph
 from agent.profiles import ensure_profiles_registered
 from agent.run_context import AgentRunContext
 from llm.registry import ModelRegistry, build_default_registry
@@ -111,12 +112,24 @@ def build_agent(
         ),
     ]
 
+    # WHY 技能来源不直接用 ``config.skill_source_paths()``：技能的**启停**由数据库记录，
+    # 而该配置只描述「技能包放在哪」。两者之间隔着一层派生产物——物化视图（见
+    # ``runtime.skill_view``）：上游的来源必须是技能目录的**父目录**，无法逐技能过滤，
+    # 所以「只加载启用的那些」只能靠派生出一份视图目录来达成。
+    #
+    # WHY 在这里判而不是在 bootstrap：``build_agent`` 是唯一真正消费来源的地方；把判定
+    # 放到装配层，会让「视图丢了」与「技能全没了」之间的因果关系再隔一层。返回的告警
+    # 走 WARNING，实际表现（退回配置目录 = 全部启用）与原因一起出现在日志里。
+    skill_sources, skill_warning = sources_for_graph(config.workspace, config.skill_source_paths())
+    if skill_warning:
+        logger.warning(skill_warning)
+
     logger.info(
         "装配 Agent：model=%s mode=%s tier=%s skills=%d memory=%d tools=%d",
         resolved_name,
         config.execution_mode.value,
         config.sandbox_tier.value,
-        len(config.skill_source_paths()),
+        len(skill_sources),
         len(config.memory_paths),
         len(tools or ()),
     )
@@ -127,7 +140,7 @@ def build_agent(
             system_prompt=_FALLBACK_SYSTEM_PROMPT,
             backend=backend,
             tools=list(tools) if tools else None,
-            skills=config.skill_source_paths() or None,
+            skills=skill_sources or None,
             memory=config.memory_paths or None,
             # WHY 传 backend 而不是直接取规则：可执行 backend 下工具级权限
             # 无法约束 execute，deepagents 会拒绝该组合；由 build_permissions

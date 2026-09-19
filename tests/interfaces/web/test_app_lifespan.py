@@ -78,6 +78,7 @@ def _stub_context() -> SimpleNamespace:
         memories=object(),
         attachments=object(),
         knowledge=object(),
+        skills=object(),
     )
 
 

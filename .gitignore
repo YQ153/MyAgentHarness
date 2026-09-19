@@ -22,6 +22,8 @@ venv/
 workspace/*
 !workspace/AGENTS.md
 !workspace/skills/
+# 内置技能随仓库交付，必须入库；否则新克隆的机器上「内置技能」这个功能不存在
+!workspace/skills-builtin/
 
 # IDE：各开发者环境配置不同，入库只会产生无意义冲突
 .idea/

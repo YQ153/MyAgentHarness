@@ -73,6 +73,8 @@ PERMISSIONS = {
     "system:models": "GET /api/models",
     "usage:read": "GET /api/usage（用量统计）",
     "tool:read": "GET /api/tools（生效工具清单与 MCP 服务器状态）",
+    "skill:read": "GET /api/skills（技能清单与启停状态）",
+    "skill:write": "PATCH /api/skills/{name}（启用 / 停用技能）",
     "memory:read": "GET /api/memories（长期记忆清单）",
     "memory:delete": "DELETE /api/memories/{path}（删除单条长期记忆）",
     "apikey:manage": "管理 API Key（创建/列出/吊销）",
@@ -120,6 +122,14 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
             # 同量级；服务层按 owner 收敛，拿到权限也删不到别人的记忆。
             "memory:read",
             "memory:delete",
+            # WHY member 有 skill:read：与 tool:read 同一理由——「这个助手会加载哪些
+            # 技能」是使用者的基本知情项，不含他人数据，收紧到 admin 只会让成员靠猜。
+            "skill:read",
+            # WHY **没有** skill:write（与 attachment:write / memory:delete 不同）：
+            # 那两项写的是**自己**的数据，而技能集是**全应用共享**的一份——物化视图在
+            # 工作区里只有一个，启停影响所有人（``SkillService`` 的作用域固定为 global）。
+            # 改共享资源属于管理员职责；给了 member，任何一个成员都能把别人依赖的技能
+            # 停掉，而受害者的表现是「Agent 忽然不会做某件事」且无迹可查。
         }
     ),
     "admin": frozenset(PERMISSIONS.keys()),

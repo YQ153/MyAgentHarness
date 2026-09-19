@@ -25,6 +25,11 @@
           放进「仅管理员可见」的管理面板会让普通成员管不了自己那份索引。
         -->
         <button id="knowledge-open" type="button">知识库</button>
+        <!--
+          技能库面板：技能集是**全应用共享**的一份，因此入口对所有人可见（成员有 skill:read），
+          但「启用 / 停用」只有管理员能点（skill:write 仅 admin）——停掉一个技能会影响所有人。
+        -->
+        <button id="skills-open" type="button">技能</button>
         <div id="auth-status" class="auth-status"></div>
       </div>
     </header>
@@ -183,6 +188,31 @@
       </div>
       <div id="knowledge-caps" class="knowledge-caps"></div>
       <div id="knowledge-list" class="knowledge-list"></div>
+    </div>
+  </div>
+
+  <!--
+    技能库面板：数据来自 GET /api/skills。
+    复用 knowledge-* 的样式类：两者都是「能力条 + 列表行」的同一种结构，为它另造一套
+    只会让两处的间距与断行规则慢慢漂开。
+  -->
+  <div id="skills-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>技能</h3>
+        <button id="skills-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="knowledge-hint">
+        技能是 Agent 会加载的指令包，放在工作区的 <code>skills/</code> 目录里。
+        启停<b>只对之后新建的会话生效</b>——已在进行的会话沿用它们启动时加载的那一份。
+        技能包本身的新增与修改请直接改文件系统：那条路径同样受权限与审批链约束。
+      </p>
+      <div class="knowledge-toolbar">
+        <button id="skills-refresh" type="button">刷新</button>
+      </div>
+      <div id="skills-caps" class="knowledge-caps"></div>
+      <div id="skills-list" class="knowledge-list"></div>
     </div>
   </div>
 

@@ -71,6 +71,12 @@
     knowledgeIndex: document.getElementById('knowledge-index'),
     knowledgeCaps: document.getElementById('knowledge-caps'),
     knowledgeList: document.getElementById('knowledge-list'),
+    skillsOpen: document.getElementById('skills-open'),
+    skillsModal: document.getElementById('skills-modal'),
+    skillsClose: document.getElementById('skills-close'),
+    skillsRefresh: document.getElementById('skills-refresh'),
+    skillsCaps: document.getElementById('skills-caps'),
+    skillsList: document.getElementById('skills-list'),
     attach: document.getElementById('attach'),
     attachInput: document.getElementById('attach-input'),
     attachmentStrip: document.getElementById('attachment-strip'),
@@ -1966,6 +1972,161 @@
     els.knowledgeModal.querySelector('.modal-backdrop').addEventListener('click', closeKnowledgeModal);
   }
 
+  /* ------------------------------------------------------------------ 技能库面板 */
+
+  function openSkillsModal() {
+    els.skillsModal.style.display = '';
+    loadSkills();
+  }
+
+  function closeSkillsModal() {
+    els.skillsModal.style.display = 'none';
+  }
+
+  /**
+   * 当前使用者能否启停技能。
+   *
+   * WHY 认证关闭时视为可以：那种模式下服务端把请求当作匿名管理员（整个应用就是单机
+   * 使用），界面若把入口藏起来，本地开发就永远点不到它——而后端其实是允许的。
+   * 这与顶栏「管理」入口的处置不同（那个只在拿到 apikey:manage 时显示）：管理面板负责
+   * 的是「签发凭据」，在无认证模式下没有意义，而技能启停不是。
+   */
+  function canToggleSkills() {
+    if (state.auth.mode === 'disabled') return true;
+    const principal = state.auth.principal;
+    return Boolean(principal && (principal.permissions || []).includes('skill:write'));
+  }
+
+  async function loadSkills() {
+    els.skillsList.innerHTML = '';
+    els.skillsList.appendChild(el('div', 'knowledge-empty', '加载中…'));
+    try {
+      const response = await api('/api/skills');
+      state.skills = await response.json();
+      renderSkills();
+    } catch (err) {
+      state.skills = null;
+      els.skillsCaps.innerHTML = '';
+      els.skillsList.innerHTML = '';
+      els.skillsList.appendChild(el('div', 'knowledge-empty', `加载失败：${err.message}`));
+    }
+  }
+
+  function renderSkills() {
+    const payload = state.skills;
+    if (!payload) return;
+
+    els.skillsCaps.innerHTML = '';
+    els.skillsCaps.appendChild(el('span', 'knowledge-chip', `作用域 ${payload.scope || 'global'}`));
+    els.skillsCaps.appendChild(
+      el(
+        'span',
+        'knowledge-chip',
+        payload.graph_sources && payload.graph_sources.length
+          ? `来源 ${payload.graph_sources.join(' ')}`
+          : '来源：无'
+      )
+    );
+    if (!canToggleSkills()) {
+      els.skillsCaps.appendChild(el('span', 'knowledge-chip', '启停需要管理员'));
+    }
+
+    els.skillsList.innerHTML = '';
+
+    // 视图告警单独占一行、且排在清单之前：它一出现，「启停当前不生效」就是当下最该知道
+    // 的事，放到列表后面会被一屏技能名淹没。
+    if (payload.view_warning) {
+      els.skillsList.appendChild(el('div', 'knowledge-empty', payload.view_warning));
+    }
+
+    const items = payload.items || [];
+    if (!items.length && !payload.view_warning) {
+      els.skillsList.appendChild(
+        el(
+          'div',
+          'knowledge-empty',
+          '还没有技能。把技能包放进工作区的 skills/ 目录（每个包一个目录、内含 SKILL.md），再点刷新。'
+        )
+      );
+    }
+
+    items.forEach((item) => {
+      const row = el('div', 'knowledge-row');
+      const main = el('div', 'knowledge-main');
+      main.appendChild(el('div', 'knowledge-path', item.name));
+      if (item.description) {
+        main.appendChild(el('div', 'knowledge-sub', item.description));
+      }
+      // 上游只告警的问题要显出来：它意味着这个技能形态可疑（例如目录名与 name 不符）。
+      // 不显的话，用户只会看到「技能在，但好像没起作用」，没有任何线索。
+      (item.problems || []).forEach((problem) => {
+        main.appendChild(el('div', 'knowledge-sub', `注意：${problem}`));
+      });
+      if (!item.enabled) {
+        main.appendChild(el('div', 'knowledge-sub', '已停用，Agent 不会加载它'));
+      }
+      row.appendChild(main);
+
+      if (canToggleSkills()) {
+        const toggle = el(
+          'button',
+          item.enabled ? 'small' : 'primary small',
+          item.enabled ? '停用' : '启用'
+        );
+        toggle.type = 'button';
+        toggle.addEventListener('click', () => toggleSkill(item));
+        row.appendChild(toggle);
+      }
+      els.skillsList.appendChild(row);
+    });
+
+    // 没能加载的候选目录：上游对它们只写日志。不在这里列出，用户看到的就是
+    // 「我明明建了它，面板里却没有」，且没有任何可查的线索。
+    (payload.unloadable || []).forEach((item) => {
+      const row = el('div', 'knowledge-row');
+      const main = el('div', 'knowledge-main');
+      main.appendChild(el('div', 'knowledge-path', item.directory));
+      main.appendChild(el('div', 'knowledge-sub', `未能加载：${item.reason}`));
+      row.appendChild(main);
+      els.skillsList.appendChild(row);
+    });
+
+    (payload.load_errors || []).forEach((reason) => {
+      els.skillsList.appendChild(el('div', 'knowledge-empty', `来源目录读取失败：${reason}`));
+    });
+  }
+
+  async function toggleSkill(item) {
+    const next = !item.enabled;
+    // WHY 停用要二次确认、启用不要：技能集是全体共享的一份，停用会让**所有人**的 Agent
+    // 少一项能力，而启用只是把它还回来。风险不对称，确认也就不该对称。
+    if (
+      !next &&
+      !window.confirm(
+        `停用技能「${item.name}」？\n\n技能集是全体共享的，停用后所有人的 Agent 都不再加载它。\n（已在进行的会话不受影响，新建会话才生效。）`
+      )
+    ) {
+      return;
+    }
+    try {
+      await api(`/api/skills/${encodeURIComponent(item.name)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      await loadSkills();
+    } catch (err) {
+      window.alert(`操作失败：${err.message}`);
+    }
+  }
+
+  function bindSkillsEvents() {
+    els.skillsOpen.addEventListener('click', openSkillsModal);
+    els.skillsClose.addEventListener('click', closeSkillsModal);
+    els.skillsRefresh.addEventListener('click', () => loadSkills());
+    els.skillsModal.querySelector('.modal-backdrop').addEventListener('click', closeSkillsModal);
+  }
+
   /* ------------------------------------------------------------------ 工作区面板 */
 
 function formatSize(bytes) {
@@ -2226,6 +2387,7 @@ async function loadAuth() {
     bindMemoryEvents();
     bindWorkspaceEvents();
     bindKnowledgeEvents();
+    bindSkillsEvents();
     bindAuthEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
