@@ -25,10 +25,12 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
 from text_utils import collapse_whitespace
 
 if TYPE_CHECKING:
@@ -769,6 +771,85 @@ async def _write_meta(conn: aiosqlite.Connection, values: dict[str, str]) -> Non
         )
 
 
+async def _prepare_knowledge_store(
+    conn: aiosqlite.Connection,
+    *,
+    dims: int,
+    model: str = "",
+    vector_enabled: bool = True,
+) -> KnowledgeStore:
+    """加载向量扩展、建表、校验存量索引并返回存储门面。
+
+    由 ``open_sqlite_store`` 在初始化阶段调用；参数前置条件（``dims`` 为正整数等）
+    由公开入口 ``open_knowledge_store`` 校验，本函数不重复判断。
+
+    Note:
+        WHY 维度变化要**报错**而不是自动重建：重建会丢掉用户已索引的全部文档，而
+        「换了模型」这件事只有用户知道该不该重来。报错把决定权交回去，同时给出
+        明确的重建方式；静默重建则是把一次配置变更变成一次数据丢失。
+
+        WHY 扩展加载放在初始化阶段，而不是等到第一次检索：能不能加载是**启动期就能
+        确定**的环境问题，放在这里才会落进 ``open_sqlite_store`` 的捕获范围、
+        被记成一次明确的初始化失败。
+
+    Raises:
+        KnowledgeStoreError: 存量索引的维度或模型与当前配置不符（必须重建索引），
+            或指定启用向量检索但扩展无法加载。
+        aiosqlite.Error: 建表或 PRAGMA 设置失败时原样向上抛出。
+    """
+    loaded_extension = False
+    if vector_enabled:
+        # WHY 用公开 API 而不是 ``conn._conn``：aiosqlite 本身暴露了
+        # enable_load_extension / load_extension，摸私有字段只是把「上游实现
+        # 细节」变成自己的依赖。``loadable_path()`` 给出的是无扩展名的路径，
+        # 由 SQLite 自己补平台后缀（Windows .dll / POSIX .so）——实测可行。
+        try:
+            import sqlite_vec
+
+            await conn.enable_load_extension(True)
+            await conn.load_extension(sqlite_vec.loadable_path())
+            loaded_extension = True
+        except Exception as exc:
+            # WHY 直接报错而不是降级成关键词检索：启用向量检索是用户的显式选择，
+            # 而扩展加载失败是**启动期就能确定**的环境问题。静默降级会让知识库
+            # 看起来在工作、只是「搜不太准」——那种现象没人会去查扩展有没有加载。
+            raise KnowledgeStoreError(
+                f"EMBEDDING_BACKEND 要求向量检索，但 sqlite-vec 扩展加载失败："
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    await conn.executescript(_SCHEMA)
+    if loaded_extension:
+        await conn.executescript(_vec_table_ddl(dims))
+
+    meta = await _read_meta(conn)
+    recorded_version = meta.get("schema_version", "")
+    if recorded_version and recorded_version != str(_SCHEMA_VERSION):
+        raise KnowledgeStoreError(
+            f"知识库结构版本不符：库内 {recorded_version}，当前 {_SCHEMA_VERSION}；"
+            "请重建索引"
+        )
+    if loaded_extension:
+        recorded_dims = meta.get("embedding_dims", "")
+        recorded_model = meta.get("embedding_model", "")
+        if recorded_dims and int(recorded_dims) != dims:
+            raise KnowledgeStoreError(
+                f"存量索引的向量维度是 {recorded_dims}，当前配置是 {dims}；"
+                "换过嵌入模型必须重建知识库（删除 .data/knowledge.db 后重新索引）"
+            )
+        if recorded_model and recorded_model != model:
+            raise KnowledgeStoreError(
+                f"存量索引来自模型 {recorded_model}，当前配置是 {model}；"
+                "不同模型产出的向量无法互相比较，必须重建知识库"
+            )
+        await _write_meta(
+            conn, {"embedding_dims": str(dims), "embedding_model": model}
+        )
+    await _write_meta(conn, {"schema_version": str(_SCHEMA_VERSION)})
+    await conn.commit()
+    return KnowledgeStore(conn, dims=dims, model=model, vector_enabled=loaded_extension)
+
+
 @asynccontextmanager
 async def open_knowledge_store(
     db_path: Path,
@@ -793,95 +874,27 @@ async def open_knowledge_store(
         KnowledgeStoreError: 存量索引的维度或模型与当前配置不符（必须重建索引），
             或指定启用向量检索但扩展无法加载。
         aiosqlite.Error: 建表或 PRAGMA 设置失败时原样向上抛出。
-
-    Note:
-        WHY 维度变化要**报错**而不是自动重建：重建会丢掉用户已索引的全部文档，而
-        「换了模型」这件事只有用户知道该不该重来。报错把决定权交回去，同时给出
-        明确的重建方式；静默重建则是把一次配置变更变成一次数据丢失。
     """
     if db_path is None:
         raise ValueError("db_path 不能为 None")
     if not isinstance(dims, int) or isinstance(dims, bool) or dims < 1:
         raise ValueError(f"dims 必须是正整数，实际：{dims!r}")
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    loaded_extension = False
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「知识库初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-
-            if vector_enabled:
-                # WHY 用公开 API 而不是 ``conn._conn``：aiosqlite 本身暴露了
-                # enable_load_extension / load_extension，摸私有字段只是把「上游实现
-                # 细节」变成自己的依赖。``loadable_path()`` 给出的是无扩展名的路径，
-                # 由 SQLite 自己补平台后缀（Windows .dll / POSIX .so）——实测可行。
-                try:
-                    import sqlite_vec
-
-                    await conn.enable_load_extension(True)
-                    await conn.load_extension(sqlite_vec.loadable_path())
-                    loaded_extension = True
-                except Exception as exc:
-                    # WHY 直接报错而不是降级成关键词检索：启用向量检索是用户的显式选择，
-                    # 而扩展加载失败是**启动期就能确定**的环境问题。静默降级会让知识库
-                    # 看起来在工作、只是「搜不太准」——那种现象没人会去查扩展有没有加载。
-                    raise KnowledgeStoreError(
-                        f"EMBEDDING_BACKEND 要求向量检索，但 sqlite-vec 扩展加载失败："
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
-
-            await conn.executescript(_SCHEMA)
-            if loaded_extension:
-                await conn.executescript(_vec_table_ddl(dims))
-
-            meta = await _read_meta(conn)
-            recorded_version = meta.get("schema_version", "")
-            if recorded_version and recorded_version != str(_SCHEMA_VERSION):
-                raise KnowledgeStoreError(
-                    f"知识库结构版本不符：库内 {recorded_version}，当前 {_SCHEMA_VERSION}；"
-                    "请重建索引"
-                )
-            if loaded_extension:
-                recorded_dims = meta.get("embedding_dims", "")
-                recorded_model = meta.get("embedding_model", "")
-                if recorded_dims and int(recorded_dims) != dims:
-                    raise KnowledgeStoreError(
-                        f"存量索引的向量维度是 {recorded_dims}，当前配置是 {dims}；"
-                        "换过嵌入模型必须重建知识库（删除 .data/knowledge.db 后重新索引）"
-                    )
-                if recorded_model and recorded_model != model:
-                    raise KnowledgeStoreError(
-                        f"存量索引来自模型 {recorded_model}，当前配置是 {model}；"
-                        "不同模型产出的向量无法互相比较，必须重建知识库"
-                    )
-                await _write_meta(
-                    conn, {"embedding_dims": str(dims), "embedding_model": model}
-                )
-            await _write_meta(conn, {"schema_version": str(_SCHEMA_VERSION)})
-            await conn.commit()
-        except Exception:
-            logger.exception("知识库初始化失败：%s", db_path)
-            raise
-
+    async with open_sqlite_store(
+        db_path,
+        label="知识库",
+        prepare=partial(
+            _prepare_knowledge_store,
+            dims=dims,
+            model=model,
+            vector_enabled=vector_enabled,
+        ),
+    ) as store:
         logger.info(
             "知识库已就绪：%s（dims=%s model=%s vectors=%s）",
             db_path,
             dims,
             model or "-",
-            loaded_extension,
+            store.vector_enabled,
         )
-        yield KnowledgeStore(
-            conn, dims=dims, model=model, vector_enabled=loaded_extension
-        )
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.debug("知识库连接已关闭：%s", db_path)
+        yield store

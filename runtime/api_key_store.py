@@ -26,6 +26,8 @@ from typing import Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
+
 logger = logging.getLogger(__name__)
 
 _ALPHABET = string.ascii_letters + string.digits
@@ -268,31 +270,23 @@ class APIKeyStore:
         return count
 
 
+async def _prepare_api_key_store(conn: aiosqlite.Connection) -> APIKeyStore:
+    """建表并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    await conn.commit()
+    return APIKeyStore(conn)
+
+
 @asynccontextmanager
 async def open_api_key_store(db_path: Path) -> AsyncIterator[APIKeyStore]:
-    """以异步上下文的方式提供 API Key 存储。"""
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
+    """以异步上下文的方式提供 API Key 存储。
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.executescript(_SCHEMA)
-            await conn.commit()
-        except Exception:
-            logger.exception("API Key 表初始化失败：%s", db_path)
-            raise
+    WHY 只剩两行：连接、PRAGMA、初始化异常的归因与关闭都在 ``open_sqlite_store`` 里
+    （那个模块的 docstring 记着这段结构曾经出过的缺陷）。本模块只声明三件事——
+    建哪张表、产出什么对象、日志叫什么。
+    """
+    async with open_sqlite_store(
+        db_path, label="API Key 表", prepare=_prepare_api_key_store
+    ) as store:
         logger.info("API Key 表已就绪：%s", db_path)
-        yield APIKeyStore(conn)
-    finally:
-        if conn is not None:
-            await conn.close()
+        yield store

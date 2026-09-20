@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from deepagents.middleware.skills import MAX_SKILL_NAME_LENGTH
 
+from runtime.sqlite_lifecycle import open_sqlite_store
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -296,6 +298,13 @@ class SkillStateStore:
         return True
 
 
+async def _prepare_skill_store(conn: aiosqlite.Connection) -> SkillStateStore:
+    """建表并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    await conn.commit()
+    return SkillStateStore(conn)
+
+
 @asynccontextmanager
 async def open_skill_store(db_path: Path) -> AsyncIterator[SkillStateStore]:
     """打开（并按需建表）技能状态库。
@@ -310,31 +319,8 @@ async def open_skill_store(db_path: Path) -> AsyncIterator[SkillStateStore]:
         ValueError: ``db_path`` 为 ``None``。
         aiosqlite.Error: 建表或 PRAGMA 设置失败时原样向上抛出。
     """
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            conn.row_factory = aiosqlite.Row
-            # 与其余存储同口径：WAL 允许与检查点等表并行读写，busy_timeout 让写锁冲突等待
-            # 而不是立即抛 "database is locked"。
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.executescript(_SCHEMA)
-            await conn.commit()
-        except Exception:
-            logger.exception("技能状态表初始化失败：%s", db_path)
-            raise
+    async with open_sqlite_store(
+        db_path, label="技能状态表", prepare=_prepare_skill_store
+    ) as store:
         logger.debug("技能状态表已就绪：%s", db_path)
-        yield SkillStateStore(conn)
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.debug("技能状态连接已关闭：%s", db_path)
+        yield store

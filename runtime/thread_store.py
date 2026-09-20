@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
 from text_utils import build_title, collapse_whitespace
 from thread_utils import normalize_thread_id
 
@@ -1042,6 +1043,22 @@ class ThreadMetaStore:
         return (record or {}).get("current_branch", "") or ""
 
 
+async def _prepare_thread_store(conn: aiosqlite.Connection) -> ThreadMetaStore:
+    """建表、跑幂等迁移并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    for migration in _MIGRATIONS:
+        try:
+            await conn.executescript(migration)
+        except Exception as exc:
+            # WHY 只记日志不中断：SQLite 对已有列/索引的 ALTER 会抛错，而幂等迁移
+            # 不需要回滚。WHY 要记下来而不是 ``pass``：真的写坏了（磁盘满、库损坏）
+            # 与「重复应用」在这里长得一样，静默跳过会让前者彻底无声——需要排查时
+            # 把级别调到 DEBUG 就能看到是哪一个迁移、什么错。
+            logger.debug("会话元数据表迁移跳过（多为重复应用）：%s", exc)
+    await conn.commit()
+    return ThreadMetaStore(conn)
+
+
 @asynccontextmanager
 async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
     """以异步上下文的方式提供会话元数据存储，退出时关闭连接。
@@ -1059,45 +1076,8 @@ async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
         ValueError: ``db_path`` 为 ``None``。
         aiosqlite.Error: 建表或 PRAGMA 设置失败时原样向上抛出。
     """
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            # WHY 设为 Row：让 fetchone/fetchall 直接可按列名取值，
-            # 避免下游用魔法下标（row[3]）读字段，字段顺序一变就会静默错位。
-            conn.row_factory = aiosqlite.Row
-
-            # WHY 重复设置 WAL：它是库级持久属性、通常已由检查点侧开启，
-            # 但本模块不应假设初始化顺序，显式声明才能保证独立启用时行为一致。
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            # WHY busy_timeout：检查点写入频繁，与本表写入可能同时发生；
-            # 默认行为是立即返回 "database is locked"，等待几秒远比报错合理。
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.executescript(_SCHEMA)
-            for migration in _MIGRATIONS:
-                try:
-                    await conn.executescript(migration)
-                except Exception:
-                    # WHY 忽略重复迁移错误：SQLite 对已有列/索引的 ALTER 会抛错，
-                    # 但幂等迁移不需要回滚；非重复错误会在外层被记录。
-                    pass
-            await conn.commit()
-        except Exception:
-            logger.exception("会话元数据表初始化失败：%s", db_path)
-            raise
-
+    async with open_sqlite_store(
+        db_path, label="会话元数据表", prepare=_prepare_thread_store
+    ) as store:
         logger.info("会话元数据表已就绪：%s", db_path)
-        yield ThreadMetaStore(conn)
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.info("会话元数据连接已关闭：%s", db_path)
+        yield store

@@ -21,6 +21,7 @@ from typing import Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
 from thread_utils import normalize_thread_id
 
 logger = logging.getLogger(__name__)
@@ -370,6 +371,21 @@ class UsageStore:
         return value
 
 
+async def _prepare_usage_store(conn: aiosqlite.Connection) -> UsageStore:
+    """建表、补列并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    try:
+        # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+        # 而升级前的库里已有用量数据。重复执行必然抛「列已存在」，忽略即可。
+        await conn.execute("ALTER TABLE usage_log ADD COLUMN trace_id TEXT;")
+    except Exception:
+        logger.debug("usage_log.trace_id 已存在，跳过迁移")
+    # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+    await conn.executescript(_TRACE_INDEX)
+    await conn.commit()
+    return UsageStore(conn)
+
+
 @asynccontextmanager
 async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
     """以异步上下文的方式提供用量存储，退出时关闭连接。
@@ -384,40 +400,11 @@ async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
         ValueError: ``db_path`` 为 ``None``。
         aiosqlite.Error: 建表失败时原样向上抛出。
     """
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.executescript(_SCHEMA)
-            try:
-                # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
-                # 而升级前的库里已有用量数据。重复执行必然抛「列已存在」，忽略即可。
-                await conn.execute("ALTER TABLE usage_log ADD COLUMN trace_id TEXT;")
-            except Exception:
-                logger.debug("usage_log.trace_id 已存在，跳过迁移")
-            # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
-            await conn.executescript(_TRACE_INDEX)
-            await conn.commit()
-        except Exception:
-            logger.exception("用量记录表初始化失败：%s", db_path)
-            raise
+    async with open_sqlite_store(
+        db_path, label="用量记录表", prepare=_prepare_usage_store
+    ) as store:
         logger.info("用量记录表已就绪：%s", db_path)
-        yield UsageStore(conn)
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.info("用量记录连接已关闭：%s", db_path)
+        yield store
 
 
 __all__ = ["MAX_MODEL_CHARS", "UsageStore", "open_usage_store", "utc_now", "window_start"]

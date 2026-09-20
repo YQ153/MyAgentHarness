@@ -18,6 +18,8 @@ from typing import Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
+
 logger = logging.getLogger(__name__)
 
 _MAX_LIMIT = 200
@@ -303,39 +305,29 @@ class AuditStore:
         return [dict(row) for row in rows]
 
 
+async def _prepare_audit_store(conn: aiosqlite.Connection) -> AuditStore:
+    """建表、补列并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    try:
+        # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+        # 而升级前的库里已经有审计数据。重复执行必然抛「列已存在」，忽略即可。
+        await conn.execute("ALTER TABLE audit_log ADD COLUMN trace_id TEXT;")
+    except Exception:
+        logger.debug("audit_log.trace_id 已存在，跳过迁移")
+    # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+    await conn.executescript(_TRACE_INDEX)
+    await conn.commit()
+    return AuditStore(conn)
+
+
 @asynccontextmanager
 async def open_audit_store(db_path: Path) -> AsyncIterator[AuditStore]:
-    """以异步上下文的方式提供审计日志存储。"""
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
+    """以异步上下文的方式提供审计日志存储。
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
-        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
-        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
-        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
-        try:
-            conn = await aiosqlite.connect(str(db_path))
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.executescript(_SCHEMA)
-            try:
-                # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
-                # 而升级前的库里已经有审计数据。重复执行必然抛「列已存在」，忽略即可。
-                await conn.execute("ALTER TABLE audit_log ADD COLUMN trace_id TEXT;")
-            except Exception:
-                logger.debug("audit_log.trace_id 已存在，跳过迁移")
-            # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
-            await conn.executescript(_TRACE_INDEX)
-            await conn.commit()
-        except Exception:
-            logger.exception("审计日志表初始化失败：%s", db_path)
-            raise
+    WHY 只剩两行：连接、PRAGMA、初始化异常的归因与关闭都在 ``open_sqlite_store`` 里。
+    """
+    async with open_sqlite_store(
+        db_path, label="审计日志表", prepare=_prepare_audit_store
+    ) as store:
         logger.info("审计日志表已就绪：%s", db_path)
-        yield AuditStore(conn)
-    finally:
-        if conn is not None:
-            await conn.close()
+        yield store
