@@ -36,11 +36,10 @@ from runtime.attachments import (
 from thread_utils import normalize_thread_id
 
 if TYPE_CHECKING:
+    from application.ports import AuditLog, ThreadMetadataReader
     from application.principal import Principal
     from config import AppConfig
     from llm.registry import ModelRegistry
-    from runtime.audit_store import AuditStore
-    from runtime.thread_store import ThreadMetaStore
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +63,8 @@ class AttachmentService:
         config: AppConfig,
         *,
         registry: ModelRegistry,
-        thread_store: ThreadMetaStore,
-        audit_store: AuditStore | None = None,
+        thread_store: ThreadMetadataReader,
+        audit_store: AuditLog | None = None,
     ) -> None:
         """构造服务。
 

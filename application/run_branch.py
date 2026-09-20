@@ -20,13 +20,13 @@ from typing import TYPE_CHECKING, Any
 from application.audit_recorder import AuditRecorder
 from application.errors import NotFoundError
 from application.message_utils import same_message_chain
+from application.ports import ThreadMetadataStore
 from application.run_registry import RunHandle, RunRegistry
 from application.runnable import build_runnable_config
 
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
     from config import AppConfig
-    from runtime.thread_store import ThreadMetaStore
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class RunBranchService:
         self,
         config: AppConfig,
         *,
-        thread_store: ThreadMetaStore,
+        thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
         registry: RunRegistry,
         audit: AuditRecorder,

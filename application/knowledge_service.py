@@ -24,8 +24,9 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharac
 
 from application.errors import UnsupportedDocumentError
 from application.ownership import effective_owner_id
+from application.ports import KnowledgeIndex
 from llm.embeddings import EmbeddingError
-from runtime.knowledge_store import ChunkInput, KnowledgeHit, KnowledgeStore
+from runtime.knowledge_store import ChunkInput, KnowledgeHit
 from runtime.workspace_files import (
     WorkspacePathError,
     looks_binary,
@@ -165,7 +166,7 @@ class KnowledgeService:
         self,
         config: AppConfig,
         *,
-        store: KnowledgeStore,
+        store: KnowledgeIndex,
         embeddings: EmbeddingBackend | None = None,
     ) -> None:
         """构造服务。

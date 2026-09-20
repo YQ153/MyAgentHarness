@@ -38,6 +38,7 @@ from application.dto import (
 )
 from application.errors import NotFoundError, OwnershipError
 from application.ownership import effective_owner_id, ensure_thread_access
+from application.ports import AuditLog, ThreadMetadataStore
 from application.principal import Principal
 from application.runnable import build_runnable_config
 from runtime.attachments import (
@@ -45,11 +46,7 @@ from runtime.attachments import (
     delete_thread_attachments,
     index_by_sha256,
 )
-from runtime.audit_store import AuditStore
-from runtime.thread_store import (
-    ThreadMetaStore,
-    normalize_search_query,
-)
+from runtime.thread_store import normalize_search_query
 from text_utils import collapse_whitespace
 from thread_utils import normalize_thread_id
 
@@ -119,9 +116,9 @@ class ThreadService:
         config: AppConfig,
         *,
         checkpointer: BaseCheckpointSaver,
-        thread_store: ThreadMetaStore,
+        thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
-        audit_store: AuditStore | None = None,
+        audit_store: AuditLog | None = None,
     ) -> None:
         """构造会话服务。
 

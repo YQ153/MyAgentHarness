@@ -23,9 +23,9 @@ from application.ownership import UNAUTHENTICATED_OWNER, effective_owner_id
 if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
 
+    from application.ports import AuditLog
     from application.principal import Principal
     from config import AppConfig
-    from runtime.audit_store import AuditStore
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,7 @@ class MemoryService:
         config: AppConfig,
         *,
         store: BaseStore,
-        audit_store: AuditStore | None = None,
+        audit_store: AuditLog | None = None,
     ) -> None:
         """构造服务。
 

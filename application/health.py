@@ -19,10 +19,9 @@ from application.dto import CheckResult, MetricsSnapshot, ReadinessReport
 
 if TYPE_CHECKING:
     from application.model_catalog import ModelCatalog
+    from application.ports import AuditLog, ThreadMetadataReader
     from application.run_service import RunService
     from config import AppConfig
-    from runtime.audit_store import AuditStore
-    from runtime.thread_store import ThreadMetaStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +39,9 @@ class HealthService:
         self,
         config: AppConfig,
         *,
-        thread_store: ThreadMetaStore,
+        thread_store: ThreadMetadataReader,
         run_service: RunService,
-        audit_store: AuditStore | None = None,
+        audit_store: AuditLog | None = None,
         catalog: ModelCatalog | None = None,
         started_at: float | None = None,
     ) -> None:

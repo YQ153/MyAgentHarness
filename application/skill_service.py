@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from application.errors import NotFoundError
-from runtime.skill_store import DEFAULT_ENABLED, GLOBAL_SCOPE, SkillStateStore
+from application.ports import SkillState
+from runtime.skill_store import DEFAULT_ENABLED, GLOBAL_SCOPE
 from runtime.skill_view import rebuild_view, sources_for_graph, view_directory, ViewEntry, ViewResult
 from runtime.skills import inspect_skills
 
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 class SkillService:
     """技能库的读与启停。"""
 
-    def __init__(self, config: AppConfig, *, store: SkillStateStore) -> None:
+    def __init__(self, config: AppConfig, *, store: SkillState) -> None:
         """构造服务。
 
         Args:

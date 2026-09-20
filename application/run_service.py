@@ -48,6 +48,7 @@ from application.message_utils import (
     user_turn_number,
 )
 from application.ownership import ensure_thread_access
+from application.ports import AuditLog, ThreadMetadataStore, UsageLedger
 from application.principal import Principal
 from application.run_branch import RunBranchService
 from application.run_governance import RunGovernor
@@ -63,11 +64,8 @@ from application.run_registry import (
 )
 from application.runnable import build_runnable_config
 from application.usage import TokenUsage
-from runtime.audit_store import AuditStore
 from runtime.execution_registry import abort_scope, bound_scope
-from runtime.thread_store import ThreadMetaStore
 from runtime.tool_outputs import prune_tool_outputs, tool_output_path, write_tool_output
-from runtime.usage_store import UsageStore
 from runtime.workspace_files import to_virtual_path
 from text_utils import build_title
 from thread_utils import normalize_thread_id
@@ -141,10 +139,10 @@ class RunService:
         self,
         config: AppConfig,
         *,
-        thread_store: ThreadMetaStore,
+        thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
-        audit_store: AuditStore | None = None,
-        usage_store: UsageStore | None = None,
+        audit_store: AuditLog | None = None,
+        usage_store: UsageLedger | None = None,
         tool_catalog: ToolCatalog | None = None,
     ) -> None:
         """构造运行服务。

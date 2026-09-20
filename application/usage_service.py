@@ -19,10 +19,9 @@ from application.ownership import effective_owner_id, ensure_thread_access
 from runtime.usage_store import window_start
 
 if TYPE_CHECKING:
+    from application.ports import ThreadMetadataReader, UsageLedger
     from application.principal import Principal
     from config import AppConfig
-    from runtime.thread_store import ThreadMetaStore
-    from runtime.usage_store import UsageStore
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,8 @@ class UsageService:
         self,
         config: AppConfig,
         *,
-        usage_store: UsageStore,
-        thread_store: ThreadMetaStore,
+        usage_store: UsageLedger,
+        thread_store: ThreadMetadataReader,
     ) -> None:
         """构造用量服务。
 

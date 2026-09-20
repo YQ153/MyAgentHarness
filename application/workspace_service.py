@@ -35,9 +35,9 @@ from runtime.workspace_files import (
 )
 
 if TYPE_CHECKING:
+    from application.ports import AuditLog
     from application.principal import Principal
     from config import AppConfig
-    from runtime.audit_store import AuditStore
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ _BYTES_PER_CHAR = 4
 class WorkspaceService:
     """工作区文件的只读访问。"""
 
-    def __init__(self, config: AppConfig, *, audit_store: AuditStore | None = None) -> None:
+    def __init__(self, config: AppConfig, *, audit_store: AuditLog | None = None) -> None:
         """构造服务。
 
         Args:
