@@ -805,63 +805,71 @@ async def open_knowledge_store(
         raise ValueError(f"dims 必须是正整数，实际：{dims!r}")
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = await aiosqlite.connect(str(db_path))
-    conn.row_factory = aiosqlite.Row
-
+    conn: aiosqlite.Connection | None = None
+    loaded_extension = False
     try:
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
+        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
+        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「知识库初始化
+        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
+        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
+        try:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL;")
+            await conn.execute("PRAGMA busy_timeout=5000;")
 
-        loaded_extension = False
-        if vector_enabled:
-            # WHY 用公开 API 而不是 ``conn._conn``：aiosqlite 本身暴露了
-            # enable_load_extension / load_extension，摸私有字段只是把「上游实现
-            # 细节」变成自己的依赖。``loadable_path()`` 给出的是无扩展名的路径，
-            # 由 SQLite 自己补平台后缀（Windows .dll / POSIX .so）——实测可行。
-            try:
-                import sqlite_vec
+            if vector_enabled:
+                # WHY 用公开 API 而不是 ``conn._conn``：aiosqlite 本身暴露了
+                # enable_load_extension / load_extension，摸私有字段只是把「上游实现
+                # 细节」变成自己的依赖。``loadable_path()`` 给出的是无扩展名的路径，
+                # 由 SQLite 自己补平台后缀（Windows .dll / POSIX .so）——实测可行。
+                try:
+                    import sqlite_vec
 
-                await conn.enable_load_extension(True)
-                await conn.load_extension(sqlite_vec.loadable_path())
-                loaded_extension = True
-            except Exception as exc:
-                # WHY 直接报错而不是降级成关键词检索：启用向量检索是用户的显式选择，
-                # 而扩展加载失败是**启动期就能确定**的环境问题。静默降级会让知识库
-                # 看起来在工作、只是「搜不太准」——那种现象没人会去查扩展有没有加载。
+                    await conn.enable_load_extension(True)
+                    await conn.load_extension(sqlite_vec.loadable_path())
+                    loaded_extension = True
+                except Exception as exc:
+                    # WHY 直接报错而不是降级成关键词检索：启用向量检索是用户的显式选择，
+                    # 而扩展加载失败是**启动期就能确定**的环境问题。静默降级会让知识库
+                    # 看起来在工作、只是「搜不太准」——那种现象没人会去查扩展有没有加载。
+                    raise KnowledgeStoreError(
+                        f"EMBEDDING_BACKEND 要求向量检索，但 sqlite-vec 扩展加载失败："
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+
+            await conn.executescript(_SCHEMA)
+            if loaded_extension:
+                await conn.executescript(_vec_table_ddl(dims))
+
+            meta = await _read_meta(conn)
+            recorded_version = meta.get("schema_version", "")
+            if recorded_version and recorded_version != str(_SCHEMA_VERSION):
                 raise KnowledgeStoreError(
-                    f"EMBEDDING_BACKEND 要求向量检索，但 sqlite-vec 扩展加载失败："
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-
-        await conn.executescript(_SCHEMA)
-        if loaded_extension:
-            await conn.executescript(_vec_table_ddl(dims))
-
-        meta = await _read_meta(conn)
-        recorded_version = meta.get("schema_version", "")
-        if recorded_version and recorded_version != str(_SCHEMA_VERSION):
-            raise KnowledgeStoreError(
-                f"知识库结构版本不符：库内 {recorded_version}，当前 {_SCHEMA_VERSION}；"
-                "请重建索引"
-            )
-        if loaded_extension:
-            recorded_dims = meta.get("embedding_dims", "")
-            recorded_model = meta.get("embedding_model", "")
-            if recorded_dims and int(recorded_dims) != dims:
-                raise KnowledgeStoreError(
-                    f"存量索引的向量维度是 {recorded_dims}，当前配置是 {dims}；"
-                    "换过嵌入模型必须重建知识库（删除 .data/knowledge.db 后重新索引）"
+                    f"知识库结构版本不符：库内 {recorded_version}，当前 {_SCHEMA_VERSION}；"
+                    "请重建索引"
                 )
-            if recorded_model and recorded_model != model:
-                raise KnowledgeStoreError(
-                    f"存量索引来自模型 {recorded_model}，当前配置是 {model}；"
-                    "不同模型产出的向量无法互相比较，必须重建知识库"
+            if loaded_extension:
+                recorded_dims = meta.get("embedding_dims", "")
+                recorded_model = meta.get("embedding_model", "")
+                if recorded_dims and int(recorded_dims) != dims:
+                    raise KnowledgeStoreError(
+                        f"存量索引的向量维度是 {recorded_dims}，当前配置是 {dims}；"
+                        "换过嵌入模型必须重建知识库（删除 .data/knowledge.db 后重新索引）"
+                    )
+                if recorded_model and recorded_model != model:
+                    raise KnowledgeStoreError(
+                        f"存量索引来自模型 {recorded_model}，当前配置是 {model}；"
+                        "不同模型产出的向量无法互相比较，必须重建知识库"
+                    )
+                await _write_meta(
+                    conn, {"embedding_dims": str(dims), "embedding_model": model}
                 )
-            await _write_meta(
-                conn, {"embedding_dims": str(dims), "embedding_model": model}
-            )
-        await _write_meta(conn, {"schema_version": str(_SCHEMA_VERSION)})
-        await conn.commit()
+            await _write_meta(conn, {"schema_version": str(_SCHEMA_VERSION)})
+            await conn.commit()
+        except Exception:
+            logger.exception("知识库初始化失败：%s", db_path)
+            raise
 
         logger.info(
             "知识库已就绪：%s（dims=%s model=%s vectors=%s）",
@@ -873,9 +881,7 @@ async def open_knowledge_store(
         yield KnowledgeStore(
             conn, dims=dims, model=model, vector_enabled=loaded_extension
         )
-    except Exception:
-        logger.exception("知识库初始化失败：%s", db_path)
-        raise
     finally:
-        await conn.close()
-        logger.debug("知识库连接已关闭：%s", db_path)
+        if conn is not None:
+            await conn.close()
+            logger.debug("知识库连接已关闭：%s", db_path)

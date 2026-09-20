@@ -1066,32 +1066,37 @@ async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
     conn: aiosqlite.Connection | None = None
 
     try:
-        conn = await aiosqlite.connect(str(db_path))
-        # WHY 设为 Row：让 fetchone/fetchall 直接可按列名取值，
-        # 避免下游用魔法下标（row[3]）读字段，字段顺序一变就会静默错位。
-        conn.row_factory = aiosqlite.Row
+        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
+        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
+        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
+        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
+        try:
+            conn = await aiosqlite.connect(str(db_path))
+            # WHY 设为 Row：让 fetchone/fetchall 直接可按列名取值，
+            # 避免下游用魔法下标（row[3]）读字段，字段顺序一变就会静默错位。
+            conn.row_factory = aiosqlite.Row
 
-        # WHY 重复设置 WAL：它是库级持久属性、通常已由检查点侧开启，
-        # 但本模块不应假设初始化顺序，显式声明才能保证独立启用时行为一致。
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        # WHY busy_timeout：检查点写入频繁，与本表写入可能同时发生；
-        # 默认行为是立即返回 "database is locked"，等待几秒远比报错合理。
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.executescript(_SCHEMA)
-        for migration in _MIGRATIONS:
-            try:
-                await conn.executescript(migration)
-            except Exception:
-                # WHY 忽略重复迁移错误：SQLite 对已有列/索引的 ALTER 会抛错，
-                # 但幂等迁移不需要回滚；非重复错误会在外层被记录。
-                pass
-        await conn.commit()
+            # WHY 重复设置 WAL：它是库级持久属性、通常已由检查点侧开启，
+            # 但本模块不应假设初始化顺序，显式声明才能保证独立启用时行为一致。
+            await conn.execute("PRAGMA journal_mode=WAL;")
+            # WHY busy_timeout：检查点写入频繁，与本表写入可能同时发生；
+            # 默认行为是立即返回 "database is locked"，等待几秒远比报错合理。
+            await conn.execute("PRAGMA busy_timeout=5000;")
+            await conn.executescript(_SCHEMA)
+            for migration in _MIGRATIONS:
+                try:
+                    await conn.executescript(migration)
+                except Exception:
+                    # WHY 忽略重复迁移错误：SQLite 对已有列/索引的 ALTER 会抛错，
+                    # 但幂等迁移不需要回滚；非重复错误会在外层被记录。
+                    pass
+            await conn.commit()
+        except Exception:
+            logger.exception("会话元数据表初始化失败：%s", db_path)
+            raise
 
         logger.info("会话元数据表已就绪：%s", db_path)
         yield ThreadMetaStore(conn)
-    except Exception:
-        logger.exception("会话元数据表初始化失败：%s", db_path)
-        raise
     finally:
         if conn is not None:
             await conn.close()

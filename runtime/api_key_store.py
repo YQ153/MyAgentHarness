@@ -277,17 +277,22 @@ async def open_api_key_store(db_path: Path) -> AsyncIterator[APIKeyStore]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn: aiosqlite.Connection | None = None
     try:
-        conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.executescript(_SCHEMA)
-        await conn.commit()
+        # WHY 只把初始化包在捕获里、``yield`` 留在它外面：``yield`` 之后抛出的异常来自
+        # ``async with`` 主体（调用方的装配或业务代码），这里接住会把它记成「表初始化
+        # 失败」——主体里一个 ValueError 就能让每个存储各打一份「初始化失败 + 堆栈」，
+        # 把排查引向数据库，而数据库根本没问题。连接失败同样是初始化失败，故一并包住。
+        try:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL;")
+            await conn.execute("PRAGMA busy_timeout=5000;")
+            await conn.executescript(_SCHEMA)
+            await conn.commit()
+        except Exception:
+            logger.exception("API Key 表初始化失败：%s", db_path)
+            raise
         logger.info("API Key 表已就绪：%s", db_path)
         yield APIKeyStore(conn)
-    except Exception:
-        logger.exception("API Key 表初始化失败：%s", db_path)
-        raise
     finally:
         if conn is not None:
             await conn.close()
