@@ -201,7 +201,17 @@
       <div class="card"><b>interfaces/web/</b><span>FastAPI 路由 + SSE + 前端静态页</span></div>
     </div>
   </div>
-  <div class="arrow">↓ 只调用应用服务，不感知 LangGraph 结构</div>
+  <div class="arrow">↓ 适配器只做协议转换；对象从哪来交给组装层</div>
+
+  <div class="layerrow">
+    <div class="layername">组装层</div>
+    <div class="layerbody">
+      <div class="card"><b>bootstrap/core.py</b><span>唯一装配点：CLI 与 Web 共用 <code>build_app_context</code></span></div>
+      <div class="card"><b>bootstrap/context.py</b><span>AppContext：装配完成的依赖集合（不可变）</span></div>
+      <div class="card"><b>bootstrap/web.py</b><span>Web 专有资源：限流器、审计清理、运行治理</span></div>
+    </div>
+  </div>
+  <div class="arrow">↓ 装配应用服务与基础设施，经 AppContext 注入——适配器因此不直接持有任何连接</div>
 
   <div class="layerrow">
     <div class="layername">应用层</div>
@@ -257,25 +267,29 @@
   <thead><tr><th>模块</th><th>依赖</th><th>被谁依赖</th></tr></thead>
   <tbody>
     <tr><td><code>config.py</code></td><td>pydantic-settings</td><td>全部模块</td></tr>
-    <tr><td><code>runtime/*</code></td><td>langgraph、aiosqlite、config</td><td>application、interfaces</td></tr>
-    <tr><td><code>agent/profiles.py</code></td><td>deepagents</td><td>agent/graph、llm/registry</td></tr>
+    <tr><td><code>runtime/*</code></td><td>langgraph、aiosqlite、config</td><td>application、agent、bootstrap（<strong>interfaces 不直接依赖它</strong>）</td></tr>
+    <tr><td><code>agent/profiles.py</code></td><td>deepagents</td><td>agent/graph、bootstrap</td></tr>
     <tr><td><code>agent/backends.py</code></td><td>deepagents.backends、runtime 的 Store</td><td>agent/graph</td></tr>
     <tr><td><code>agent/guardrails.py</code></td><td>deepagents、langchain 中间件</td><td>agent/graph</td></tr>
-    <tr><td><code>llm/registry.py</code></td><td>langchain、agent/profiles</td><td>agent/graph、application</td></tr>
+    <tr><td><code>llm/registry.py</code></td><td>langchain（<code>agent</code> 只出现在 docstring 里，不是导入）</td><td>agent/graph、application</td></tr>
     <tr><td><code>agent/graph.py</code></td><td>agent/*、llm/*、runtime/*</td><td>application/*（经 AgentFactory 注入）</td></tr>
-    <tr><td><code>application/*</code></td><td>agent、runtime、config</td><td>interfaces/*</td></tr>
-    <tr><td><code>interfaces/*</code></td><td>application、runtime、config</td><td>main.py</td></tr>
+    <tr><td><code>application/*</code></td><td>agent、runtime、config、llm</td><td>interfaces/*</td></tr>
+    <tr><td><code>interfaces/*</code></td><td>application、bootstrap、config（<strong>runtime 由 bootstrap 装配后注入</strong>）</td><td>main.py</td></tr>
   </tbody>
 </table>
 
 <div class="box warn">
-  <span class="t">依赖图上的唯一例外</span>
-  <code>llm/registry.py:24</code> 反向导入了 <code>agent.profiles</code>（为了在构造模型前
-  确保 HarnessProfile 已注册）。这使 <code>llm</code> 与 <code>agent</code> 两个包之间
-  存在<strong>双向引用</strong>，Python 能正常工作依赖于「先导入 <code>agent</code> 包」的导入顺序。
-  新增代码时请勿从 <code>llm.registry</code> 直接导入 <code>agent.graph</code> 等更上层模块，
-  否则容易触发循环导入。彻底解耦的做法是把 <code>ensure_profiles_registered()</code>
-  的调用挪到 <code>agent/graph.py</code> 的装配入口处。
+  <span class="t">依赖方向由契约守住（2026-09-20 复核）</span>
+  <code>llm</code> 与 <code>agent</code> 之间<strong>没有</strong>双向引用：Profile 注册由
+  <strong>上层</strong>发起（<code>bootstrap/core.py:15</code>、<code>agent/graph.py:28</code>），
+  模型注册表同样由 <code>agent/graph.py:30</code> 取用；<code>llm/registry.py</code> 里提到
+  <code>agent.profiles</code> 的地方只剩一句前置条件说明（<code>llm/registry.py:446</code>），
+  且 <code>_build()</code> 的 docstring 写明了「不放注册以免形成包级循环」这条理由
+  （<code>llm/registry.py:263-268</code>）。
+  <br><strong>此前这里写着「依赖图上的唯一例外：<code>llm/registry.py</code> 反向导入了
+  <code>agent.profiles</code>」——该例外已在 2026-09 的分层重构中消除，文字留存至今。</strong>
+  方向现由 <code>.importlinter</code> 契约 2（<code>llm must not depend on agent</code>，实测 KEPT）
+  守住；<code>interfaces</code> 对 <code>runtime</code> 同理（契约 1）。
 </div>
 
 <h3>2.3 核心组件一览</h3>
@@ -283,13 +297,13 @@
 <table>
   <thead><tr><th>组件</th><th>实现位置</th><th>职责</th></tr></thead>
   <tbody>
-    <tr><td>配置中心 <code>AppConfig</code></td><td><code>config.py:37</code></td><td>环境变量装载、路径展开、目录创建、技能/记忆路径换算</td></tr>
-    <tr><td>模型注册表 <code>ModelRegistry</code></td><td><code>llm/registry.py:97</code></td><td>按别名提供模型实例，双检锁懒加载，密钥与地址校验</td></tr>
-    <tr><td>装配入口 <code>build_agent</code></td><td><code>agent/graph.py:62</code></td><td>唯一的图构造点，挂载中间件、Backend、权限、中断与 Profile</td></tr>
+    <tr><td>配置中心 <code>AppConfig</code></td><td><code>config.py:306</code></td><td>环境变量装载、路径展开、目录创建、技能/记忆路径换算</td></tr>
+    <tr><td>模型注册表 <code>ModelRegistry</code></td><td><code>llm/registry.py:132</code></td><td>按别名提供模型实例，双检锁懒加载，密钥与地址校验</td></tr>
+    <tr><td>装配入口 <code>build_agent</code></td><td><code>agent/graph.py:80</code></td><td>唯一的图构造点，挂载中间件、Backend、权限、中断与 Profile</td></tr>
     <tr><td>图工厂 <code>AgentFactory</code></td><td><code>agent/graph.py</code></td><td>按模型别名缓存已编译图；缓存上下文含 checkpointer 与 store，随工厂实例失效</td></tr>
-    <tr><td>Backend 工厂</td><td><code>agent/backends.py:36</code></td><td>按执行档位决定「文件落在哪、命令在哪跑」</td></tr>
-    <tr><td>护栏 <code>build_permissions</code></td><td><code>agent/guardrails.py:41</code></td><td>敏感文件黑名单 + 读写放行规则（顺序敏感）</td></tr>
-    <tr><td>中断配置 <code>build_interrupt_on</code></td><td><code>agent/guardrails.py:72</code></td><td>仅 <code>local</code> 档位为 <code>execute</code> 开启审批</td></tr>
+    <tr><td>Backend 工厂</td><td><code>agent/backends.py:161</code></td><td>按执行档位决定「文件落在哪、命令在哪跑」</td></tr>
+    <tr><td>护栏 <code>build_permissions</code></td><td><code>agent/guardrails.py:77</code></td><td>敏感文件黑名单 + 读写放行规则（顺序敏感）</td></tr>
+    <tr><td>中断配置 <code>build_interrupt_on</code></td><td><code>agent/guardrails.py:135</code></td><td>仅 <code>local</code> 档位为 <code>execute</code> 开启审批</td></tr>
     <tr><td>会话服务 <code>ThreadService</code></td><td><code>application/thread_service.py</code></td><td>会话标识、清单、历史读取、删除</td></tr>
     <tr><td>运行服务 <code>RunService</code></td><td><code>application/run_service.py</code></td><td>发起运行、恢复执行、停止与事件产出；槽位、计数、治理与分叉委托给下列三个协作者</td></tr>
     <tr><td>运行登记表 <code>RunRegistry</code></td><td><code>application/run_registry.py</code></td><td>运行槽位、累计计数与审批挂起状态的唯一所有者（含那把 <code>threading.Lock</code> 与限流器）</td></tr>
@@ -299,7 +313,7 @@
     <tr><td>事件翻译器</td><td><code>application/event_translator.py</code></td><td>LangGraph 流增量 → 应用事件（有状态解析器）</td></tr>
     <tr><td>中断编解码</td><td><code>application/interrupt_codec.py</code></td><td>解析 <code>__interrupt__</code>、规整 decisions、构造 <code>Command</code></td></tr>
     <tr><td>检查点上下文</td><td><code>runtime/checkpointer.py:19</code></td><td>异步 SQLite 保存器的建立、建表与关闭</td></tr>
-    <tr><td>会话元数据 <code>ThreadMetaStore</code></td><td><code>runtime/thread_store.py:76</code></td><td>会话标题、创建/活动时间与轮次的读写，与检查点共用同一个 SQLite 文件</td></tr>
+    <tr><td>会话元数据 <code>ThreadMetaStore</code></td><td><code>runtime/thread_store.py:322</code></td><td>会话标题、创建/活动时间与轮次的读写，与检查点共用同一个 SQLite 文件</td></tr>
   </tbody>
 </table>
 
@@ -419,16 +433,16 @@
 <table>
   <thead><tr><th>文件</th><th>对外入口</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td><code>main.py</code></td><td><code>main()</code> <code>main.py:79</code></td><td>子命令解析（<code>_build_parser</code> <code>main.py:33</code>）、配置失败兜底（退出码 2）、按命令分发到 <code>_run_cli</code> / <code>_run_web</code></td></tr>
-    <tr><td><code>config.py</code></td><td><code>AppConfig.load()</code> <code>config.py:182</code></td><td>装载后立即 <code>ensure_directories()</code>；<code>get_config()</code> <code>config.py:196</code> 以 <code>lru_cache</code> 保证进程内共享同一份</td></tr>
+    <tr><td><code>main.py</code></td><td><code>main()</code> <code>main.py:137</code></td><td>子命令解析（<code>_build_parser</code> <code>main.py:82</code>）、配置失败兜底（退出码 2）、按命令分发到 <code>_run_cli</code> / <code>_run_web</code></td></tr>
+    <tr><td><code>config.py</code></td><td><code>AppConfig.load()</code> <code>config.py:1227</code></td><td>装载后立即 <code>ensure_directories()</code>；<code>get_config()</code> <code>config.py:1242</code> 以 <code>lru_cache</code> 保证进程内共享同一份</td></tr>
     <tr><td><code>agent/graph.py</code></td><td><code>build_agent()</code> / <code>AgentFactory.get()</code></td><td><code>AgentFactory</code> 为带锁双检的缓存版本，由装配层构造后注入服务</td></tr>
     <tr><td><code>agent/backends.py</code></td><td><code>build_backend()</code></td><td>校验工作区存在性；<code>sandbox</code> 档位显式抛 <code>NotImplementedError</code> 而非静默降级</td></tr>
-    <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>:360</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>:76</code> 提供登记、轮次累加、列表与删除</td></tr>
+    <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>runtime/thread_store.py:1063</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>runtime/thread_store.py:322</code> 提供登记、轮次累加、列表与删除</td></tr>
     <tr><td><code>application/run_service.py</code></td><td><code>RunService.stream()</code> / <code>resume()</code></td><td>普通协程，<strong>在进入流之前</strong>完成校验与模型初始化；返回产出 <code>AgentEvent</code> 的异步迭代器</td></tr>
     <tr><td><code>application/thread_service.py</code></td><td><code>ThreadService.history()</code> / <code>rename_thread()</code> / <code>set_archived()</code> / <code>delete_thread()</code></td><td>删除返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分不存在 / 部分成功 / 失败</td></tr>
-    <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>:160</code></td><td>主循环 + <code>_run_turn()</code> <code>:133</code> 中断循环 + <code>ask_human()</code> <code>:80</code> 决策采集</td></tr>
-    <tr><td><code>interfaces/web/app.py</code></td><td><code>create_app()</code> <code>:53</code></td><td>路由注册必须在静态挂载之前，否则 API 被 <code>/</code> 吞掉</td></tr>
-    <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>13 个端点，2 个以 SSE 返回</td></tr>
+    <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>interfaces/cli.py:242</code></td><td>主循环 + <code>_run_turn()</code> <code>interfaces/cli.py:209</code> 中断循环 + <code>ask_human()</code> <code>interfaces/cli.py:98</code> 决策采集</td></tr>
+    <tr><td><code>interfaces/web/app.py</code></td><td><code>create_app()</code> <code>interfaces/web/app.py:128</code></td><td>路由注册必须在静态挂载之前，否则 API 被 <code>/</code> 吞掉</td></tr>
+    <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>19 个端点，4 个以 SSE 返回（<code>media_type="text/event-stream"</code>）</td></tr>
   </tbody>
 </table>
 
@@ -437,7 +451,7 @@
 
 <p>
   <code>config.py</code> 是全应用<strong>唯一的</strong>环境变量解析点，读取优先级为
-  <code>环境变量 &gt; .env 文件 &gt; 字段默认值</code>（<code>config.py:44-49</code>）。
+  <code>环境变量 &gt; .env 文件 &gt; 字段默认值</code>（<code>config.py:313-318</code>）。
   选用 <code>pydantic-settings</code> 而非裸 <code>os.getenv</code>，是为了让类型转换、
   缺省值与非法值拦截由框架统一处理。
 </p>
@@ -453,21 +467,21 @@
 
 <div class="box">
   <span class="t">1. 路径统一展开为绝对路径</span>
-  <code>_expand_path</code>（<code>config.py:88-96</code>）对 <code>workspace</code> /
+  <code>_expand_path</code>（<code>config.py:912</code>）对 <code>workspace</code> /
   <code>memory_file</code> / <code>db_path</code> 执行 <code>expanduser().resolve()</code>。
   WHY：Backend 的 <code>root_dir</code> 若为相对路径，进程工作目录一旦变化就会指向不同物理目录。
 </div>
 
 <div class="box">
   <span class="t">2. 传给 deepagents 的路径必须是「相对工作区的 POSIX 路径」</span>
-  <code>skill_source_paths()</code>（<code>config.py:135</code>）与 <code>memory_paths</code>
-  （<code>config.py:159</code>）都做了 <code>relative_to(workspace)</code> 再前置 <code>/</code>。
+  <code>skill_source_paths()</code>（<code>config.py:1180</code>）与 <code>memory_paths</code>
+  （<code>config.py:1204</code>）都做了 <code>relative_to(workspace)</code> 再前置 <code>/</code>。
   WHY：虚拟文件系统内部以 <code>/</code> 为根分隔符，且 Backend 的根就是 <code>workspace</code>；
   传宿主机绝对路径（Windows 下还带盘符与反斜杠）永远命中不了。位于工作区之外的目录无法映射，只能跳过并告警。
 </div>
 
 <p>
-  <code>existing_skill_dirs()</code>（<code>config.py:124</code>）在技能目录缺失时只记录告警
+  <code>existing_skill_dirs()</code>（<code>config.py:1156</code>）在技能目录缺失时只记录告警
   而不报错——技能库属于可选能力，缺失应当降级而非让应用无法启动。
 </p>
 
@@ -475,8 +489,8 @@
 <h2 id="c-llm">5. 核心组件：模型注册表</h2>
 
 <p>
-  <code>llm/registry.py</code> 用 <code>ModelSpec</code>（<code>:32</code>）描述一个可切换模型，
-  用 <code>ModelRegistry</code>（<code>:97</code>）按别名提供实例。
+  <code>llm/registry.py</code> 用 <code>ModelSpec</code>（<code>llm/registry.py:34</code>）描述一个可切换模型，
+  用 <code>ModelRegistry</code>（<code>llm/registry.py:132</code>）按别名提供实例。
 </p>
 
 <h4>三个设计要点</h4>
@@ -485,41 +499,41 @@
   <tbody>
     <tr>
       <td>懒加载</td>
-      <td><code>get()</code> <code>:131</code> 首次调用才构造</td>
+      <td><code>get()</code> <code>llm/registry.py:186</code> 首次调用才构造</td>
       <td>模型初始化会读取密钥并可能触发鉴权探测，启动时一次性构造会让某个缺 Key 的 provider 拖垮整个应用</td>
     </tr>
     <tr>
       <td>线程安全</td>
-      <td>双检锁 <code>:137-151</code></td>
+      <td>双检锁 <code>llm/registry.py:192-206</code></td>
       <td>Web 为多线程环境，并发首次请求同一模型若重复初始化，既浪费连接也可能触发 provider 限流</td>
     </tr>
     <tr>
       <td>共享缓存视图</td>
-      <td><code>with_model()</code> <code>:153</code> 浅拷贝</td>
+      <td><code>with_model()</code> <code>llm/registry.py:248</code> 浅拷贝</td>
       <td>切换模型不应丢弃已初始化的连接；浅拷贝让新视图与原对象共用同一 <code>_cache</code> 与锁</td>
     </tr>
   </tbody>
 </table>
 
 <h4>构造阶段的失败快慢策略</h4>
-<p><code>_build()</code>（<code>:168</code>）在进入 SDK 之前就完成三类校验：</p>
+<p><code>_build()</code>（<code>llm/registry.py:263</code>）在进入 SDK 之前就完成三类校验：</p>
 <ol>
-  <li>密钥环境变量缺失 → <code>RuntimeError</code>（<code>:173-177</code>）；</li>
-  <li>密钥仍是占位值 <code>your_api_key_here</code> → 明确提示去填 <code>.env</code>（<code>:179-182</code>）；</li>
-  <li>自定义 API 地址非法 → 在 <code>_resolve_base_url()</code>（<code>:59</code>）用 <code>urlparse</code> 拦截，并去掉结尾斜杠避免拼出 <code>//chat/completions</code>。</li>
+  <li>密钥环境变量缺失 → <code>RuntimeError</code>（<code>llm/registry.py:271-275</code>）；</li>
+  <li>密钥仍是占位值 <code>your_api_key_here</code> → 明确提示去填 <code>.env</code>（<code>llm/registry.py:277-280</code>）；</li>
+  <li>自定义 API 地址非法 → 在 <code>_resolve_base_url()</code>（<code>llm/registry.py:69</code>）用 <code>urlparse</code> 拦截，并去掉结尾斜杠避免拼出 <code>//chat/completions</code>。</li>
 </ol>
 <p>
-  此外 <code>_read_effective_base_url()</code>（<code>:83</code>）会从构造出的模型实例上
+  此外 <code>_read_effective_base_url()</code>（<code>llm/registry.py:93</code>）会从构造出的模型实例上
   <strong>读回真正生效的地址</strong>做自检：不同版本的 provider 包字段名不同，
   个别版本会静默忽略未知 kwargs 并回落到官方地址，此时必须告警而不是让请求打到非预期服务端。
 </p>
 
 <h4>注册范围</h4>
 <p>
-  <code>build_default_registry()</code>（<code>:224</code>）当前只注册一条
+  <code>build_default_registry()</code>（<code>llm/registry.py:438</code>）当前只注册一条
   <code>deepseek-flash</code> 条目（provider 为 <code>deepseek</code>）。
   新增 provider 只需追加一条 <code>ModelSpec</code>，装配层与接口层零改动；
-  若 <code>DEFAULT_MODEL</code> 指向未注册别名，会告警并回落到 <code>deepseek-flash</code>（<code>:247-250</code>）。
+  若 <code>DEFAULT_MODEL</code> 指向未注册别名，会告警并回落到 <code>deepseek-flash</code>（<code>llm/registry.py:475-482</code>）。
 </p>
 
 <!-- ============================================================ -->
@@ -528,23 +542,23 @@
 <h3>6.1 <code>agent/graph.py</code>：唯一装配点</h3>
 
 <p>
-  全应用只有 <code>build_agent()</code>（<code>graph.py:62</code>）一处调用
+  全应用只有 <code>build_agent()</code>（<code>agent/graph.py:80</code>）一处调用
   <code>create_deep_agent</code>。这是<strong>刻意的收敛</strong>：该函数的参数组合会随
   Backend、权限、技能、Profile 指数增长，散落多处调用必然导致护栏口径不一致，
   也让安全审计失去锚点。
 </p>
 
-<h4>装配内容（<code>graph.py:117-130</code>）</h4>
+<h4>装配内容（<code>agent/graph.py:117-197</code>）</h4>
 <table>
   <thead><tr><th>参数</th><th>取值来源</th><th>作用</th></tr></thead>
   <tbody>
     <tr><td><code>model</code></td><td><code>registry.get(别名)</code></td><td>按别名解析到具体模型实例</td></tr>
-    <tr><td><code>system_prompt</code></td><td><code>_FALLBACK_SYSTEM_PROMPT</code> <code>:40</code></td><td>兜底提示；确保 Profile 未注册时仍保留规划与结果落盘引导</td></tr>
+    <tr><td><code>system_prompt</code></td><td><code>_FALLBACK_SYSTEM_PROMPT</code> <code>agent/graph.py:58</code></td><td>兜底提示；确保 Profile 未注册时仍保留规划与结果落盘引导</td></tr>
     <tr><td><code>backend</code></td><td><code>build_backend()</code></td><td>文件落点与命令执行策略</td></tr>
     <tr><td><code>skills</code> / <code>memory</code></td><td><code>config</code> 换算后的 POSIX 路径</td><td>技能库与长期记忆，空则传 <code>None</code></td></tr>
     <tr><td><code>permissions</code></td><td><code>build_permissions()</code></td><td>文件系统安全规则</td></tr>
     <tr><td><code>interrupt_on</code></td><td><code>build_interrupt_on(mode)</code></td><td>HITL 审批通道</td></tr>
-    <tr><td><code>middleware</code></td><td><code>:96-107</code></td><td>待办规划 + 上下文裁剪 + 调用次数硬上限</td></tr>
+    <tr><td><code>middleware</code></td><td><code>agent/graph.py:137-148</code></td><td>待办规划 + 上下文裁剪 + 调用次数硬上限</td></tr>
     <tr><td><code>checkpointer</code> / <code>store</code></td><td>调用方注入</td><td>会话持久化与长期记忆</td></tr>
   </tbody>
 </table>
@@ -593,19 +607,22 @@
   <tbody>
     <tr>
       <td><code>local</code></td>
-      <td><code>LocalShellBackend</code> <code>:56</code></td>
+      <td><code>_ExtendedPathSafeLocalShellBackend</code> <code>agent/backends.py:67</code></td>
       <td>宿主机直跑 shell。<code>inherit_env=False</code> 是刻意的——宿主机环境变量常含 API Key，
-      会顺着子进程泄漏。装配前会打印高危告警（<code>:53</code>）</td>
+      会顺着子进程泄漏。装配前会打印高危告警（<code>agent/backends.py:179</code>）</td>
     </tr>
     <tr>
       <td><code>sandbox</code></td>
-      <td>—</td>
-      <td>显式抛 <code>NotImplementedError</code>（<code>:67</code>）。WHY 不静默降级成本机执行：
-      那会让使用者误以为命令跑在容器里</td>
+      <td><code>SandboxedFilesystemBackend</code> <code>agent/backends.py:195</code></td>
+      <td><strong>（2026-09-20 订正）</strong>该档位已实现，不再抛
+      <code>NotImplementedError</code>：runner 由 <code>build_sandbox_runner()</code>
+      （<code>agent/backends.py:194</code>）按能力探测装配，装配失败直接抛出，<strong>不退化成本机执行</strong>。
+      装配后打印告警说明「只做资源管控，不是安全边界」（<code>agent/backends.py:205-209</code>）。
+      此前这里写的是「显式抛 <code>NotImplementedError</code>」——Tier 2 容器沙箱落地后已不成立</td>
     </tr>
     <tr>
       <td><code>disabled</code>（默认）</td>
-      <td><code>FilesystemBackend</code> <code>:76</code></td>
+      <td><code>_ExtendedPathSafeFilesystemBackend</code> <code>agent/backends.py:215</code></td>
       <td>非沙盒后端不满足 <code>SandboxBackendProtocol</code>，<code>execute</code> 工具存在但调用即返回错误，
       模型可据此调整策略</td>
     </tr>
@@ -638,7 +655,7 @@
   一旦某处新增工具却忘了配规则，就会静默获得越权能力。
 </p>
 
-<h4>文件权限（<code>:41</code>）—— 顺序敏感</h4>
+<h4>文件权限（<code>agent/guardrails.py:77</code>）—— 顺序敏感</h4>
 <p>规则按声明顺序匹配，首个命中即生效，因此「窄而严」必须写在「宽而松」之前：</p>
 <ol>
   <li><strong>拒绝</strong>对敏感模式（<code>.env</code>、<code>.git/</code>、<code>.ssh/</code>、<code>id_rsa</code>、<code>*.pem</code>、<code>*.key</code>、<code>*.p12</code> 等）的读写；</li>
@@ -650,7 +667,7 @@
   用黑名单而非白名单的原因：虚拟根已经限制了可见范围，剩下的真实风险只是「工作区内恰好存在凭据文件」。
 </p>
 
-<h4>HITL 中断配置（<code>:72</code>）</h4>
+<h4>HITL 中断配置（<code>agent/guardrails.py:135</code>）</h4>
 <p>
   仅 <code>local</code> 档位返回 <code>{"execute": InterruptOnConfig(allowed_decisions=["approve","reject"], ...)}</code>，
   其余档位返回空字典。WHY：只有真正能执行命令时才需要审批——<code>disabled</code> 下
@@ -660,19 +677,20 @@
 <h3>6.4 <code>agent/profiles.py</code>：模型行为 Profile</h3>
 
 <p>
-  <code>ensure_profiles_registered()</code>（<code>:46</code>）幂等注册 key 为
+  <code>ensure_profiles_registered()</code>（<code>agent/profiles.py:46</code>）幂等注册 key 为
   <code>"deepseek"</code> 的 <code>HarnessProfile</code>，内容包含：
 </p>
 <ul>
-  <li><code>base_system_prompt</code>（<code>:27</code>）：规定「超过 3 步先 <code>write_todos</code> 拆解」「大结果先落盘只带结论回对话」「一次做完不要中途询问」等行为准则；</li>
-  <li><code>system_prompt_suffix</code>（<code>:43</code>）：要求中文回答、代码与命令保持原样；</li>
+  <li><code>_BASE_SYSTEM_PROMPT</code>（<code>agent/profiles.py:27</code>，经 <code>base_system_prompt=</code> 传入）：规定「超过 3 步先 <code>write_todos</code> 拆解」「大结果先落盘只带结论回对话」「一次做完不要中途询问」等行为准则；</li>
+  <li><code>_SYSTEM_PROMPT_SUFFIX</code>（<code>agent/profiles.py:43</code>，经
+    <code>system_prompt_suffix=</code> 传入）：要求中文回答、代码与命令保持原样；</li>
   <li><code>general_purpose_subagent.enabled = True</code>：开启通用子 Agent，用于「会产生大量中间结果的子任务」。</li>
 </ul>
 <p>
   WHY 用 Profile 而非在 <code>graph.py</code> 里写 if-else：<code>create_deep_agent</code>
   会在模型构造完成后按 provider 或 <code>provider:model</code> 查表并做加性合并，
   新增模型只需注册一条，装配点零改动。幂等性由模块级 <code>_REGISTERED</code> +
-  <code>_LOCK</code> 双检保证（<code>:52-59</code>）。
+  <code>_LOCK</code> 双检保证（<code>agent/profiles.py:54-59</code>）。
 </p>
 
 <!-- ============================================================ -->
@@ -828,7 +846,7 @@
     </tr>
     <tr>
       <td>节点切换（<code>metadata.langgraph_node</code> 变化）</td>
-      <td><code>:343-346</code></td>
+      <td><code>application/event_translator.py:156-163</code></td>
       <td>flush 缓冲的工具调用。WHY：工具参数是分片到达的，模型节点一旦结束转为工具节点，
       这是唯一可靠的 flush 时机</td>
     </tr>
@@ -844,12 +862,12 @@
     </tr>
     <tr>
       <td>流正常结束</td>
-      <td><code>:368-369</code></td>
+      <td><code>application/run_service.py:802</code></td>
       <td><code>done</code> 事件</td>
     </tr>
     <tr>
       <td>任何异常</td>
-      <td><code>:359-362</code></td>
+      <td><code>application/run_service.py:894-896</code></td>
       <td>记录完整栈 + 产出 <code>error</code> 事件后优雅结束（不向上抛，避免流被硬切断）</td>
     </tr>
   </tbody>
@@ -861,7 +879,7 @@
   <code>{"__raw__": ...}</code> 交给前端原样展示，便于排查。
 </p>
 
-<h4>运行配置（<code>:294</code>）</h4>
+<h4>运行配置（<code>application/runnable.py:55-56</code>）</h4>
 <pre><code>{
   "configurable": {"thread_id": thread_id},   # 会话隔离
   "recursion_limit": config.recursion_limit,  # 深层循环保护
@@ -876,7 +894,7 @@
 <h3>8.1 <code>runtime/checkpointer.py</code>：异步 SQLite 检查点</h3>
 
 <p>
-  <code>checkpointer_context()</code>（<code>:19</code>）是一个<strong>异步上下文管理器</strong>，
+  <code>checkpointer_context()</code>（<code>runtime/checkpointer.py:19</code>）是一个<strong>异步上下文管理器</strong>，
   包装 <code>AsyncSqliteSaver.from_conn_string()</code>，负责建表（<code>setup()</code>）、
   yield 保存器、退出时关闭连接。调用方以 <code>async with</code> 持有，保证正常退出与
   Ctrl+C / 异常路径下连接都被确定关闭，而不是依赖 GC。
@@ -890,8 +908,8 @@
 
 <h4>使用点</h4>
 <ul>
-  <li>CLI：<code>interfaces/cli.py:176</code> 的 <code>async with</code> 包住整个交互循环；</li>
-  <li>Web：<code>interfaces/web/app.py:36</code> 的 lifespan 内，与应用生命周期绑定。</li>
+  <li>CLI：<code>interfaces/cli.py:261</code> 的 <code>async with</code> 包住整个交互循环；</li>
+  <li>Web：<code>interfaces/web/app.py:39</code> 的 lifespan 内，与应用生命周期绑定。</li>
 </ul>
 
 <h3>8.2 <code>runtime/store.py</code>：长期记忆</h3>
@@ -932,7 +950,7 @@
   两者描述的是同一批会话，分库会带来「删了会话却删不掉元数据」的跨库不一致。
 </p>
 
-<h4>表结构（<code>thread_store.py:40</code>）</h4>
+<h4>表结构（<code>runtime/thread_store.py:83</code>）</h4>
 <table>
   <thead><tr><th>列</th><th>类型</th><th>说明</th></tr></thead>
   <tbody>
@@ -958,13 +976,13 @@
   承担：SQLite 会为既有行填默认值，因此升级后历史会话的可见性与升级前一致。
 </p>
 
-<h4>时间为什么存字符串（<code>:55</code>）</h4>
+<h4>时间为什么存字符串（<code>runtime/thread_store.py:286</code>）</h4>
 <p>
   固定为「同偏移、定宽」的 ISO8601 UTC 文本后，<strong>字典序即时间序</strong>，
   排序可以完全交给索引，不需要任何转换函数；前端也不必处理时区换算。
 </p>
 
-<h4>并发与一致性（<code>:83</code>）</h4>
+<h4>并发与一致性（<code>runtime/thread_store.py:336</code>）</h4>
 <ul>
   <li>SQLite 单写多读；WAL 模式（由检查点侧开启，属库级持久属性）允许本表与检查点并行读写；</li>
   <li><code>busy_timeout=5000</code>：检查点写入频繁，写锁冲突时等待，而不是立刻抛
@@ -972,7 +990,7 @@
   <li>aiosqlite 连接不允许语句交错，因此所有读写都串行在一把 <code>asyncio.Lock</code> 之下。</li>
 </ul>
 
-<h4>记录一轮对话：单条 UPSERT（<code>:177</code>）</h4>
+<h4>记录一轮对话：单条 UPSERT（<code>runtime/thread_store.py:463</code>）</h4>
 <pre><code>INSERT INTO thread_meta (thread_id, title, created_at, updated_at, turn_count)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
@@ -1007,15 +1025,15 @@ ON CONFLICT(thread_id) DO UPDATE SET
 <table>
   <thead><tr><th>函数</th><th>位置</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td><code>render_event()</code></td><td><code>:35</code></td>
+    <tr><td><code>render_event()</code></td><td><code>interfaces/cli.py:40</code></td>
       <td>按事件类型渲染：token 不换行并强制 <code>flush</code>（否则用户以为卡死）；tool_call 压成单行参数摘要；todos 打印清单；step 静默</td></tr>
-    <tr><td><code>ask_human()</code></td><td><code>:80</code></td>
+    <tr><td><code>ask_human()</code></td><td><code>interfaces/cli.py:98</code></td>
       <td>逐条渲染待审批调用，按 <code>allowed_decisions</code> 动态给出 <code>a/r/e/s</code> 选项；
       <code>edit</code> 会循环重新输入直到 JSON 合法；返回 <code>{"decisions": [...]}</code></td></tr>
-    <tr><td><code>_run_turn()</code></td><td><code>:133</code></td>
+    <tr><td><code>_run_turn()</code></td><td><code>interfaces/cli.py:209</code></td>
       <td>先消费 <code>stream</code>，再用 <code>while pending_payload</code> 循环处理多次中断。
       恢复时<strong>沿用同一 <code>model_name</code></strong>——中断与恢复是同一次运行的两个半程</td></tr>
-    <tr><td><code>run_cli()</code></td><td><code>:160</code></td>
+    <tr><td><code>run_cli()</code></td><td><code>interfaces/cli.py:242</code></td>
       <td>检查点托管 → 构造 service → <strong>启动即校验模型别名</strong>（只比对名称，不需要密钥，可快速失败）
       → 主循环（<code>EOFError</code> 视为正常结束以支持管道输入）</td></tr>
   </tbody>
@@ -1025,12 +1043,12 @@ ON CONFLICT(thread_id) DO UPDATE SET
 
 <h4><code>app.py</code>：应用工厂与生命周期</h4>
 <ul>
-  <li><code>_lifespan</code>（<code>:28</code>）：在 lifespan 中打开检查点与会话元数据表、
+  <li><code>_lifespan</code>（<code>interfaces/web/app.py:39</code>）：在 lifespan 中打开检查点与会话元数据表、
     构造 <code>AgentFactory</code> 与三个服务，分别挂到 <code>app.state.threads</code> /
     <code>app.state.runs</code> / <code>app.state.catalog</code>。WHY 不放在模块导入时：
     服务构造会打开 SQLite 连接并初始化模型，只有放在这里才能保证进程退出（含异常退出）
     一定走到清理逻辑。</li>
-  <li><code>create_app</code>（<code>:53</code>）：注册路由后<strong>再</strong>挂载静态目录。
+  <li><code>create_app</code>（<code>interfaces/web/app.py:128</code>）：注册路由后<strong>再</strong>挂载静态目录。
     WHY：<code>mount("/")</code> 会吞掉之后注册的所有路径，导致 API 404。</li>
 </ul>
 
@@ -1038,13 +1056,13 @@ ON CONFLICT(thread_id) DO UPDATE SET
 <table>
   <thead><tr><th>方法</th><th>路径</th><th>实现</th><th>返回</th></tr></thead>
   <tbody>
-    <tr><td>GET</td><td><code>/api/models</code></td><td><code>:65</code></td><td>模型列表（不含密钥）</td></tr>
-    <tr><td>POST</td><td><code>/api/threads</code></td><td><code>:71</code></td><td>200 + <code>thread_id</code>；<strong>只发号不落库</strong></td></tr>
-    <tr><td>GET</td><td><code>/api/threads</code></td><td><code>:81</code></td><td>会话清单，支持 <code>limit</code> / <code>offset</code></td></tr>
-    <tr><td>GET</td><td><code>/api/threads/{id}</code></td><td><code>:109</code></td><td>历史消息数组</td></tr>
-    <tr><td>DELETE</td><td><code>/api/threads/{id}</code></td><td><code>:119</code></td><td><code>{thread_id, deleted}</code>；<code>deleted</code> 以元数据为准</td></tr>
-    <tr><td>POST</td><td><code>/api/threads/{id}/runs</code></td><td><code>:151</code></td><td>SSE 流；<strong>会话在此刻诞生</strong></td></tr>
-    <tr><td>POST</td><td><code>/api/threads/{id}/resume</code></td><td><code>:176</code></td><td>SSE 流</td></tr>
+    <tr><td>GET</td><td><code>/api/models</code></td><td><code>interfaces/web/routes.py:134</code></td><td>模型列表（不含密钥）</td></tr>
+    <tr><td>POST</td><td><code>/api/threads</code></td><td><code>interfaces/web/routes.py:248</code></td><td>200 + <code>thread_id</code>；<strong>只发号不落库</strong></td></tr>
+    <tr><td>GET</td><td><code>/api/threads</code></td><td><code>interfaces/web/routes.py:261</code></td><td>会话清单，支持 <code>limit</code> / <code>offset</code></td></tr>
+    <tr><td>GET</td><td><code>/api/threads/{id}</code></td><td><code>interfaces/web/routes.py:422</code></td><td>历史消息数组</td></tr>
+    <tr><td>DELETE</td><td><code>/api/threads/{id}</code></td><td><code>interfaces/web/routes.py:455</code></td><td><code>{thread_id, deleted}</code>；<code>deleted</code> 以元数据为准</td></tr>
+    <tr><td>POST</td><td><code>/api/threads/{id}/runs</code></td><td><code>interfaces/web/routes.py:491</code></td><td>SSE 流；<strong>会话在此刻诞生</strong></td></tr>
+    <tr><td>POST</td><td><code>/api/threads/{id}/resume</code></td><td><code>interfaces/web/routes.py:573</code></td><td>SSE 流</td></tr>
   </tbody>
 </table>
 
@@ -1065,7 +1083,7 @@ ON CONFLICT(thread_id) DO UPDATE SET
 </ul>
 
 <p>
-  SSE 响应头（<code>:32-38</code>）的 <code>Cache-Control: no-transform</code> 与
+  SSE 响应头（<code>interfaces/web/sse.py:14</code>）的 <code>Cache-Control: no-transform</code> 与
   <code>X-Accel-Buffering: no</code> 是关掉反向代理缓冲的标准做法——
   否则流式输出会退化成一次性返回。
 </p>
@@ -1105,46 +1123,48 @@ ON CONFLICT(thread_id) DO UPDATE SET
 
 <h4><code>schemas.py</code>：请求/响应模型</h4>
 <ul>
-  <li><code>ChatRequest</code>（<code>:29</code>）：<code>content</code>（<code>min_length=1</code>）+ 可选 <code>model</code>；</li>
-  <li><code>ResumeRequest</code>（<code>:36</code>）：<code>decisions</code>（非空列表）+ 可选 <code>model</code>；</li>
-  <li><code>DecisionPayload</code>（<code>:17</code>）：<code>type</code> 用 <code>Literal</code> 限定为
+  <li><code>ChatRequest</code>（<code>interfaces/web/schemas.py:55</code>）：<code>content</code>（<code>min_length=1</code>）+ 可选 <code>model</code>；</li>
+  <li><code>ResumeRequest</code>（<code>interfaces/web/schemas.py:82</code>）：<code>decisions</code>（非空列表）+ 可选 <code>model</code>；</li>
+  <li><code>DecisionPayload</code>（<code>interfaces/web/schemas.py:24</code>）：<code>type</code> 用 <code>Literal</code> 限定为
     <code>approve/edit/reject/respond</code> 四值，越界在框架层就被拦下；</li>
-  <li><code>ModelInfo</code>（<code>:78</code>）刻意不含任何密钥字段；</li>
-  <li><code>ThreadSummary</code>（<code>:49</code>）与 <code>ThreadListResponse</code>（<code>:64</code>）：
+  <li><code>ModelInfo</code>（定义在 <code>application/dto.py:40</code>，本模块在第 14 行再导出）
+    刻意不含任何密钥字段；</li>
+  <li><code>ThreadSummary</code>（定义在 <code>application/dto.py:126</code>）与
+    <code>ThreadListResponse</code>（<code>interfaces/web/schemas.py:135</code>）：
     会话清单的条目与分页包装，时间以 ISO8601 字符串直接透出（库中即此格式，免去一次无意义的转换）。</li>
 </ul>
 
 <h4><code>static/</code>：前端三件套</h4>
 <p>
-  无构建步骤、无框架。最重要的取舍在 <code>app.js:4-7</code>：<strong>没有使用 <code>EventSource</code></strong>，
+  无构建步骤、无框架。最重要的取舍在 <code>interfaces/web/static/app.js:4-7</code>：<strong>没有使用 <code>EventSource</code></strong>，
   因为它只支持 GET，而发起对话需要携带可能很长的 JSON 请求体，因此改用
   <code>fetch</code> + <code>ReadableStream</code> 手动解析 SSE 帧。
 </p>
 <table>
   <thead><tr><th>函数</th><th>位置</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td><code>consumeSSE()</code></td><td><code>:191</code></td>
+    <tr><td><code>consumeSSE()</code></td><td><code>interfaces/web/static/app.js:319</code></td>
       <td>按 <code>\n\n</code> 切帧——一次网络读可能截断在多帧中间，只有这样才能保证 JSON 完整；
       <code>finally</code> 中 <code>releaseLock()</code> 防止异常路径下连接一直挂着</td></tr>
-    <tr><td><code>readThreadIdFromUrl()</code></td><td><code>:100</code></td>
+    <tr><td><code>readThreadIdFromUrl()</code></td><td><code>interfaces/web/static/app.js:228</code></td>
       <td>从 <code>#/c/{id}</code> 解析会话 ID；无则草稿态</td></tr>
-    <tr><td><code>navigate()</code></td><td><code>:112</code></td>
+    <tr><td><code>navigate()</code></td><td><code>interfaces/web/static/app.js:240</code></td>
       <td>改 <code>location.hash</code>，由 <code>hashchange</code> 统一驱动 UI 同步；
       hash 值未变时须手动调 <code>syncWithUrl()</code>，否则「新会话」按钮看起来无效</td></tr>
-    <tr><td><code>syncWithUrl()</code></td><td><code>:122</code></td>
+    <tr><td><code>syncWithUrl()</code></td><td><code>interfaces/web/static/app.js:250</code></td>
       <td>按 URL 决定恢复历史还是进入草稿态——「刷新 = 恢复」就落在这里</td></tr>
-    <tr><td><code>startDraft()</code></td><td><code>:138</code></td>
+    <tr><td><code>startDraft()</code></td><td><code>interfaces/web/static/app.js:266</code></td>
       <td>草稿态：清空界面但不申请、不写库</td></tr>
-    <tr><td><code>ensureThread()</code></td><td><code>:151</code></td>
+    <tr><td><code>ensureThread()</code></td><td><code>interfaces/web/static/app.js:279</code></td>
       <td>首次发送时才申请会话 ID</td></tr>
-    <tr><td><code>el()</code></td><td><code>:49</code></td>
+    <tr><td><code>el()</code></td><td><code>interfaces/web/static/app.js:137</code></td>
       <td>一律用 <code>textContent</code> 而非 <code>innerHTML</code>：工具输出与文件内容可能含 HTML/脚本，
       用字符串拼接等价于开一个 XSS 入口</td></tr>
-    <tr><td><code>renderApproval()</code></td><td><code>:380</code></td>
+    <tr><td><code>renderApproval()</code></td><td><code>interfaces/web/static/app.js:693</code></td>
       <td>按钮列表由 <code>review_configs.allowed_decisions</code> <strong>动态决定</strong>：
       不同工具允许的决策不同，写死按钮会发出被后端拒绝的请求；
       多调用场景需全部决定后才提交</td></tr>
-    <tr><td><code>handleEvent()</code></td><td><code>:486</code></td>
+    <tr><td><code>handleEvent()</code></td><td><code>interfaces/web/static/app.js:824</code></td>
       <td>按事件名分派渲染；<code>done</code> 时重置助手节点与工具卡片引用</td></tr>
   </tbody>
 </table>
@@ -1161,7 +1181,7 @@ ON CONFLICT(thread_id) DO UPDATE SET
   <span class="step">分发 cli / web</span>
 </div>
 <p>
-  <code>_setup_logging()</code>（<code>main.py:17</code>）用 <code>force=True</code> 安装唯一的
+  <code>_setup_logging()</code>（<code>main.py:55</code>）用 <code>force=True</code> 安装唯一的
   StreamHandler 到 stderr。WHY 必须显式设置：不设置时可能继承第三方库的配置，
   导致 uvicorn 重复接管日志，每条消息打印两遍。
 </p>
@@ -1255,9 +1275,9 @@ uvicorn.run() → 触发 _lifespan：
    （CLI 侧：_run_turn 捕获 interrupt 载荷存进 pending_payload，跳出后调用 ask_human）</code></pre>
 
 <p>
-  <code>decode_interrupt()</code>（<code>interrupt_codec.py:41</code>）兼容两种形态：
+  <code>decode_interrupt()</code>（<code>application/interrupt_codec.py:50</code>）兼容两种形态：
   标准 HITL 的字典直接取 <code>action_requests</code> / <code>review_configs</code>；
-  非 HITL 的裸 <code>interrupt()</code> 会被包成统一形状（<code>:78-93</code>），
+  非 HITL 的裸 <code>interrupt()</code> 会被包成统一形状（<code>application/interrupt_codec.py:84-95</code>），
   让前端只需处理一种结构。
 </p>
 
@@ -1573,7 +1593,7 @@ StreamingResponse(text/event-stream)
     </tr>
     <tr>
       <td>新增模型 provider</td>
-      <td>在 <code>llm/registry.py:233</code> 的 <code>specs</code> 中追加一条 <code>ModelSpec</code>；
+      <td>在 <code>llm/registry.py:364</code> 的 <code>specs</code> 中追加一条 <code>ModelSpec</code>；
       如需差异化提示词，在 <code>agent/profiles.py</code> 注册对应 Profile</td>
     </tr>
     <tr>
@@ -1664,13 +1684,14 @@ StreamingResponse(text/event-stream)
 <footer>
   MyAgentHarness 技术文档 · 基于仓库当前代码生成 · 位置引用格式为 <code>文件:行号</code>；
   代码变更后请同步更新对应章节。
-  <br><strong>状态（2026-09-20 补注）</strong>：主体章节（分层、装配、数据流、接口）仍与代码一致。
-  第三章的目录树已于 2026-09-20 按实际文件重生成（补上 <code>bootstrap/</code> 与全部根级模块、
-  去掉已删除的 <code>tool/</code>），<strong>但同一章「关键文件职责」表的行号尚未复核</strong>——
-  符号名（函数 / 类名）仍然有效，行号已普遍滞后，实测三例：<code>main()</code> 标
-  <code>main.py:79</code> 实为 <code>:137</code>；<code>open_thread_store()</code> 标
-  <code>:360</code> 实为 <code>:1046</code>；<code>ThreadMetaStore</code> 标 <code>:76</code>
-  实为 <code>:321</code>。<strong>请按符号名检索，不要按行号跳转。</strong>
+  <br><strong>状态（2026-09-20 复核）</strong>：主体章节（分层、装配、数据流、接口）与代码一致。
+  第三章的目录树与全篇 <code>文件:行号</code> 引用已于 2026-09-20 逐条复核并修正，
+  复核口径是「<strong>该行必须真的包含所声称的符号</strong>」；此前它们普遍滞后 60–700 行，
+  只有 3 处仍然正确。这一约定现由 <code>tests/test_architecture_doc_contract.py</code> 持续守住：
+  行号再漂移会在 CI 直接失败，而不是等读者跳错地方。
+  第二章的依赖方向表与依赖图同期订正——此前写着 <code>llm/registry.py</code> 反向依赖
+  <code>agent.profiles</code>、以及 <code>interfaces</code> 直接依赖 <code>runtime</code>，
+  两条在 2026-09 的分层重构里都已不成立，文字却留存至今。
   第十八章的「已知限制」与「后续迭代方向」按<strong>逐条补注</strong>维护——已交付的条目以
   <del>删除线</del> 加「已完成」标注，<strong>未标注的仍然有效</strong>。
   清单式的最新状态见 <code>docs/planning/功能完整度分析与缺失功能清单.md</code>，
