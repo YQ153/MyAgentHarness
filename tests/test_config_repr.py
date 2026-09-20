@@ -24,6 +24,7 @@ _SECRETS: dict[str, str] = {
     "openai_api_key": "sk-openai-PLAINTEXT-0002",
     "anthropic_api_key": "sk-ant-PLAINTEXT-0003",
     "auth_api_key_dev": "devkey-PLAINTEXT-0005",
+    "harness_api_key": "harnesskey-PLAINTEXT-0006",
 }
 """每个字段一个独特且可 grep 的明文哨兵，失败时能一眼看出是哪个字段漏了。"""
 
