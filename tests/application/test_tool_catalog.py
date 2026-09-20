@@ -19,13 +19,20 @@ def _bundle(
     *descriptors: ToolDescriptor,
     custom_modules: tuple[str, ...] = (),
     mcp_statuses: tuple[MCPServerStatus, ...] = (),
+    builtin_names: frozenset[str] = BUILTIN_TOOL_NAMES,
 ) -> ToolBundle:
-    """构造一个只含描述的装配结果（本用例不关心可执行工具对象）。"""
+    """构造一个只含描述的装配结果（本用例不关心可执行工具对象）。
+
+    WHY ``builtin_names`` 默认取内核常量：真实的 ``build_tool_bundle`` 总会填入它，
+    跟着填才是"与装配结果同形"的替身。空集的边界由
+    ``test_missing_builtin_names_falls_back_to_unknown`` 单独覆盖。
+    """
     return ToolBundle(
         tools=(),
         descriptors=descriptors,
         custom_modules=custom_modules,
         mcp_statuses=mcp_statuses,
+        builtin_names=builtin_names,
     )
 
 
@@ -113,6 +120,19 @@ def test_source_of_distinguishes_origin():
     assert catalog.source_of("translate") == "custom"
     # 旧配置里残留的工具名要如实标为未知，不能被误读成内置能力
     assert catalog.source_of("removed_tool") == "unknown"
+
+
+def test_missing_builtin_names_falls_back_to_unknown():
+    """装配产物未携带内置工具名时，来源一律如实标为未知。
+
+    WHY 值得钉：``ToolBundle.builtin_names`` 是应用层判定"内置"的唯一依据。
+    若实现退回读内核常量表，本用例会失败——它正是"应用层不回查内核装配细节"
+    这条约束的守卫（见《架构遗留问题治理方案》Q9）。
+    """
+    catalog = ToolCatalog(_bundle(builtin_names=frozenset()))
+
+    assert catalog.list_tools().items == []
+    assert catalog.source_of("read_file") == "unknown"
 
 
 def test_server_of_only_for_mcp_tools():

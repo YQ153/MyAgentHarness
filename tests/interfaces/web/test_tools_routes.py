@@ -33,6 +33,8 @@ def _catalog() -> ToolCatalog:
                 ToolDescriptor(name="translate", source=ToolSource.CUSTOM, description="翻译"),
             ),
             custom_modules=("demo_tools",),
+            # 替身与真实装配结果同形：内置工具名随 bundle 一起交出（见 Q9）
+            builtin_names=BUILTIN_TOOL_NAMES,
             mcp_statuses=(
                 MCPServerStatus(name="srv", transport="stdio", ok=True, tool_count=1),
                 MCPServerStatus(

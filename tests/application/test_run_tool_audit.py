@@ -15,7 +15,7 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 
 from agent.mcp import MCPServerStatus
 from agent.tooling import ToolBundle
-from agent.tools import ToolDescriptor, ToolSource
+from agent.tools import BUILTIN_TOOL_NAMES, ToolDescriptor, ToolSource
 from application.principal import Principal
 from application.run_service import RunService
 from application.tool_catalog import ToolCatalog
@@ -84,6 +84,8 @@ def _catalog(*, with_builtin_flag: bool = False) -> ToolCatalog:
                 ),
             ),
             mcp_statuses=(MCPServerStatus(name="srv", transport="stdio", ok=True, tool_count=1),),
+            # 替身与真实装配结果同形：内置工具名随 bundle 一起交出（见 Q9）
+            builtin_names=BUILTIN_TOOL_NAMES,
         )
     )
 
