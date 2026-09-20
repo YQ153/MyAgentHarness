@@ -21,6 +21,8 @@ from typing import Any
 
 import aiosqlite
 
+from thread_utils import normalize_thread_id
+
 logger = logging.getLogger(__name__)
 
 MAX_MODEL_CHARS = 128
@@ -323,14 +325,19 @@ class UsageStore:
 
     @staticmethod
     def _validate_thread_id(thread_id: str) -> str:
-        if not isinstance(thread_id, str):
-            raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
-        normalized = thread_id.strip()
-        if not normalized:
-            raise ValueError("thread_id 不能为空")
-        if len(normalized) > 128:
-            raise ValueError("thread_id 过长")
-        return normalized
+        """校验会话 ID 并返回规范化结果。
+
+        WHY 委托 ``thread_utils`` 而不是本模块自己判断：这条规则的权威实现在
+        中立模块里（路由层、服务层、其它 store 都用它），长度上限也在那里。
+        本模块曾把「非字符串 / 空 / 超过 128」重写了一遍——上限写成字面量，
+        报错文案也不带具体长度；改上限时它会静默不跟，失效方式是
+        「接口放行、用量入库被拒」这类只在特定长度下才暴露的错误。
+        本方法保留下来只作为调用点的稳定名字，删掉它会牵动 ``record`` 的调用行。
+
+        Raises:
+            ValueError: 非字符串、为空或超出长度上限。
+        """
+        return normalize_thread_id(thread_id)
 
     @staticmethod
     def _validate_model(model: str) -> str:

@@ -27,6 +27,7 @@ import httpx
 from langchain_core.tools import BaseTool, tool
 
 from agent.tools import ToolRegistry, ToolSource
+from text_utils import truncate_with_notice
 from web_safety import OutboundAddressRejected, validate_outbound_url
 
 if TYPE_CHECKING:
@@ -100,10 +101,14 @@ WHY 单独起一个别名：``_SEARCH_PROVIDERS`` 表与适配器函数是成对
 
 
 def _truncate(text: str, limit: int) -> str:
-    """按字符上限截断并显式标注。"""
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n\n... Output truncated at {limit} chars."
+    """按字符上限截断并显式标注。
+
+    WHY 把判断交给 ``text_utils.truncate_with_notice``：截断与否、切到哪里是
+    与标题截断、检索片段截断共用的同一个决策，分开写迟早出现「这里标了、那里没标」。
+    留在本模块的只有措辞——这段文本会被模型当输入读，所以要英文，并带上具体字符数，
+    让模型知道自己看到的是残缺内容而不是全部。
+    """
+    return truncate_with_notice(text, limit, f"\n\n... Output truncated at {limit} chars.")
 
 
 def _render_results(query: str, results: list[SearchResult]) -> str:

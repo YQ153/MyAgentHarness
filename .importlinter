@@ -103,3 +103,23 @@ source_modules =
 forbidden_modules =
     bootstrap
 allow_indirect_imports = True
+
+; ===========================================================================
+; Root-level modules are NOT covered here, and cannot be. import-linter only
+; accepts packages as analysis roots: root_packages entries must be directories
+; with __init__.py, so listing a single-file module fails with
+;   "'config' is a module, not a package."
+; and referencing one from a contract (after putting it back) fails with
+;   "Module 'config' does not exist."
+; Both verified against import-linter 2.15 / grimp 3.17.
+;
+; The affected modules are config / text_utils / thread_utils / web_safety /
+; knowledge_runtime / knowledge_tools / web_tools / main. Their boundaries are
+; enforced instead by tests/test_root_module_contract.py, which runs in the same
+; CI job as `uv run lint-imports`.
+;
+; WHY this note lives here: the obvious "fix" for a missing rule is to append
+; the module to root_packages, which only yields a confusing tool error. This
+; note exists so that dead end is not re-explored. The role of each root-level
+; module (neutral leaf / service handle / tool plugin / entry point) and the
+; reasoning behind it are recorded in docs/architecture/.

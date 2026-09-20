@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from agent.tools import ToolRegistry, ToolSource
 from knowledge_runtime import ensure_service
+from text_utils import truncate_with_notice
 
 if TYPE_CHECKING:
     from config import AppConfig
@@ -53,10 +54,14 @@ class KnowledgeToolError(RuntimeError):
 
 
 def _truncate(text: str) -> str:
-    """按字符上限截断片段，并显式标注截断。"""
-    if len(text) <= _MAX_SNIPPET_CHARS:
-        return text
-    return text[:_MAX_SNIPPET_CHARS] + "…（片段已截断）"
+    """按字符上限截断片段，并显式标注截断。
+
+    WHY 把判断交给 ``text_utils.truncate_with_notice``：截断与否、切到哪里是
+    与网页正文截断共用的同一个决策，分开写迟早出现「这里标了、那里没标」。
+    留在本模块的只有措辞——这段文本直接进对话，读者是人，所以用中文短句，
+    不用英文与字符数。
+    """
+    return truncate_with_notice(text, _MAX_SNIPPET_CHARS, "…（片段已截断）")
 
 
 def _build_search_tool(config: AppConfig) -> object:
