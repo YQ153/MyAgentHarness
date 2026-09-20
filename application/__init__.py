@@ -1,10 +1,29 @@
-"""应用层：把 LangGraph 的内部事件翻译成稳定的对外协议。
+"""应用层：把内核与基础设施的能力编排成稳定的对外业务契约。
 
-对外提供三件事，彼此职责互不重叠：
+WHY 分成「职责域」与「对外契约」两段写：本层有 30 个模块，而 ``__all__``
+只导出 12 个符号。旧写法（"对外提供三件事"）会让新读者以为这一层只有三个
+东西，从而漏掉二十余个模块——按它理解代码，会找不到附件、知识库、记忆、
+技能、用量、工作区、健康、分叉、治理与运行登记。
 
-- :class:`ThreadService` 会话的元数据生命周期（清单、历史、删除）
-- :class:`RunService`   一次运行的推进与事件产出
-- :class:`ModelCatalog` 可切换模型的只读目录
+职责域（层内模块，不被 ``__all__`` 导出）：
+
+- 会话与运行编排：``thread_service`` / ``run_service`` / ``run_branch`` /
+  ``run_governance`` / ``run_registry``
+- 领域能力服务：``attachment_service`` / ``knowledge_service`` /
+  ``memory_service`` / ``skill_service`` / ``usage_service`` /
+  ``workspace_service`` / ``model_catalog`` / ``tool_catalog`` / ``health``
+- 对外契约：``dto`` / ``errors`` / ``events`` / ``ports`` / ``principal`` /
+  ``audit_recorder`` / ``ownership``
+- 协议翻译与支撑：``event_translator`` / ``interrupt_codec`` / ``usage`` /
+  ``runnable`` / ``thread_export`` / ``message_utils`` / ``audit_context`` /
+  ``api_key_auth``
+
+对外导出的稳定契约只有 ``__all__`` 中的 12 个符号，其余请按具体模块路径导入。
+``__init__`` 保持最小导出面是有意的：扩大它会把这二十余个模块一并变成
+"公共 API 面"，此后任何调整都成了对接口层的破坏性变更。
+
+分组口径与 ``tests/application/test_layer_purity_contract.py`` 的层内纯度契约
+一致——两处必须同时改，否则契约会先失败（这是有意的）。
 """
 
 from application.dto import (
