@@ -23,18 +23,20 @@ WHY 作用范围不含 `scripts/` 与 `tests/`：前者是一次性探针，后�
 
 from __future__ import annotations
 
-import ast
-import logging
 from pathlib import Path
 
 import pytest
 
-logger = logging.getLogger(__name__)
-
-ROOT = Path(__file__).resolve().parents[1]
-
-#: 分层的六个包，与 `.importlinter` 的 `root_packages` 同源。
-_LAYER_PACKAGES = frozenset({"agent", "application", "bootstrap", "interfaces", "llm", "runtime"})
+# WHY 解析实现放在 ``tests/_ast_imports.py``：应用层的两个契约测试
+# （运行时端口、层内纯度）需要同一段"读源码 → 解析 import → 失败即显式报错"
+# 的基础设施。判据各写各的，基础设施只有一份——同一段解析逻辑写两遍，
+# 其中一份的修复不会到达另一份。
+from tests._ast_imports import (
+    LAYER_PACKAGES as _LAYER_PACKAGES,
+    ROOT,
+    repo_top_level_imports,
+    top_level_name,
+)
 
 #: 每个根级模块允许依赖的仓库内顶层模块。
 #:
@@ -103,6 +105,10 @@ def _repo_imports(module_path: Path) -> frozenset[str]:
     只统计仓库内的名字：标准库不属于本契约的范围（由解释器保证），
     三方依赖由 `uv.lock` 保证。
 
+    WHY 是薄封装（实现在 ``tests/_ast_imports.py``）：四个用例都按
+    ``_repo_imports(path)`` 调用，保留这个名字可以让解析实现的迁移不牵动用例；
+    而"读源码 → 解析 → 失败即显式报错"这段纪律与应用的层契约共用同一份实现。
+
     Args:
         module_path: 待解析的模块文件。
 
@@ -114,55 +120,7 @@ def _repo_imports(module_path: Path) -> frozenset[str]:
         AssertionError: 文件读取失败或源码无法解析。两者都会让收集结果为空，
             从而让所有断言「通过」——所以都必须显式失败，不能吞掉。
     """
-    if not module_path.is_file():
-        raise ValueError(f"模块文件不存在：{module_path}")
-
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.exception("读取根级模块失败：%s", module_path)
-        raise AssertionError(f"无法读取 {module_path.name}：{exc}") from exc
-
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError as exc:
-        logger.exception("解析根级模块失败：%s", module_path)
-        raise AssertionError(
-            f"{module_path.name} 无法解析（第 {exc.lineno} 行）：{exc.msg}"
-        ) from exc
-
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            # 相对导入（level > 0）在根级模块里是非法的：没有父包可回退。
-            # 它的 node.module 可能为 None，会被下面的交集直接过滤掉，
-            # 因而由 test_every_root_module_declares_a_role 之外的用例覆盖不到——
-            # 这类写法会让模块在导入时直接抛 ImportError，不属本契约的职责。
-            names.add(node.module.split(".")[0])
-    return frozenset(names & _KNOWN_TOP_LEVEL)
-
-
-def _top_level_name(module_path: Path) -> str:
-    """返回模块所属的顶层名字（包名或根级模块名）。
-
-    Args:
-        module_path: 仓库内的模块文件。
-
-    Returns:
-        顶层名字。``runtime/thread_store.py`` 得到 ``runtime``；
-        根目录的 ``web_tools.py`` 得到 ``web_tools``。
-
-    Raises:
-        ValueError: 路径不在仓库内——相对路径算不出来时无从判定归属，
-            静默返回空串会让调用方把它当成「不认识的名字」放过去。
-    """
-    try:
-        relative = module_path.resolve().relative_to(ROOT)
-    except ValueError as exc:
-        raise ValueError(f"{module_path} 不在仓库 {ROOT} 内") from exc
-    return relative.parts[0] if len(relative.parts) > 1 else relative.stem
+    return repo_top_level_imports(module_path, _KNOWN_TOP_LEVEL)
 
 
 def _scannable_paths() -> list[Path]:
@@ -249,9 +207,9 @@ def test_service_handle_is_reached_only_by_its_legitimate_callers() -> None:
     「服务只经由应用层被访问」这个前提上的。
     """
     offenders = [
-        f"{path.relative_to(ROOT).as_posix()}（属于 {_top_level_name(path)}）"
+        f"{path.relative_to(ROOT).as_posix()}（属于 {top_level_name(path)}）"
         for path in _scannable_paths()
-        if _top_level_name(path) not in _HANDLE_CALLERS
+        if top_level_name(path) not in _HANDLE_CALLERS
         and _HANDLE_MODULE in _repo_imports(path)
     ]
 
