@@ -3,8 +3,8 @@
 一个可直接运行的**通用 Agent 骨架**：以 [deepagents](https://github.com/langchain-ai/deepagents) 为内核，
 自带文件读写、待办规划、子任务委派与人工审批（HITL）能力，同时提供 **命令行（CLI）** 与 **Web 服务** 两种运行形态。
 
-两种形态共享同一套内核（`agent/` 装配层 + `application/` 应用服务），差异只在适配器，
-因此同一份会话状态、同一套审批语义在两种入口下完全一致。
+两种形态共享同一套内核（`agent/` + `application/`），差异只在适配器，
+装配集中在唯一的组装点 `bootstrap/`；因此同一份会话状态、同一套审批语义在两种入口下完全一致。
 
 ---
 
@@ -539,19 +539,80 @@ Agent 通过 `write_file` 写进 `/memories/` 的内容会**跨会话保留**，
 
 ```
 MyAgentHarness/
-├── main.py             # 入口：分发 cli / web 两个子命令
-├── config.py           # 统一配置中心（唯一的环境变量解析处）
-├── agent/              # 装配层：模型后端、工具、护栏、图构建
-├── application/        # 应用服务：会话编排、事件模型、中断编解码
-├── interfaces/         # 适配器
-│   ├── cli.py          # 命令行交互
-│   └── web/            # FastAPI 服务 + 前端页面
-├── llm/                # 模型注册表与构造
-├── runtime/            # 检查点持久化、会话元数据表与长期存储
-└── workspace/          # Agent 的活动边界（文件读写、记忆、技能）
+├── main.py                   # 进程入口：解析子命令 → 装载配置 → 日志 → 分发
+├── config.py                 # 配置中心（唯一的环境变量解析处）
+├── thread_utils.py           # 会话 ID 校验规则：接口 / 应用 / 存储三层共用
+├── text_utils.py             # 文本规整：应用层与存储层共用
+├── web_safety.py             # 出站地址 SSRF 校验：供联网工具复用
+├── web_tools.py              # 内置联网工具（默认不加载）
+├── knowledge_runtime.py      # 知识库的进程级服务句柄
+├── knowledge_tools.py        # 知识库工具（默认不加载）
+│
+├── Dockerfile                # 应用镜像：多阶段构建，以非 root 用户运行
+├── docker-compose.yml        # 编排：默认 apikey 认证，只绑定回环地址
+├── docker/                   # 沙箱执行镜像（受众是"跑命令"，与应用镜像分开）
+├── pyproject.toml            # 依赖声明（requires-python >= 3.14）
+├── uv.lock                   # 精确锁定的依赖版本
+├── .env.example              # 配置模板
+├── README.md                 # 本文档
+├── .importlinter             # 分层依赖契约（6 条；uv run lint-imports）
+├── .github/workflows/ci.yml  # 双平台 CI：pytest + lint-imports
+│
+├── bootstrap/                # 组装层：唯一的装配点
+│   ├── context.py            # ★ AppContext：装配完成的依赖集合（不可变）
+│   ├── core.py               # ★ build_app_context：CLI 与 Web 共用
+│   └── web.py                # Web 专有资源（限流器、审计清理、运行治理）
+├── agent/                    # 内核层：模型后端、工具、护栏、图构建
+├── application/              # 应用层：会话编排、运行推进、事件模型、中断编解码
+├── interfaces/               # 接口层：两种适配器
+│   ├── cli.py                # 命令行交互
+│   └── web/                  # FastAPI 服务（REST + SSE）与前端页面
+│       └── auth/             # 认证与鉴权子包：会话 / OIDC / API Key / 审计
+├── llm/                      # 模型层：模型注册表与嵌入后端
+├── runtime/                  # 运行时层：检查点、各类 store、文件与沙箱
+│   └── sandbox/              # 三档沙箱：进程 / WSL / 容器
+├── scripts/                  # 运维与回归脚本（probe_* 探针、smoke_* 冒烟）
+├── tests/                    # 测试（按被测层镜像组织）
+├── docs/                     # 文档（含 docs/overview/architecture.html 结构总览）
+└── workspace/                # Agent 的活动边界（文件读写、记忆、技能）
 ```
 
-分层约定：`interfaces` → `application` → `agent` / `runtime`，上层依赖下层，下层不反向依赖。
+### 分层约定
+
+依赖方向只有两条，`interfaces` 是唯一的上层：
+
+- `interfaces` → `application` → `agent` / `runtime`
+- `interfaces` → `bootstrap`（适配器调用组装点，拿已装配好的对象）
+
+**`interfaces` 不得直接依赖 `runtime`**：基础设施由 `bootstrap` 装配后经 `AppContext`
+注入。这条是 2026-09 分层重构的成果——此前它有 13 处越界，且更换存储实现要改接口层。
+
+根级模块都**不属于任何层**，放在根级各有理由：
+
+| 模块 | 为什么在根级 |
+| --- | --- |
+| `config.py` | 全应用的最底层，谁都可以依赖它 |
+| `thread_utils.py` / `text_utils.py` | 规则被 `application` 与 `runtime` **同时**使用，放进任一层都会立刻构成循环 |
+| `web_safety.py` | 被联网工具（一个根级模块）复用，而它本身只依赖标准库 |
+| `web_tools.py` / `knowledge_tools.py` | 自定义工具插件，运行期按 `CUSTOM_TOOL_MODULES` 动态加载；只能依赖注册 SPI 与自己的服务句柄 |
+| `knowledge_runtime.py` | 知识库需要整进程唯一的一份服务句柄，而工具扩展点没有注入依赖的通道 |
+| `main.py` | 只做分发，装配必须经 `interfaces` → `bootstrap` |
+
+### 规则是可执行的，不是文档里的共识
+
+| 约束 | 载体 | 怎么跑 |
+| --- | --- | --- |
+| 六个包之间的依赖方向（6 条契约） | `.importlinter` | `uv run lint-imports` |
+| 根级模块的依赖边界与角色 | `tests/test_root_module_contract.py` | `uv run pytest` |
+
+> 为什么分成两处：import-linter 只接受「包」作为分析根（`root_packages` 必须是含
+> `__init__.py` 的目录），单文件模块既不能列为分析根、也不能被契约引用（实测报
+> `'config' is a module, not a package` 与 `Module 'config' does not exist`）。
+> 根级模块因此由契约测试承担，两者跑在 CI 的同一个 job 里。
+
+**改动依赖关系前先跑这两条命令**，而不是先猜。越界会在提交时立刻失败，
+而不是在某次偶发的导入顺序下以循环导入的形式出现。
+方案的来龙去脉见 `docs/architecture/架构遗留问题治理方案.md`。
 
 ---
 

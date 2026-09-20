@@ -306,23 +306,47 @@
 <!-- ============================================================ -->
 <h2 id="layout">3. 目录与关键文件说明</h2>
 
+<p><strong>快照说明（2026-09-20 重生成）</strong>：本树按仓库实际文件重新生成。
+此前的版本缺 <code>bootstrap/</code> 组装层与全部根级模块，并残留了已删除的
+<code>tool/</code> 目录——照它找文件会找不到，照它理解装配会漏掉唯一的组装点。
+完整规则以 <code>.importlinter</code>（6 条包层契约）与
+<code>tests/test_root_module_contract.py</code>（根级模块角色表）为准。</p>
+
 <pre><code>MyAgentHarness/
 ├── main.py                 进程入口：解析子命令 → 装载配置 → 日志 → 分发
 ├── config.py               配置中心（唯一的环境变量解析点）
-├── text_utils.py           文本规整：空白折叠与截断（应用层与存储层共享）
 ├── thread_utils.py         会话 ID 校验：跨层唯一实现（接口/应用/存储共享）
+├── text_utils.py           文本规整：空白折叠与截断（应用层与存储层共享）
+├── web_safety.py           出站地址 SSRF 校验（供联网工具复用）
+├── web_tools.py            内置联网工具（默认不加载，需写进 CUSTOM_TOOL_MODULES）
+├── knowledge_runtime.py    知识库的进程级服务句柄（装配与拆除归 bootstrap）
+├── knowledge_tools.py      知识库工具（默认不加载）
 ├── pyproject.toml          依赖声明（requires-python >= 3.14）
+├── uv.lock                 精确锁定的依赖版本
+├── .importlinter           分层依赖契约（6 条；uv run lint-imports）
 ├── .env.example            配置模板
 ├── README.md               面向使用者的快速上手
-├── docs/
-│   └── architecture.html   本文档
+├── Dockerfile              应用镜像：多阶段构建，以非 root 用户运行
+├── docker-compose.yml      编排：默认 apikey 认证，只绑定回环地址
+├── .github/workflows/ci.yml  双平台 CI：pytest + lint-imports
+├── docs/                   文档（architecture / auth / overview / planning）
+├── bootstrap/              ★ 组装层：全应用唯一的装配点
+│   ├── context.py          ★ AppContext：装配完成的依赖集合（不可变）
+│   ├── core.py             ★ build_app_context：CLI 与 Web 共用
+│   └── web.py              Web 专有资源（限流器、审计清理、运行治理）
 ├── agent/                  内核层：装配、后端、护栏、Profile
 │   ├── graph.py            ★ 全应用唯一的 create_deep_agent 调用点
 │   ├── backends.py         ★ CompositeBackend 装配（工作区 + /memories/）
 │   ├── guardrails.py       ★ 文件权限规则与 HITL 中断配置
 │   ├── profiles.py         HarnessProfile 注册（提示词、子 Agent 开关）
+│   ├── tools.py            工具注册器与自定义工具模块加载（ToolRegistry / ToolSource）
+│   ├── tooling.py          工具装配 bundle（内置 + 自定义 + MCP）
+│   ├── mcp.py              MCP 服务器接入与逐台加载状态
+│   ├── run_context.py      图运行时上下文与记忆命名空间
+│   ├── sandbox_backend.py  文件走工作区、命令走 SandboxRunner 的 Backend
+│   ├── path_safety.py      Windows 扩展路径前缀容错
 │   └── __init__.py         导出 build_agent / AgentFactory
-├── application/            应用层：会话编排与对外协议
+├── application/            应用层：会话编排与对外协议（29 个模块）
 │   ├── thread_service.py   ★ 会话服务：new_thread_id / list_threads / history / rename_thread / set_archived / delete_thread
 │   ├── run_service.py      ★ 运行服务门面：stream / resume / stop / edit / regenerate / enforce_governance
 │   ├── run_registry.py     ★ 运行登记表：槽位、累计计数与审批挂起状态的唯一所有者
@@ -337,6 +361,18 @@
 │   ├── errors.py           可预期异常（ThreadBusyError 等）
 │   ├── runnable.py         LangGraph 运行配置构造
 │   ├── interrupt_codec.py  ★ 中断解析与恢复指令构造
+│   ├── principal.py        认证主体与权限模型（角色 → 权限映射）
+│   ├── ownership.py        会话归属判定
+│   ├── ports.py            基础设施端口协议（APIKeyRepository / AuditSink / RateLimiterPort）
+│   ├── audit_context.py    审计用 contextvars 请求上下文（trace_id 的唯一来源）
+│   ├── health.py           健康与指标服务
+│   ├── attachment_service.py  附件上传 / 列举 / 删除与多模态消息构造
+│   ├── knowledge_service.py   知识库切分 / 索引 / 检索
+│   ├── memory_service.py      长期记忆管理（按主体隔离）
+│   ├── skill_service.py       技能清单 / 启停 / 物化视图重建
+│   ├── usage.py / usage_service.py  Token 用量提取与统计
+│   ├── thread_export.py       会话导出 Markdown
+│   ├── tool_catalog.py        工具目录服务
 │   └── __init__.py         导出三个服务与事件模型
 ├── interfaces/             接口层：两种适配器
 │   ├── cli.py              ★ 终端交互：事件渲染 + stdin 审批
@@ -344,19 +380,38 @@
 │       ├── app.py          ★ FastAPI 工厂与 lifespan 资源管理
 │       ├── routes.py       ★ REST 与 SSE 端点
 │       ├── schemas.py      请求/响应 Pydantic 模型
+│       ├── sse.py          应用事件 → SSE 帧
+│       ├── deps.py         require_state：依赖未就绪时返回 503
+│       ├── request_context.py  审计上下文中间件
+│       ├── health.py       运维端点 /health /ready /metrics
+│       ├── attachment_routes.py / knowledge_routes.py / skill_routes.py / workspace_routes.py
+│       ├── auth/           认证子包：deps（身份提取与权限闸门）/ identity / apikey / audit / audit_api / utils / router
 │       └── static/         前端静态资源（无构建步骤：index.html / app.js / styles.css / markdown.js / auth_credential.js）
 ├── llm/                    模型层
 │   ├── registry.py         ★ 模型注册表与构造
+│   ├── embeddings.py       嵌入后端协议
+│   ├── embed_process.py    子进程嵌入客户端
 │   └── __init__.py         对外仅暴露 ModelRegistry / ModelSpec
 ├── runtime/                运行时层
 │   ├── checkpointer.py     ★ 异步 SQLite 检查点上下文
 │   ├── thread_store.py     ★ 会话元数据表（标题 / 时间 / 轮次）
-│   ├── store.py            进程内长期记忆 Store
+│   ├── store.py            ★ 长期记忆 Store（AsyncSqliteStore，与检查点同库）
+│   ├── audit_store.py / audit_archive.py / audit_retention.py   审计：存储、JSONL 归档、保留期清理
+│   ├── api_key_store.py / usage_store.py / skill_store.py        API Key、用量、技能状态
+│   ├── skill_view.py / skills.py                                技能物化视图与技能包解析
+│   ├── knowledge_store.py  知识库存储（FTS5 + vec0）
+│   ├── attachments.py / workspace_files.py / tool_outputs.py    附件、工作区文件、工具输出留存
+│   ├── rate_limiter.py     内存令牌桶（认证端点限流）
+│   ├── execution_registry.py / host_shell.py / interval_worker.py  在跑命令登记、宿主 shell、后台周期任务
+│   ├── sandbox/            ★ 三档沙箱：protocol / factory / models / errors + process_runner / wsl_runner / docker_runner / _winjob
 │   └── __init__.py
-├── tool/                   历史遗留空目录（早期文件工具原型已移除）
+├── scripts/                运维与回归脚本（probe_* 探针 / smoke_* 冒烟 / 一次性维护）
+├── tests/                  测试（按被测层镜像组织；含根级模块边界契约）
+├── docker/                 沙箱执行镜像的 Dockerfile（与应用自身的根 Dockerfile 分开）
 └── workspace/              Agent 的活动边界
     ├── AGENTS.md           长期记忆（被 config.memory_paths 加载）
-    └── skills/             技能库目录（可为空，缺失时降级跳过）
+    ├── skills/             用户技能库（可为空，缺失时降级跳过）
+    └── skills-builtin/     内置技能（随仓库交付）
 </code></pre>
 
 <h3>关键文件职责与入口函数</h3>
@@ -1561,38 +1616,65 @@ StreamingResponse(text/event-stream)
     <code>GET/DELETE /api/memories</code> 只作用于调用者自己的那一份，管理员也无法
     查看或清理他人记忆——跨主体读取需要独立的授权与审计设计，本期未做。</li>
   <li><strong>会话搜索只覆盖标题</strong>：正文存在检查点的 msgpack BLOB 里，检索需要
-    逐条反序列化；要让正文可搜必须另建索引（会话导出 / 导入同样未做）。</li>
+    逐条反序列化；要让正文可搜必须另建索引。（<strong>2026-09-20 补注</strong>：括号里原写
+    「会话导出 / 导入同样未做」，该半句已随 T19 交付而失效——导出 Markdown / JSON 与导入
+    均已实现。正文检索本身仍未做，此条继续有效；<code>scripts/probe_fts5.py</code>
+    留有当时的可行性验证。）</li>
   <li><strong>归档与删除都不中断正在运行的任务</strong>：运行持有自己的图与检查点句柄，
     删掉元数据后它仍会跑到结束并把事件推给发起方——需要「删除即停止」的场景得由
     调用方先调 <code>stop</code>。</li>
   <li><strong>检查点单机</strong>：SQLite 不适合多副本部署，横向扩展需替换为共享存储（如 PostgreSQL 检查点）。</li>
   <li><strong>图缓存键不含 checkpointer</strong>：同一进程内切换 checkpointer 的场景需先改缓存键策略。</li>
-  <li><strong>无鉴权与会话隔离</strong>：Web 端点没有身份认证，任何能访问端口的人都能创建与操作会话。
-    当前实现定位为本地开发服务，<strong>请勿直接暴露到公网</strong>。</li>
+  <li><del><strong>无鉴权与会话隔离</strong>：Web 端点没有身份认证，任何能访问端口的人都能创建与操作会话。</del>
+    <strong>已完成（T1，2026-09-20 补注）</strong>：现有 <code>disabled</code> / <code>apikey</code> /
+    <code>oidc</code> 三种模式，认证端点另有 IP 级限流。<em>仍然要注意</em>：
+    <code>AUTH_MODE=disabled</code> 时服务没有任何身份，此时把 <code>HOST</code> 改绑非回环地址
+    会触发启动告警（告警而非拒绝启动），那种组合依然只适合本机。</li>
   <li><strong><code>tool/</code> 为空目录</strong>：早期文件工具原型已移除，功能由 deepagents 的内置工具承担。</li>
-  <li><strong>会话清单没有用户维度</strong>：接口返回库中的全部会话，不与调用者身份绑定。
-    这与「无鉴权」是同一个问题的两面，服务端一旦多用户化必须同步处理。</li>
+  <li><del><strong>会话清单没有用户维度</strong>：接口返回库中的全部会话，不与调用者身份绑定。
+    这与「无鉴权」是同一个问题的两面，服务端一旦多用户化必须同步处理。</del>
+    <strong>已完成（T1）</strong>：清单按 <code>thread_meta.owner_id</code> 收敛，跨用户读写返回 403；
+    管理员是显式的运维兜底路径（不是绕过归属的隐式后门）。</li>
   <li><strong>存量空会话需手工清理</strong>：新逻辑不再产生空会话，但升级前若已在旧版本下
     打开或刷新过页面，库里会留下 <code>title='' AND turn_count=0</code> 的行，需一次性删除。</li>
 </ul>
 
 <h3>18.3 建议的后续迭代方向</h3>
 <ol>
-  <li>为 Web 增加鉴权，并让会话清单按用户维度隔离。</li>
-  <li>实现 <code>sandbox</code> Backend（基于 <code>BaseSandbox</code> 或外部沙盒），
-    在保持审批语义的前提下开放命令执行。</li>
+  <li><del>为 Web 增加鉴权，并让会话清单按用户维度隔离。</del>
+    <strong>已完成（T1）</strong>：三模式鉴权 + <code>owner_id</code> 归属 + 角色权限。</li>
+  <li><del>实现 <code>sandbox</code> Backend（基于 <code>BaseSandbox</code> 或外部沙盒），
+    在保持审批语义的前提下开放命令执行。</del>
+    <strong>已完成（T20 / T25 / T24）</strong>：三档沙箱齐备——Tier 0 进程沙箱、
+    Tier 1 WSL 发行版、Tier 2 容器（挂载仅限工作区、网络默认切断、中止无残留）；
+    执行档位 <code>local</code> / <code>sandbox</code> / <code>disabled</code> 全部可用，
+    且<strong>三个沙箱档位下审批都默认开启</strong>（隔离回答「碰到了会怎样」，
+    审批回答「该不该跑」，两者不可互相替代）。</li>
   <li><del>把 <code>InMemoryStore</code> 替换为持久化实现，使 <code>/memories/</code> 跨进程存活。</del>
     已完成：换成 <code>AsyncSqliteStore</code>（与检查点同库），命名空间按主体收敛，
     并补上记忆面板与 <code>memory_delete</code> 审计。</li>
-  <li>解除 <code>llm.registry</code> → <code>agent.profiles</code> 的反向依赖，消除双向引用。</li>
+  <li><del>解除 <code>llm.registry</code> → <code>agent.profiles</code> 的反向依赖，消除双向引用。</del>
+    <strong>已完成</strong>：分层依赖契约 <code>llm-no-agent</code> 由 CI 每次运行校验
+    （当前 6 条契约全部 KEPT）。</li>
   <li><del>把 <code>SKILL_DIRS</code> 补进 <code>.env.example</code>，并考虑使用路径分隔符解析多目录。</del>
     已完成：<code>SKILL_DIRS</code> 按 <code>os.pathsep</code> 解析多目录并已写入
     <code>.env.example</code>；<code>SANDBOX_ENV_ALLOWLIST</code> 的逗号写法同步生效。</li>
 </ol>
 
 <footer>
-  MyAgentHarness 技术文档 · 基于仓库当前代码生成 · 所有位置引用格式为 <code>文件:行号</code>，
-  与源文件一致；代码变更后请同步更新对应章节。
+  MyAgentHarness 技术文档 · 基于仓库当前代码生成 · 位置引用格式为 <code>文件:行号</code>；
+  代码变更后请同步更新对应章节。
+  <br><strong>状态（2026-09-20 补注）</strong>：主体章节（分层、装配、数据流、接口）仍与代码一致。
+  第三章的目录树已于 2026-09-20 按实际文件重生成（补上 <code>bootstrap/</code> 与全部根级模块、
+  去掉已删除的 <code>tool/</code>），<strong>但同一章「关键文件职责」表的行号尚未复核</strong>——
+  符号名（函数 / 类名）仍然有效，行号已普遍滞后，实测三例：<code>main()</code> 标
+  <code>main.py:79</code> 实为 <code>:137</code>；<code>open_thread_store()</code> 标
+  <code>:360</code> 实为 <code>:1046</code>；<code>ThreadMetaStore</code> 标 <code>:76</code>
+  实为 <code>:321</code>。<strong>请按符号名检索，不要按行号跳转。</strong>
+  第十八章的「已知限制」与「后续迭代方向」按<strong>逐条补注</strong>维护——已交付的条目以
+  <del>删除线</del> 加「已完成」标注，<strong>未标注的仍然有效</strong>。
+  清单式的最新状态见 <code>docs/planning/功能完整度分析与缺失功能清单.md</code>，
+  治理中的架构问题见 <code>docs/architecture/架构遗留问题治理方案.md</code>。
 </footer>
 
 </main>
