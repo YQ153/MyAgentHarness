@@ -10,10 +10,11 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from deepagents import create_deep_agent
 from langchain.agents.middleware import (
+    AgentMiddleware,
     ContextEditingMiddleware,
     ModelCallLimitMiddleware,
     TodoListMiddleware,
@@ -35,6 +36,24 @@ if TYPE_CHECKING:
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+AgentGraph = CompiledStateGraph[Any, AgentRunContext, Any, Any]
+"""本应用装配出的图类型。
+
+WHY 不写成裸 ``CompiledStateGraph``：langgraph 的 ``ContextT`` 带默认值 ``None``，
+而 ``create_deep_agent(context_schema=AgentRunContext)`` 返回的图第 2 位实参是
+``AgentRunContext``，两者不等——注解写成裸泛型会在 ``return`` 处报
+invalid-return-type，把真正需要被校验的调用点错误盖住。
+
+WHY 状态位（第 1/3/4 位）写 ``Any``：langchain 的 ``AgentState`` /
+``InputAgentState`` / ``OutputAgentState`` 无法被验证满足 langgraph 的
+``StateLike`` 上界（deepagents 自身的返回注解就得挂 ``ty: ignore``），
+写实只会把同一处抑制注释搬进本文件。
+
+WHY 必须把 ``ContextT`` 写实而不是整个退回 ``Any``：``astream`` 的
+``context`` 参数签名是 ``ContextT | None``，图一旦退化为裸泛型，主体传错
+（记忆落进匿名池）在类型层面就检不出来了。
+"""
 
 _FALLBACK_SYSTEM_PROMPT = """你是通用任务助手，工作目录是受限虚拟文件系统。
 
@@ -65,7 +84,7 @@ def build_agent(
     store: BaseStore,
     model_name: str | None = None,
     tools: Sequence[BaseTool] | None = None,
-) -> CompiledStateGraph:
+) -> AgentGraph:
     """装配一个完整的 deep agent。
 
     Args:
@@ -99,14 +118,30 @@ def build_agent(
 
     # WHY 显式补充 TodoListMiddleware：deepagents 0.7.14 的默认中间件栈不含
     # 规划能力，通用长任务必须自己挂上，否则 Agent 容易在多步任务中迷失。
-    middleware = [
-        TodoListMiddleware(),
+    #
+    # WHY 每个中间件都手写类型参数 ``[Any, AgentRunContext]``（LangChain 里这三个
+    # 类的参数顺序是 ``(ResponseT, ContextT)``）：``AgentMiddleware`` 对 ``ContextT``
+    # 是**不变型**，省略类型参数时它取默认值 ``None``；而 ``create_deep_agent``
+    # 拿到 ``context_schema`` 后，形参已被钉成
+    # ``Sequence[AgentMiddleware[..., AgentRunContext]]``，不写就与形参冲突
+    # （ty 报 invalid-argument-type）。
+    #
+    # WHY 列表本身也要标注：``TodoListMiddleware`` / ``ModelCallLimitMiddleware``
+    # 的状态分别是 ``PlanningState`` / ``ModelCallLimitState`` 这两个泛型 TypedDict，
+    # 类型检查器判不出它们是 ``AgentState`` 的子类型，期望形参只能退到
+    # ``AgentState[Any]``，于是逐个元素都不可赋值。状态位写 ``Any`` 是如实声明
+    # 「本层不约束状态形状」——状态形状由图自己决定。
+    #
+    # WHY 不用 cast 或 ``list[Any]`` 抹平：那会连「中间件声明的上下文必须与图同源」
+    # 一起抹掉，而那条约束正是声明 ``context_schema`` 的意义。
+    middleware: list[AgentMiddleware[Any, AgentRunContext, Any]] = [
+        TodoListMiddleware[Any, AgentRunContext](),
         # WHY ContextEditingMiddleware：DeepSeek 无 prompt 缓存收益，控制
         # 上下文成本只能靠裁剪历史的工具调用记录。
-        ContextEditingMiddleware(),
+        ContextEditingMiddleware[Any, AgentRunContext](),
         # WHY 限制单次运行调用次数：通用 Agent 最大的成本风险是模型陷入
         # 「读—改—再读」循环，必须有硬上限兜底。
-        ModelCallLimitMiddleware(
+        ModelCallLimitMiddleware[Any, AgentRunContext](
             run_limit=config.max_model_calls_per_run,
             exit_behavior="end",
         ),
@@ -211,7 +246,7 @@ class AgentFactory:
         # WHY 元组化：工具集在装配完成后不应再被就地增删，否则同一进程里
         # 先后装配的两张图会拿到不同的能力集。
         self._tools: tuple[BaseTool, ...] = tuple(tools or ())
-        self._cache: dict[str, CompiledStateGraph] = {}
+        self._cache: dict[str, AgentGraph] = {}
         # WHY 用锁而非直接依赖 GIL：``get`` 可能被多个 worker 线程并发调用，
         # 重复装配会浪费一次完整的中间件栈构建，也可能突破 provider 侧限流。
         self._lock = threading.Lock()
@@ -221,7 +256,7 @@ class AgentFactory:
         """本工厂共享的长期记忆存储，供需要直接读写 ``/memories/`` 的场景使用。"""
         return self._store
 
-    def get(self, model_name: str | None = None) -> CompiledStateGraph:
+    def get(self, model_name: str | None = None) -> AgentGraph:
         """取一个已装配的图，按模型别名缓存。
 
         Args:
