@@ -8,20 +8,19 @@
 from __future__ import annotations
 
 import logging
-import secrets
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
 
+from application.api_key_auth import record_api_key_auth, validate_api_key
 from application.ports import APIKeyRepository, RateLimiterPort
 from application.principal import (
     ANONYMOUS_PRINCIPAL,
     Principal,
-    ROLE_PERMISSIONS,
 )
 from config import AppConfig
 from interfaces.web.auth.audit import log_auth_event
-from interfaces.web.auth.utils import bearer_token, client_ip
+from interfaces.web.auth.utils import bearer_token, client_ip, user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -77,70 +76,29 @@ async def get_principal(request: Request) -> Principal | None:
 async def _validate_api_key(request: Request, api_key: str) -> Principal | None:
     """校验 API Key 并返回对应主体。
 
+    WHY 校验本身不在这里：CLI 与 Web 此前各写一份，两份**都能登录**，差异只在审计与
+    主体字段上（功能测试发现不了）。共用实现见 ``application.api_key_auth``；
+    本函数只剩"从请求里取上下文、把结果记进审计"两件事。
+
     Returns:
         校验通过的主体；校验失败返回 ``None``。
     """
     store: APIKeyRepository | None = getattr(request.app.state, "api_key_store", None)
     config: AppConfig = request.app.state.config
 
-    # WHY 兜底 dev key：最小可用与单节点场景下保留环境变量快速入口，
-    # 生产环境应把 dev key 置空，强制走数据库 key store。
-    if config.auth_api_key_dev and secrets.compare_digest(api_key, config.auth_api_key_dev):
-        await log_auth_event(
-            request,
-            event_type="apikey_auth_success",
-            actor_id="apikey:dev",
-            action="validate",
-            outcome="success",
-            details={"source": "env_dev_key"},
-        )
-        return Principal(
-            user_id="apikey:dev",
-            display_name="dev",
-            role="admin",
-            scopes=frozenset(ROLE_PERMISSIONS["admin"]),
-            auth_method="apikey",
-        )
-
-    if store is None:
-        await log_auth_event(
-            request,
-            event_type="apikey_auth_failure",
-            actor_id="unknown",
-            action="validate",
-            outcome="failure",
-            details={"reason": "store_unavailable"},
-        )
-        return None
-
-    record = await store.validate(api_key)
-    if record is None:
-        await log_auth_event(
-            request,
-            event_type="apikey_auth_failure",
-            actor_id="unknown",
-            action="validate",
-            outcome="failure",
-            details={"reason": "invalid_or_revoked"},
-        )
-        return None
-
-    actor_id = f"apikey:{record['key_id']}"
-    await log_auth_event(
-        request,
-        event_type="apikey_auth_success",
-        actor_id=actor_id,
-        action="validate",
-        outcome="success",
-        details={"key_id": record["key_id"], "role": record["role"]},
+    result = await validate_api_key(
+        api_key, dev_key=config.auth_api_key_dev, store=store
     )
-    return Principal(
-        user_id=actor_id,
-        display_name=f"API Key {record.get('key_prefix', '')}...",
-        role=record["role"],
-        scopes=frozenset((record.get("scopes") or "").split()),
-        auth_method="apikey",
+    # WHY 审计写在这里而不是共用实现里：事件内容由共用实现给出，而 ip / user_agent
+    # 只有本层拿得到（需要 Request）。载荷逐字保持既有形态——不传 entry，见
+    # record_api_key_auth 的参数说明。
+    await record_api_key_auth(
+        getattr(request.app.state, "audit_store", None),
+        result,
+        ip=client_ip(request),
+        user_agent=user_agent(request),
     )
+    return result.principal
 
 
 def require_permission(permission: str):

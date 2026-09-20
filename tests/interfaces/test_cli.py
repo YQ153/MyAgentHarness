@@ -29,7 +29,7 @@ import pytest
 
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
-from application.principal import Principal
+from application.principal import ROLE_PERMISSIONS, Principal
 from config import AppConfig
 from interfaces import cli
 from interfaces.cli import (
@@ -164,8 +164,23 @@ class _StubApiKeyStore:
         return self._record
 
 
+class _StubAuditStore:
+    """``AuditSink`` 替身：记录每次写入的字段。
+
+    WHY 记录字段而不是只记调用次数：这条路径上真正要守的是"记了什么"
+    （事件类型 / actor / 失败原因 / 入口标记），只数次数的话，
+    把 event_type 写反也能过。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def log(self, **fields: Any) -> None:
+        self.calls.append(fields)
+
+
 class _StubContext:
-    """``build_app_context`` 的替身：只暴露主循环真正取用的四个对象。"""
+    """``build_app_context`` 的替身：只暴露主循环真正取用的几个对象。"""
 
     def __init__(
         self,
@@ -173,11 +188,16 @@ class _StubContext:
         runs: Any,
         catalog: Any,
         api_key_store: Any = None,
+        audit_store: Any = None,
     ) -> None:
         self.threads = threads
         self.runs = runs
         self.catalog = catalog
         self.api_key_store = api_key_store
+        # WHY 必须有这一项：CLI 的认证审计与 Web 落进同一个存储（由 bootstrap 装配）。
+        # 替身少这一个字段，主循环会在取值时抛 AttributeError——那不是被测代码的问题，
+        # 而是替身没跟上 AppContext 的形状。
+        self.audit_store = audit_store
 
     async def __aenter__(self) -> _StubContext:
         return self
@@ -192,6 +212,7 @@ def _patch_context(
     model_names: list[str] | None = None,
     rounds: list[list[AgentEvent]] | None = None,
     api_key_store: Any = None,
+    audit_store: Any = None,
 ) -> _StubRuns:
     """替换 ``build_app_context``，并返回其中的假 ``RunService`` 供断言。"""
     runs = _StubRuns(rounds)
@@ -200,6 +221,7 @@ def _patch_context(
         runs=runs,
         catalog=_StubCatalog(model_names or ["stub-model"]),
         api_key_store=api_key_store,
+        audit_store=audit_store,
     )
     monkeypatch.setattr(cli, "build_app_context", lambda config: context)
     return runs
@@ -456,6 +478,11 @@ async def test_validate_api_key_accepts_dev_key(tmp_path: Path):
         user_id="apikey:dev",
         display_name="dev",
         role="admin",
+        # WHY 断言 scopes：同一个应急密钥换来的主体，两个入口必须长得一样。
+        # 此前 CLI 侧不带 scopes、Web 侧带（Web 把 admin 的权限集给了它），
+        # 而 scopes 会经 /auth/me 回给浏览器，也是 has_scope 唯一的输入——
+        # 一旦它参与权限判断，CLI 侧会静默少权限。
+        scopes=frozenset(ROLE_PERMISSIONS["admin"]),
         auth_method="apikey",
     )
 
@@ -498,6 +525,71 @@ async def test_validate_api_key_rejects_unknown_key(tmp_path: Path):
         await _validate_api_key_for_cli(config, "nope", api_key_store=_StubApiKeyStore())
 
 
+# ================================================================== 认证审计
+
+
+async def test_validate_api_key_for_cli_writes_success_audit(tmp_path: Path):
+    """CLI 认证成功要落审计，并标出入口。
+
+    WHY 单独立一条：这条审计此前**根本不存在**。两个入口的认证语义没有收敛时，
+    Web 侧成功/失败各落一条，CLI 侧一条都不落——而两边都"能登录"，
+    功能测试永远发现不了这种差异。
+    """
+    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
+    audit = _StubAuditStore()
+
+    await _validate_api_key_for_cli(config, "dev-secret", audit_store=audit)
+
+    assert len(audit.calls) == 1
+    call = audit.calls[0]
+    assert call["event_type"] == "apikey_auth_success"
+    assert call["actor_id"] == "apikey:dev"
+    assert call["outcome"] == "success"
+    assert call["action"] == "validate"
+    assert call["details"] == {"source": "env_dev_key", "entry": "cli"}
+    # CLI 没有来源地址与客户端标识。传空串会让审计面板上出现一个看起来像异常的空白值，
+    # 而"这个字段不存在"与"取到了空值"是两回事。
+    assert call["ip"] is None
+    assert call["user_agent"] is None
+
+
+async def test_validate_api_key_for_cli_writes_failure_audit_before_raising(tmp_path: Path):
+    """失败也要落审计，且在抛异常之前落。
+
+    WHY 时序也要测：失败路径上只有这一层拿得到结果对象——上层只看到一个异常，
+    写不出"为什么失败"，而"存储没装配"与"凭据无效"的处置方式完全不同。
+    """
+    config = make_config(tmp_path)
+    audit = _StubAuditStore()
+
+    with pytest.raises(ValueError, match="HARNESS_API_KEY 无效"):
+        await _validate_api_key_for_cli(
+            config, "nope", api_key_store=_StubApiKeyStore(), audit_store=audit
+        )
+
+    assert len(audit.calls) == 1
+    call = audit.calls[0]
+    assert call["event_type"] == "apikey_auth_failure"
+    assert call["actor_id"] == "unknown"
+    assert call["outcome"] == "failure"
+    assert call["details"] == {"reason": "invalid_or_revoked", "entry": "cli"}
+
+
+async def test_audit_write_failure_does_not_break_cli_auth(tmp_path: Path):
+    """审计写坏了也不能让认证失败——否则存储故障直接演变成「谁都登录不了」。"""
+    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
+
+    class _BrokenAuditStore:
+        async def log(self, **fields: Any) -> None:
+            raise RuntimeError("审计库炸了")
+
+    principal = await _validate_api_key_for_cli(
+        config, "dev-secret", audit_store=_BrokenAuditStore()
+    )
+
+    assert principal.user_id == "apikey:dev"
+
+
 # ================================================================== 主体构造
 
 
@@ -523,6 +615,27 @@ async def test_build_principal_apikey_requires_env(tmp_path: Path, monkeypatch):
 async def test_build_principal_apikey_uses_env_key(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HARNESS_API_KEY", "dev-secret")
     config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
+
+    principal = await _build_cli_principal(config)
+
+    assert principal is not None
+    assert principal.user_id == "apikey:dev"
+
+
+async def test_build_principal_apikey_reads_key_from_env_file(tmp_path: Path, monkeypatch):
+    """写在 ``.env`` 里的密钥必须生效——它是 .env.example 指的配置位置。
+
+    WHY 单独测：``.env`` 的值只进 ``AppConfig``、不进 ``os.environ``，所以「CLI 直接读
+    环境变量」的实现会让这条路径永远失败，而它恰是容器内与「照模板配好」两条真实场景
+    的主路径；症状是提示「没配密钥」而用户刚刚才配过。
+    """
+    monkeypatch.delenv("HARNESS_API_KEY", raising=False)
+    config = _cli_auth_config(
+        tmp_path,
+        "apikey",
+        harness_api_key="dev-secret",
+        auth_api_key_dev="dev-secret",
+    )
 
     principal = await _build_cli_principal(config)
 
@@ -719,8 +832,11 @@ async def test_run_cli_logs_unexpected_failure(tmp_path: Path, monkeypatch, capl
 
 
 async def test_run_cli_uses_authenticated_principal(tmp_path: Path, monkeypatch):
-    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
+    # WHY 顺序不能反：凭据与其余配置同一个入口（``AppConfig.harness_api_key``），
+    # 而配置在构造期读环境变量——先建配置再设变量，得到的是「变量明明设了却没生效」，
+    # 正是这条用例要防的形态（真实启动顺序也是先有环境、再建配置）。
     monkeypatch.setenv("HARNESS_API_KEY", "dev-secret")
+    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
     _feed_input(monkeypatch, "你好", "exit")
     runs = _patch_context(
         monkeypatch,
@@ -733,6 +849,37 @@ async def test_run_cli_uses_authenticated_principal(tmp_path: Path, monkeypatch)
     principal = runs.stream_calls[0]["principal"]
     assert principal is not None
     assert principal.user_id == "apikey:dev"
+
+
+async def test_run_cli_returns_2_when_api_key_missing(tmp_path: Path, monkeypatch, capsys):
+    """``auth_mode=apikey`` 却没给密钥：当场说清并返回 2，不抛堆栈。
+
+    WHY 断言这条：此前这个 ValueError 一路抛到 ``main()``，用户看到的是三层堆栈，
+    真正的一句话提示被夹在中间；退出码 2（参数错误）也让脚本能区分「配置没给」与
+    「跑起来之后失败」（后者是 1）。
+    """
+    monkeypatch.delenv("HARNESS_API_KEY", raising=False)
+    config = _cli_auth_config(tmp_path, "apikey")
+    runs = _patch_context(monkeypatch, model_names=["stub-model"])
+
+    code = await run_cli(config, model_name="stub-model")
+    out = capsys.readouterr().out
+
+    assert code == 2
+    assert "HARNESS_API_KEY" in out
+    assert "AUTH_API_KEY_DEV" in out
+    # 提示与退出码都对了，就说明这一步没有半途发起过任何运行
+    assert runs.stream_calls == []
+
+
+async def test_run_cli_returns_2_when_api_key_invalid(tmp_path: Path, monkeypatch, capsys):
+    """密钥填错同样是配置问题，同样按 2 返回并给出提示。"""
+    monkeypatch.setenv("HARNESS_API_KEY", "wrong")
+    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
+    _patch_context(monkeypatch, model_names=["stub-model"])
+
+    assert await run_cli(config, model_name="stub-model") == 2
+    assert "无效" in capsys.readouterr().out
 
 
 # ================================================================== 同步入口
