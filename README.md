@@ -604,6 +604,8 @@ MyAgentHarness/
 | --- | --- | --- |
 | 六个包之间的依赖方向（6 条契约） | `.importlinter` | `uv run lint-imports` |
 | 根级模块的依赖边界与角色 | `tests/test_root_module_contract.py` | `uv run pytest` |
+| `application` 的层内纯度（契约组不依赖服务组） | `tests/application/test_layer_purity_contract.py` | `uv run pytest` |
+| `application` 允许直接依赖的 `runtime` 符号（端口化之外的白名单） | `tests/application/test_runtime_port_contract.py` | `uv run pytest` |
 
 > 为什么分成两处：import-linter 只接受「包」作为分析根（`root_packages` 必须是含
 > `__init__.py` 的目录），单文件模块既不能列为分析根、也不能被契约引用（实测报

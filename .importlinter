@@ -123,3 +123,21 @@ allow_indirect_imports = True
 ; note exists so that dead end is not re-explored. The role of each root-level
 ; module (neutral leaf / service handle / tool plugin / entry point) and the
 ; reasoning behind it are recorded in docs/architecture/.
+;
+; ---------------------------------------------------------------------------
+; In-package boundaries are NOT covered here either: every contract above
+; compares packages with each other, so module-to-module dependencies inside a
+; single package (application/ is a flat package of 29 modules) are invisible.
+; Two guards cover that gap, in the same CI job:
+;
+;   tests/application/test_layer_purity_contract.py
+;       contract modules (dto / errors / events / ports / principal /
+;       audit_recorder / ownership) must not import service modules -- the
+;       reverse direction would mean the contract layer absorbed business flow.
+;
+;   tests/application/test_runtime_port_contract.py
+;       the exact set of runtime symbols application/ may import directly
+;       (portable implementations go through application/ports.py protocols;
+;       stateless helpers, data carriers and exceptions stay whitelisted).
+;
+; Rationale for both: docs/architecture/ (Q8 and Q11 of the governance plan).

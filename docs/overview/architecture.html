@@ -323,8 +323,10 @@
 <p><strong>快照说明（2026-09-20 重生成）</strong>：本树按仓库实际文件重新生成。
 此前的版本缺 <code>bootstrap/</code> 组装层与全部根级模块，并残留了已删除的
 <code>tool/</code> 目录——照它找文件会找不到，照它理解装配会漏掉唯一的组装点。
-完整规则以 <code>.importlinter</code>（6 条包层契约）与
-<code>tests/test_root_module_contract.py</code>（根级模块角色表）为准。</p>
+完整规则以 <code>.importlinter</code>（6 条包层契约）、
+<code>tests/test_root_module_contract.py</code>（根级模块角色表）与
+<code>tests/application/test_layer_purity_contract.py</code> /
+<code>tests/application/test_runtime_port_contract.py</code>（应用层的层内纯度与运行时端口白名单）为准。</p>
 
 <pre><code>MyAgentHarness/
 ├── main.py                 进程入口：解析子命令 → 装载配置 → 日志 → 分发
@@ -377,7 +379,7 @@
 │   ├── interrupt_codec.py  ★ 中断解析与恢复指令构造
 │   ├── principal.py        认证主体与权限模型（角色 → 权限映射）
 │   ├── ownership.py        会话归属判定
-│   ├── ports.py            基础设施端口协议（APIKeyRepository / AuditSink / RateLimiterPort）
+│   ├── ports.py            基础设施端口协议：接口侧（AuditSink / APIKeyRepository / RateLimiterPort）+ 应用侧（ThreadMetadata* / AuditLog / UsageLedger / KnowledgeIndex / SkillState）
 │   ├── audit_context.py    审计用 contextvars 请求上下文（trace_id 的唯一来源）
 │   ├── health.py           健康与指标服务
 │   ├── attachment_service.py  附件上传 / 列举 / 删除与多模态消息构造
@@ -387,7 +389,7 @@
 │   ├── usage.py / usage_service.py  Token 用量提取与统计
 │   ├── thread_export.py       会话导出 Markdown
 │   ├── tool_catalog.py        工具目录服务
-│   └── __init__.py         导出三个服务与事件模型
+│   └── __init__.py         导出对外稳定契约（__all__ 的 12 个符号；职责域清单见其 docstring）
 ├── interfaces/             接口层：两种适配器
 │   ├── cli.py              ★ 终端交互：事件渲染 + stdin 审批
 │   └── web/
