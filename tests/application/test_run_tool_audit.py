@@ -21,7 +21,7 @@ from application.run_service import RunService
 from application.tool_catalog import ToolCatalog
 from tests.application.test_run_governance import RecordingAuditStore
 from tests.application.test_run_service import FakeGraphFactory, _drain
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 def _tool_call_chunk(name: str, args: str, index: int = 0) -> Any:
@@ -99,10 +99,12 @@ def _make_service(
     catalog: ToolCatalog | None = None,
     **config_overrides: Any,
 ) -> RunService:
+    config = make_config(tmp_path, **config_overrides)
     return RunService(
-        make_config(tmp_path, **config_overrides),
+        config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(graph),
+        workspaces=StubSessionRegistry(config),
         audit_store=audit,
         tool_catalog=catalog,
     )

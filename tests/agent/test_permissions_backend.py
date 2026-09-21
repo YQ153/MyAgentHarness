@@ -29,7 +29,7 @@ from langgraph.store.memory import InMemoryStore
 from agent.backends import build_backend
 from agent.guardrails import build_interrupt_on, build_permissions
 from agent.run_context import AgentRunContext
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -100,7 +100,8 @@ def _tool_outputs(chunks: list[Any]) -> list[str]:
 
 def test_disabled_backend_keeps_tool_level_permissions(tmp_path: Path):
     """``disabled`` 档位下敏感路径拒绝必须保留——这是文件工具的主防线。"""
-    backend = build_backend(_config(tmp_path), InMemoryStore())
+    config = _config(tmp_path)
+    backend = build_backend(config, InMemoryStore(), scope=make_root(config))
 
     rules = build_permissions(backend)
 
@@ -110,7 +111,8 @@ def test_disabled_backend_keeps_tool_level_permissions(tmp_path: Path):
 
 def test_local_backend_drops_tool_level_permissions(tmp_path: Path, caplog: pytest.LogCaptureFixture):
     """``local`` 档位下工具级权限被停用，且必须留下 WARNING（不静默）。"""
-    backend = build_backend(_config(tmp_path, execution_mode="local"), InMemoryStore())
+    config = _config(tmp_path, execution_mode="local")
+    backend = build_backend(config, InMemoryStore(), scope=make_root(config))
 
     with caplog.at_level(logging.WARNING):
         rules = build_permissions(backend)
@@ -122,7 +124,7 @@ def test_local_backend_drops_tool_level_permissions(tmp_path: Path, caplog: pyte
 def test_sandbox_backend_drops_tool_level_permissions(tmp_path: Path):
     """``sandbox`` 档位与 ``local`` 同口径：可执行就不带工具级权限。"""
     config = _config(tmp_path, execution_mode="sandbox", sandbox_tier="process")
-    backend = build_backend(config, InMemoryStore())
+    backend = build_backend(config, InMemoryStore(), scope=make_root(config))
 
     assert build_permissions(backend) == []
 
@@ -148,7 +150,8 @@ def test_full_rules_rejected_on_executable_backend(tmp_path: Path):
     WHY 保留这条「负用例」：它是「必须裁剪」这一结论的前提。前提消失（上游开始
     支持该组合）时本用例会转红，提示我们重新评估是否还要停用权限。
     """
-    backend = build_backend(_config(tmp_path, execution_mode="local"), InMemoryStore())
+    config = _config(tmp_path, execution_mode="local")
+    backend = build_backend(config, InMemoryStore(), scope=make_root(config))
 
     with pytest.raises(NotImplementedError):
         FilesystemMiddleware(backend=backend, _permissions=build_permissions())
@@ -162,7 +165,7 @@ def test_local_mode_graph_assembles(tmp_path: Path):
     """
     config = _config(tmp_path, execution_mode="local")
     store = InMemoryStore()
-    backend = build_backend(config, store)
+    backend = build_backend(config, store, scope=make_root(config))
 
     agent = create_deep_agent(
         model=ScriptedChatModel(replies=[AIMessage(content="ok")]),
@@ -192,9 +195,9 @@ async def test_disabled_mode_denies_secret_file_read_end_to_end(tmp_path: Path):
     工具调用路径」，而不是「匹配函数算对了」——两者之间隔着装配这一层。
     """
     config = _config(tmp_path)
-    (config.workspace / ".env").write_text("SECRET_VALUE=1\n", encoding="utf-8")
+    (make_root(config).root / ".env").write_text("SECRET_VALUE=1\n", encoding="utf-8")
     store = InMemoryStore()
-    backend = build_backend(config, store)
+    backend = build_backend(config, store, scope=make_root(config))
 
     agent = create_deep_agent(
         model=ScriptedChatModel(

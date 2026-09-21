@@ -7,7 +7,12 @@ WHY 做成自定义工具而不是内置工具：知识库是可选能力（要�
 正是为这类「按配置启用」的能力准备的。
 
 WHY 工具体内按需取服务而不是注册时注入：扩展点只把 ``config`` 交给模块，而知识库
-持有的是一条 SQLite 连接。``knowledge_runtime`` 负责「整进程一份」，这里只取用。
+持有的是一条 SQLite 连接。``knowledge_runtime`` 负责按工作区各持一份，这里只取用。
+
+WHY 服务要按**本轮运行的工作区**取，而不是取启动时那一个：知识库按工作区隔离，每条
+会话的索引只包含它自己工作区里的文档。取错库的表现是「检索到的文档不是这个项目的」，
+而它看起来像检索不准，不像配错了库。工作区由 ``AgentRunContext`` 经 ``ToolRuntime``
+传进来（与长期记忆的按主体隔离共用同一条通道）。
 
 WHY 检索结果要截断：一次返回若干个片段，每个都可能上千字；原样返回会把工具结果变成
 一段长文并挤占上下文——检索的价值在于「指出去哪里看」，不在于把文档搬进对话。
@@ -16,13 +21,22 @@ WHY 检索结果要截断：一次返回若干个片段，每个都可能上千�
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+# WHY 运行期导入而不是放进 TYPE_CHECKING：``@tool`` 会调 ``get_type_hints`` 解析注解，
+# 而注解在 ``from __future__ import annotations`` 下是字符串——名字必须真的存在于模块
+# 命名空间里，否则构造工具时就抛 NameError（失败点离原因很远，看起来像「知识库工具
+# 注册不了」）。
+from langchain.tools import ToolRuntime
+
+from agent.run_context import workspace_of
 from agent.tools import ToolRegistry, ToolSource
 from knowledge_runtime import ensure_service
 from text_utils import truncate_with_notice
 
 if TYPE_CHECKING:
+    from application.knowledge_service import KnowledgeService
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -64,14 +78,38 @@ def _truncate(text: str) -> str:
     return truncate_with_notice(text, _MAX_SNIPPET_CHARS, "…（片段已截断）")
 
 
+async def _service_for(config: AppConfig, runtime: ToolRuntime) -> KnowledgeService:
+    """按本轮运行的文件根取知识库服务。
+
+    WHY **没有**回落分支：库按根隔离（同一个 ``/README.md`` 在两个项目里是同一个键），
+    因此「拿不准用哪个根」时唯一安全的做法是报错而不是猜一个。运行上下文没带根，说明
+    调用方绕过了图（图在构造时就把根烧进了 backend 与工具上下文）——那时查到的索引
+    很可能属于另一个项目，而症状只是「检索结果对不上」，不会报任何错。
+
+    Raises:
+        KnowledgeToolError: 运行上下文里没有文件根。
+
+    Args:
+        config: 应用配置。
+        runtime: 工具运行时；从中取 ``AgentRunContext.workspace``（本轮的文件根）。
+    """
+    workspace = workspace_of(runtime)
+    if not workspace:
+        raise KnowledgeToolError(
+            "本轮运行没有文件根，无法确定要检索哪一个知识库；"
+            "请通过对话发起检索（图会在构造时把根写进运行上下文）"
+        )
+    return await ensure_service(config, Path(workspace))
+
+
 def _build_search_tool(config: AppConfig) -> object:
     """构造 ``search_documents`` 工具。"""
     from langchain_core.tools import tool
 
     @tool("search_documents", description=_SEARCH_DESCRIPTION)
-    async def search_documents(query: str) -> str:
+    async def search_documents(query: str, runtime: ToolRuntime) -> str:
         """在工作区已索引的文档里检索。"""
-        service = await ensure_service(config)
+        service = await _service_for(config, runtime)
         try:
             result = await service.search(query)
         except ValueError as exc:
@@ -103,9 +141,9 @@ def _build_index_tool(config: AppConfig) -> object:
     from langchain_core.tools import tool
 
     @tool("index_documents", description=_INDEX_DESCRIPTION)
-    async def index_documents() -> str:
+    async def index_documents(runtime: ToolRuntime) -> str:
         """索引（或刷新）工作区文本文档。"""
-        service = await ensure_service(config)
+        service = await _service_for(config, runtime)
         summary = await service.index_workspace()
         return (
             f"已扫描 {summary['scanned']} 个文件：新索引 {summary['indexed']} 个、"

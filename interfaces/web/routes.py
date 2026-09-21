@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -15,9 +16,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
-from application.attachment_service import AttachmentService
 from application.dto import (
     BranchListResult,
+    DirectoryListing,
     ImportResult,
     MemoryDeleteResult,
     MemoryListResult,
@@ -26,6 +27,7 @@ from application.dto import (
     ThreadSummary,
     ToolListResult,
     UsageSummary,
+    WorkspacePickResult,
 )
 from application.errors import (
     InterruptExpiredError,
@@ -33,6 +35,9 @@ from application.errors import (
     OwnershipError,
     PermissionDeniedError,
     RunRejectedError,
+    SessionRootLockedError,
+    SessionRootNotReadyError,
+    SessionRootUnavailableError,
     ThreadBusyError,
     VisionUnsupportedError,
 )
@@ -41,12 +46,17 @@ from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.principal import Principal
 from application.run_service import RunService
+from application.session_registry import (
+    FolderPickerBusyError,
+    FolderPickerTimeoutError,
+    FolderPickerUnavailableError,
+)
 from application.thread_export import render_markdown
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
 from interfaces.web.auth import get_principal, require_permission
-from interfaces.web.deps import require_state
+from interfaces.web.deps import get_session_registry, require_state, resolve_scoped_services
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
@@ -104,16 +114,6 @@ def get_memory_service(request: Request) -> MemoryService:
     return require_state(request, "memories", "记忆管理服务")
 
 
-def get_attachments(request: Request) -> AttachmentService:
-    """取出附件服务单例。
-
-    WHY 运行端点需要它：带附件的消息必须在**进入图之前**被构造成多模态内容块——
-    这段构造包含了「模型是否接受图片」的判定，放在运行服务里会让运行服务同时
-    承担会话编排与多模态形态转换两件事。
-    """
-    return require_state(request, "attachments", "附件服务")
-
-
 def _validate_thread_id(thread_id: str) -> str:
     """校验路径参数中的会话 ID。
 
@@ -135,6 +135,75 @@ def _validate_thread_id(thread_id: str) -> str:
 async def list_models(catalog: ModelCatalog = Depends(get_catalog)) -> list[ModelInfo]:
     """列出可切换的模型。"""
     return catalog.list_models()
+
+
+@router.get("/workspaces/dirs", response_model=DirectoryListing)
+async def list_workspace_dirs(
+    path: str | None = Query(
+        default=None, description="要列的目录；不传则返回起点（盘符或 /）"
+    ),
+    registry: Any = Depends(get_session_registry),
+    principal: Principal = Depends(require_permission("file:read")),
+) -> DirectoryListing:
+    """列出一个目录下的子目录，供界面逐级挑选工作空间。
+
+    WHY 没有边界：工作空间允许用户任意选择（这是产品规则），因此服务端不过滤位置——
+    能选任意目录就意味着能读任意目录，这里的门槛只剩权限本身。
+
+    只列目录、只列一层：这一步的用途是挑目录；一次列全整棵树会让响应变成一次全盘扫描。
+
+    WHY 用 ``asyncio.to_thread``：``iterdir`` 是阻塞的系统调用，在事件循环里直接跑会让
+    一次慢盘列举拖住所有并发请求（与文件面板同一口径，见 ``WorkspaceService``）。
+
+    权限与文件面板同口径（``file:read``）：它暴露的是宿主机上的绝对路径。
+    """
+    try:
+        return await asyncio.to_thread(registry.list_directories, path)
+    except ValueError as exc:
+        # 路径不存在 / 不是目录：改路径就能过，是 400 而不是 403。
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/pick", response_model=WorkspacePickResult)
+async def pick_workspace(
+    workspace: str | None = Query(default=None, description="对话框的起始目录；不传则用服务端的主目录"),
+    registry: Any = Depends(get_session_registry),
+    principal: Principal = Depends(require_permission("file:read")),
+) -> WorkspacePickResult:
+    """在**服务端**弹出系统文件夹选择对话框，把选中的路径回给浏览器。
+
+    WHY 需要它：浏览器页面拿不到宿主的绝对路径——``<input webkitdirectory>`` 只给相对名，
+    File System Access API 只给一个 handle。要拿到 ``D:\\projects\\my-app`` 这种取值，
+    只能由服务端进程在自己的桌面上弹原生对话框。
+
+    代价是明确的：这个对话框出现在**服务端那台机器**的屏幕上，而不是访问浏览器的人眼前。
+    因此它只适用于「服务端就跑在你自己机器上」这种形态；容器、无显示器的服务器、以及
+    服务端与浏览器分离的部署都会得到 501，那时应当用 ``/workspaces/dirs`` 逐级挑选。
+
+    WHY 是 POST：它会在宿主上弹出一个窗口，属于有副作用的动作。做成 GET 会被浏览器
+    预取、被中间层缓存，凭空多出几个没人认领的弹窗。
+
+    WHY ``asyncio.to_thread``：这一步要等用户关上对话框（最长见
+    ``folder_picker.DEFAULT_TIMEOUT_SECONDS``），阻塞在事件循环里会让整个服务停摆。
+    """
+    try:
+        chosen = await asyncio.to_thread(registry.pick_folder, workspace)
+    except FolderPickerUnavailableError as exc:
+        # 501 而不是 500：这不是「服务出错了」，而是「这个部署形态没有图形环境」——
+        # 客户端据此该做的事是换一条路径（网页内浏览），而不是重试。
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc)
+        ) from exc
+    except FolderPickerBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except FolderPickerTimeoutError as exc:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if chosen is None:
+        return WorkspacePickResult(cancelled=True)
+    return WorkspacePickResult(cancelled=False, path=chosen)
 
 
 @router.get("/tools", response_model=ToolListResult)
@@ -394,16 +463,24 @@ async def export_thread(
 @router.post("/threads/import", response_model=ImportResult)
 async def import_thread(
     body: ThreadExport,
+    workspace: str | None = Query(
+        default=None,
+        description="导入后的新会话使用哪个工作空间；缺省表示不绑定，用它的会话专属目录",
+    ),
     threads: ThreadService = Depends(get_threads),
     principal: Principal = Depends(require_permission("thread:create")),
 ) -> ImportResult:
     """把导出的 JSON 复原成一个**新会话**。
 
     WHY 请求体就是导出文件本身：这样「导出 → 导入」是一条无转换的路径，不需要再
-    约定一层包装格式——多一层包装就多一处可能对不上的字段名。
+    约定一层包装格式——多一层包装就多一处可能对不上的字段名。工作空间因此只能走查询
+    参数（它是**导入方**的决定，不是文件里的内容）。
+
+    WHY 不照搬文件里的 ``workspace``：那是来源机器上的绝对路径，在本机通常不存在，
+    照搬会让导入直接失败。文件里的取值只作为线索（也在 ``notes`` 里说明）。
     """
     try:
-        return await threads.import_thread(body, principal)
+        return await threads.import_thread(body, principal, workspace=workspace)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -445,6 +522,12 @@ async def get_history(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
+    except (SessionRootNotReadyError, SessionRootUnavailableError) as exc:
+        # WHY 单独接：读历史要按会话的根装配图与附件索引（历史里的图片引用是相对本根的
+        # 路径），因此根没就绪或目录不见了都会在这里失败。两者都是 409：用户能做的事
+        # 是明确的（先发出第一条消息 / 把目录恢复回来），而不是「服务端故障，请稍后再试」。
+        # 兜到下面那条分支会得到 500 + 一句内部断言，与用户的操作毫无关系。
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.exception("读取会话历史失败：thread=%s", normalized)
         raise HTTPException(
@@ -492,8 +575,8 @@ async def delete_thread(
 async def run_agent(
     thread_id: str,
     body: ChatRequest,
+    request: Request,
     runs: RunService = Depends(get_runs),
-    attachments: AttachmentService = Depends(get_attachments),
     principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """发起一轮对话，以 SSE 流式返回事件。
@@ -507,6 +590,13 @@ async def run_agent(
     """
     normalized = _validate_thread_id(thread_id)
 
+    # WHY 附件服务在这里现取、而不是走 ``get_attachments`` 依赖：附件必须与运行落在
+    # **同一个**工作区，而本次请求要用的工作区在 body 里（不是查询参数）。走依赖会读到
+    # 另一个值——新会话的附件当场「不存在」，而它明明刚上传成功。
+    attachments = (
+        await resolve_scoped_services(request, thread_id=normalized, requested=body.workspace)
+    ).attachments
+
     try:
         content: str | list[dict[str, Any]] = body.content
         if body.attachment_ids:
@@ -517,7 +607,20 @@ async def run_agent(
                 model_name=body.model,
                 principal=principal,
             )
-        events = await runs.stream(normalized, content, principal=principal, model_name=body.model)
+        events = await runs.stream(
+            normalized,
+            content,
+            principal=principal,
+            model_name=body.model,
+            workspace=body.workspace,
+        )
+    except (SessionRootLockedError, SessionRootNotReadyError, SessionRootUnavailableError) as exc:
+        # WHY 409：三种都是「状态不允许这次操作」——已锁定（这条会话的根定了）、还没
+        # 就绪（这条会话还没有根）、不可用（根目录不见了）。重试本请求无用，客户端应改用
+        # 原根、新建会话，或把那个目录恢复回来。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     except VisionUnsupportedError as exc:
         # WHY 单独先接：它是 ValueError 的子类，落到下面那条分支就只会得到
         # 一句裸错误文本，而这里要保证「换哪个模型」这个关键信息一定被回出去。

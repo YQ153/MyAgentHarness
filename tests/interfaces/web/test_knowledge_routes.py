@@ -21,22 +21,26 @@ from application.knowledge_service import KnowledgeService
 from config import AppConfig
 from interfaces.web.knowledge_routes import router
 from runtime.knowledge_store import open_knowledge_store
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config, make_root
 
 _DIMS = 4
+
+#: 面板端点按**会话**解析文件根；用例统一带上一个会话 ID（与界面真实请求一致）。
+_SESSION = {"thread_id": "t1"}
 
 
 @pytest.fixture
 async def api(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, AppConfig]]:
     """只挂知识库路由的应用（与真实启动共用同一个服务实现）。"""
     config = make_config(tmp_path)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(
         tmp_path / "knowledge.db", dims=_DIMS, model="", vector_enabled=False
     ) as store:
         app = FastAPI()
         app.state.config = config
-        app.state.knowledge = KnowledgeService(config, store=store)
+        app.state.knowledge = KnowledgeService(config, scope=make_root(config), store=store)
+        app.state.workspaces = StubSessionRegistry(config, knowledge=app.state.knowledge)
         app.include_router(router)
 
         transport = httpx.ASGITransport(app=app)
@@ -46,7 +50,7 @@ async def api(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, AppConfi
 
 def _write(config: AppConfig, relative: str, text: str) -> str:
     """在工作区里写一份文件，返回其虚拟路径。"""
-    target = config.workspace / relative
+    target = make_root(config).root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
     return "/" + relative
@@ -61,7 +65,7 @@ async def test_list_reports_capabilities_on_empty_index(
     """空索引也返回能力与统计，前端据此决定展示什么。"""
     http, _ = api
 
-    response = await http.get("/api/knowledge")
+    response = await http.get("/api/knowledge", params=_SESSION)
 
     assert response.status_code == 200
     body = response.json()
@@ -79,13 +83,13 @@ async def test_index_workspace_then_list(api: tuple[httpx.AsyncClient, AppConfig
     http, config = api
     _write(config, "notes/login.md", "# 登录问题\n\n登录接口超时排查记录。")
 
-    indexed = await http.post("/api/knowledge", json={})
+    indexed = await http.post("/api/knowledge", params=_SESSION, json={})
     assert indexed.status_code == 200
     summary = indexed.json()
     assert (summary["scanned"], summary["indexed"]) == (1, 1)
     assert summary["items"][0]["source_path"] == "/notes/login.md"
 
-    listed = await http.get("/api/knowledge")
+    listed = await http.get("/api/knowledge", params=_SESSION)
     items = listed.json()["items"]
     assert [item["source_path"] for item in items] == ["/notes/login.md"]
     assert items[0]["chunk_count"] >= 1
@@ -97,11 +101,11 @@ async def test_index_single_document_by_path(api: tuple[httpx.AsyncClient, AppCo
     _write(config, "notes/login.md", "登录接口超时排查记录。")
     _write(config, "notes/other.md", "另一份文档。")
 
-    response = await http.post("/api/knowledge", json={"path": "/notes/login.md"})
+    response = await http.post("/api/knowledge", params=_SESSION, json={"path": "/notes/login.md"})
 
     assert response.status_code == 200
     assert response.json()["scanned"] == 1
-    listed = await http.get("/api/knowledge")
+    listed = await http.get("/api/knowledge", params=_SESSION)
     assert [item["source_path"] for item in listed.json()["items"]] == ["/notes/login.md"]
 
 
@@ -115,12 +119,12 @@ async def test_unchanged_document_is_skipped_then_forced(
     """
     http, config = api
     _write(config, "notes/login.md", "登录接口超时排查记录。")
-    await http.post("/api/knowledge", json={})
+    await http.post("/api/knowledge", params=_SESSION, json={})
 
-    second = await http.post("/api/knowledge", json={})
+    second = await http.post("/api/knowledge", params=_SESSION, json={})
     assert second.json()["unchanged"] == 1
 
-    forced = await http.post("/api/knowledge", json={"force": True})
+    forced = await http.post("/api/knowledge", params=_SESSION, json={"force": True})
     assert forced.json()["indexed"] == 1
 
 
@@ -129,9 +133,9 @@ async def test_binary_file_is_rejected_with_400(
 ) -> None:
     """显式指定一份二进制文件时返回 400 并说明原因。"""
     http, config = api
-    (config.workspace / "blob.bin").write_bytes(b"\x00\x01binary")
+    (make_root(config).root / "blob.bin").write_bytes(b"\x00\x01binary")
 
-    response = await http.post("/api/knowledge", json={"path": "/blob.bin"})
+    response = await http.post("/api/knowledge", params=_SESSION, json={"path": "/blob.bin"})
 
     assert response.status_code == 400
     assert "二进制" in response.json()["detail"]
@@ -147,9 +151,9 @@ async def test_binary_file_is_skipped_when_indexing_workspace(
     """
     http, config = api
     _write(config, "notes/login.md", "登录接口超时排查记录。")
-    (config.workspace / "blob.bin").write_bytes(b"\x00\x01binary")
+    (make_root(config).root / "blob.bin").write_bytes(b"\x00\x01binary")
 
-    response = await http.post("/api/knowledge", json={})
+    response = await http.post("/api/knowledge", params=_SESSION, json={})
 
     assert response.status_code == 200
     body = response.json()
@@ -163,7 +167,7 @@ async def test_missing_file_returns_404(api: tuple[httpx.AsyncClient, AppConfig]
     """指定的文件不存在时 404（与 400「文件不适合索引」区分开）。"""
     http, _ = api
 
-    response = await http.post("/api/knowledge", json={"path": "/nope.md"})
+    response = await http.post("/api/knowledge", params=_SESSION, json={"path": "/nope.md"})
 
     assert response.status_code == 404
 
@@ -172,7 +176,7 @@ async def test_traversal_path_is_rejected(api: tuple[httpx.AsyncClient, AppConfi
     """逃出工作区的路径返回 400，而不是 500。"""
     http, _ = api
 
-    response = await http.post("/api/knowledge", json={"path": "/../outside.md"})
+    response = await http.post("/api/knowledge", params=_SESSION, json={"path": "/../outside.md"})
 
     assert response.status_code == 400
 
@@ -186,15 +190,15 @@ async def test_delete_removes_document_from_index(
     """移除后清单里不再出现，工作区源文件不受影响。"""
     http, config = api
     _write(config, "notes/login.md", "登录接口超时排查记录。")
-    await http.post("/api/knowledge", json={})
+    await http.post("/api/knowledge", params=_SESSION, json={})
 
-    deleted = await http.delete("/api/knowledge", params={"path": "/notes/login.md"})
+    deleted = await http.delete("/api/knowledge", params={"thread_id": "t1", "path": "/notes/login.md"})
     assert deleted.status_code == 200
     assert deleted.json()["deleted"] is True
 
-    listed = await http.get("/api/knowledge")
+    listed = await http.get("/api/knowledge", params=_SESSION)
     assert listed.json()["items"] == []
-    assert (config.workspace / "notes/login.md").is_file(), "源文件不该被删"
+    assert (make_root(config).root / "notes/login.md").is_file(), "源文件不该被删"
 
 
 async def test_delete_is_idempotent(api: tuple[httpx.AsyncClient, AppConfig]) -> None:
@@ -205,7 +209,7 @@ async def test_delete_is_idempotent(api: tuple[httpx.AsyncClient, AppConfig]) ->
     """
     http, _ = api
 
-    response = await http.delete("/api/knowledge", params={"path": "/nope.md"})
+    response = await http.delete("/api/knowledge", params={"thread_id": "t1", "path": "/nope.md"})
 
     assert response.status_code == 200
     assert response.json()["deleted"] is False
@@ -217,6 +221,6 @@ async def test_delete_rejects_traversal_path(
     """含上跳片段的路径被拦下。"""
     http, _ = api
 
-    response = await http.delete("/api/knowledge", params={"path": "/../outside.md"})
+    response = await http.delete("/api/knowledge", params={"thread_id": "t1", "path": "/../outside.md"})
 
     assert response.status_code == 400

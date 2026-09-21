@@ -61,6 +61,13 @@ class ChatRequest(BaseModel):
         default_factory=list,
         description="随本轮发送的附件 ID（来自上传接口）；空列表表示纯文本",
     )
+    workspace: str | None = Field(
+        default=None,
+        description=(
+            "本条会话要使用的工作区绝对路径；None 表示用启动默认值。"
+            "只在会话首条消息上生效——已绑定的会话给出不同取值会被拒绝（409）"
+        ),
+    )
 
 
 class RegenerateRequest(BaseModel):

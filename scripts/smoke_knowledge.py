@@ -66,8 +66,8 @@ WHY 特意选它：若检索只是关键词碰巧命中，这条查询不会命�
 
 async def _run(config: AppConfig) -> int:
     """装配 → 索引 → 检索，返回退出码。"""
-    config.workspace.mkdir(parents=True, exist_ok=True)
-    (config.workspace / "login.md").write_text(_DOC, encoding="utf-8")
+    _session_root(config, "smoke-knowledge").mkdir(parents=True, exist_ok=True)
+    (_session_root(config, "smoke-knowledge") / "login.md").write_text(_DOC, encoding="utf-8")
 
     print("[1/5] 经 build_app_context 装配（与 CLI / Web 启动同一条路径）")
     async with build_app_context(config) as context:
@@ -159,12 +159,13 @@ def main(argv: list[str]) -> int:
 
     with tempfile.TemporaryDirectory(prefix="mah-knowledge-") as workdir:
         root = pathlib.Path(workdir)
+        # WHY 不建任何「工作区」目录：配置里不再有这一项——会话的根由它自己决定。本脚本
+        # 造的是一个手工会话，因此下面显式取一个会话根来放文档。
         config = AppConfig(
             _env_file=root / "no-such.env",
-            workspace=root / "workspace",
-            memory_file=root / "workspace" / "AGENTS.md",
+            memory_file=root / "AGENTS.md",
             db_path=root / "data" / "agent.db",
-            skill_dirs=[root / "workspace" / "skills"],
+            skill_dirs=[root / "skills"],
             auth_mode="disabled",
             embedding_backend=args.backend,
             embedding_python=python,

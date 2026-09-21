@@ -53,6 +53,8 @@ from thread_utils import normalize_thread_id
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
+    from application.session_registry import SessionRegistry
+
     from agent.graph import AgentFactory
     from config import AppConfig
 
@@ -118,6 +120,7 @@ class ThreadService:
         checkpointer: BaseCheckpointSaver,
         thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
+        workspaces: SessionRegistry,
         audit_store: AuditLog | None = None,
     ) -> None:
         """构造会话服务。
@@ -127,6 +130,8 @@ class ThreadService:
             checkpointer: 检查点保存器，用于清理会话状态。
             thread_store: 会话元数据存储。
             graph_factory: 图工厂，用于读取会话历史。
+            workspaces: 会话级工作区的解析入口；**必填**——附件索引与清理都要按
+                **该会话**的工作区来做，沿用进程默认值会去扫别人的目录。
             audit_store: 审计日志存储，可选；认证关闭时可为 ``None``。
 
         Raises:
@@ -142,14 +147,21 @@ class ThreadService:
             raise ValueError("thread_store 不能为 None")
         if graph_factory is None:
             raise ValueError("graph_factory 不能为 None")
+        if workspaces is None:
+            raise ValueError("workspaces 不能为 None：附件索引按会话的工作区解析")
 
         self._config = config
         self._checkpointer = checkpointer
         self._thread_store = thread_store
         self._graph_factory = graph_factory
+        self._workspaces = workspaces
         self._audit_store = audit_store
 
-        logger.info("ThreadService 就绪：workspace=%s auth_mode=%s", config.workspace, config.auth_mode)
+        logger.info(
+            "ThreadService 就绪：sessions_root=%s auth_mode=%s",
+            config.resolved_sessions_root,
+            config.auth_mode,
+        )
 
     def _effective_owner_id(self, principal: Principal | None) -> str | None:
         """根据认证模式返回查询时使用的 owner_id。
@@ -338,7 +350,11 @@ class ThreadService:
         record = await self._thread_store.get(normalized)
         self._ensure_ownership(record, normalized, principal)
 
-        graph = self._graph_factory.get()
+        # WHY 按会话的工作区取图与建附件索引：历史消息里的附件引用是「相对本会话工作区」
+        # 的相对路径，拿另一个根去索引只会得到一份空映射——表现为「历史里的图全丢了」，
+        # 而文件其实还在原处。
+        scope = await self._workspaces.resolve(thread_id=normalized, record=record)
+        graph = self._graph_factory.get(scope=scope)
         checkpoint = await self._resolve_branch(normalized, branch_id)
 
         try:
@@ -355,9 +371,7 @@ class ThreadService:
         messages = getattr(state, "values", {}).get("messages") or []
         # WHY 先建一次索引而不是每条消息各自查一次：附件目录的列举要扫目录，
         # 一条消息查一次会把一次历史读取放大成 N 次目录扫描。
-        attachment_index = await asyncio.to_thread(
-            index_by_sha256, Path(self._config.workspace), normalized
-        )
+        attachment_index = await asyncio.to_thread(index_by_sha256, scope.root, normalized)
         return [self._message_to_dto(message, attachment_index) for message in messages]
 
     # ------------------------------------------------------------------ 分支
@@ -486,7 +500,9 @@ class ThreadService:
         WHY 读取失败不回滚切换：切换本身只是改一列游标，代价可忽略；而因为读不到头
         就拒绝用户的切换，会让「检查点侧临时出问题」变成「分支功能不可用」。
         """
-        graph = self._graph_factory.get()
+        graph = self._graph_factory.get(
+            scope=await self._workspaces.resolve(thread_id=thread_id)
+        )
         try:
             state = await graph.aget_state(
                 build_runnable_config(self._config, thread_id)
@@ -588,9 +604,17 @@ class ThreadService:
             # 文件读者会以为导出的是根分支，拿它去对照界面就会对不上。
             branch_id=current if branch_id is None else branch_id,
             messages=messages,
+            # WHY 导出带上工作区：消息正文里的工具输出引用是**工作区内**的虚拟路径
+            # （形如 ``/_tool_outputs/...``）。不带来源目录，导入方会把这条会话的产物
+            # 指向自己默认工作区里的同名路径——没有就 404，有就显示另一个项目的文件，
+            # 两种都看不出「少了什么」。这里记的是**来源**，导入时是否沿用由导入方决定。
+            workspace=str((record or {}).get("workspace") or ""),
             notes=[
                 "只包含该分支的消息；分支结构与各分支的位置不随导出迁移。",
                 "用量与审计不随导出迁移——导入后的会话自导入时刻重新计。",
+                "工作区不随导出迁移：导入后的会话落在导入方的默认工作区，"
+                "可用导入请求的 workspace 参数指定别处（文件里的 workspace 是来源取值，"
+                "只在同一台机器上有意义）。",
             ],
         )
 
@@ -600,6 +624,7 @@ class ThreadService:
         principal: Principal | None = None,
         *,
         title: str | None = None,
+        workspace: str | None = None,
     ) -> ImportResult:
         """把一份导出快照复原成一个**新会话**。
 
@@ -626,7 +651,17 @@ class ThreadService:
         new_id = uuid.uuid4().hex
         messages, skipped = _restore_messages(payload.messages)
 
-        graph = self._graph_factory.get()
+        # WHY 导入也要定根：导入产生的是一个**新会话**，它此后就按这个根读写文件。
+        # 取值由**导入方**给出（不给就用新会话的专属目录），而不是照搬导出文件里的
+        # ``payload.workspace``——那是来源机器上的绝对路径，在本机通常不存在，照搬只会
+        # 让导入失败。文件里的那个值仅作线索（``notes`` 里已说明）。
+        # WHY 这里必须先把根定下来再登记：导入的会话带轮次，而「有轮次就有根」是本模型
+        # 的一条不变式——漏了这一步，那条会话会成为一个永远解析不出根的黑洞。
+        # WHY 传 ``thread_id=new_id``：让解析知道这是哪条会话，从而给出它自己的专属目录。
+        scope = await self._workspaces.resolve(
+            requested=workspace, thread_id=new_id, record={}, allow_missing=True
+        )
+        graph = self._graph_factory.get(scope=scope)
         try:
             # WHY 直接写入状态而不是「重放一遍对话」：重放会真的调模型——既慢，又会
             # 生出一轮与原文不同的回答。要的是复原，不是重新回答。
@@ -651,6 +686,8 @@ class ThreadService:
             title_hint=resolved_title,
             turn_delta=sum(1 for message in messages if isinstance(message, HumanMessage)),
             owner_id=self._effective_owner_id(principal) or "",
+            workspace=str(scope.root),
+            workspace_bound=bool(workspace and str(workspace).strip()),
         )
         if payload.tags:
             await self._thread_store.set_tags(new_id, payload.tags)
@@ -708,6 +745,13 @@ class ThreadService:
         record = await self._thread_store.get(normalized)
         self._ensure_ownership(record, normalized, principal)
 
+        # WHY 在删元数据之前解析工作区：附件目录要按本会话绑定的根去找，而元数据
+        # 一旦删掉，那个绑定就没了——之后再解析只能回落到默认工作区，于是「删了会话
+        # 但附件留在原处」，且没有任何入口能再清掉它们。
+        workspace_root = (
+            await self._workspaces.resolve(thread_id=normalized, record=record)
+        ).root
+
         actor_id = principal.user_id if principal else "anonymous"
         meta_error = ""
         try:
@@ -723,7 +767,7 @@ class ThreadService:
         checkpoint_removed = await self._delete_checkpoints(normalized)
         # WHY 一并删附件：它们是工作区里的真实文件，而会话已不再被任何界面引用——
         # 留着不占功能，只占磁盘，且没有任何入口能看到或清掉它们。
-        attachments_removed = await self._delete_attachments(normalized)
+        attachments_removed = await self._delete_attachments(normalized, workspace_root)
 
         if meta_deleted and checkpoint_removed:
             outcome = DeleteOutcome.DELETED
@@ -773,8 +817,11 @@ class ThreadService:
             detail=detail,
         )
 
-    async def _delete_attachments(self, thread_id: str) -> int:
-        """删除该会话的附件文件。
+    async def _delete_attachments(self, thread_id: str, workspace_root: Path) -> int:
+        """删除该会话在指定工作区里的附件文件。
+
+        WHY 由调用方传入工作区根而不是在这里解析：本方法在元数据**已删除之后**才被
+        调用，此刻会话行已经没有了——再解析只能回落默认工作区，而附件在别处。
 
         WHY 失败不上抛：会话删除的主结果由元数据决定，附件残留只是空间问题；
         把它升级成一次失败的删除，会让用户为了几个文件重试一次已经成功的操作。
@@ -785,7 +832,7 @@ class ThreadService:
         """
         try:
             return await asyncio.to_thread(
-                delete_thread_attachments, Path(self._config.workspace), thread_id
+                delete_thread_attachments, workspace_root, thread_id
             )
         except Exception:
             logger.exception("删除会话附件失败：thread=%s", thread_id)

@@ -24,7 +24,7 @@ from config import AppConfig
 from llm.embeddings import EmbeddingError
 from runtime.knowledge_store import ChunkInput, open_knowledge_store
 from runtime.workspace_files import WorkspacePathError
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 _DIMS = 4
 
@@ -57,28 +57,28 @@ class _FakeEmbeddings:
 async def service(tmp_path: Path) -> AsyncIterator[tuple[KnowledgeService, AppConfig]]:
     """无嵌入后端的知识库服务（``EMBEDDING_BACKEND=none`` 的等价形态）。"""
     config = make_config(tmp_path)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(
         tmp_path / "knowledge.db", dims=_DIMS, model="", vector_enabled=False
     ) as store:
-        yield KnowledgeService(config, store=store), config
+        yield KnowledgeService(config, scope=make_root(config), store=store), config
 
 
 @pytest.fixture
 async def vector_service(tmp_path: Path) -> AsyncIterator[tuple[KnowledgeService, AppConfig, _FakeEmbeddings]]:
     """带嵌入后端的知识库服务（向量检索可用）。"""
     config = make_config(tmp_path)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     embeddings = _FakeEmbeddings()
     async with open_knowledge_store(
         tmp_path / "knowledge.db", dims=_DIMS, model="fake:test"
     ) as store:
-        yield KnowledgeService(config, store=store, embeddings=embeddings), config, embeddings
+        yield KnowledgeService(config, scope=make_root(config), store=store, embeddings=embeddings), config, embeddings
 
 
 def _write(config: AppConfig, relative: str, text: str) -> str:
     """在工作区里写一份文件，返回其虚拟路径。"""
-    target = config.workspace / relative
+    target = make_root(config).root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
     return "/" + relative
@@ -222,9 +222,9 @@ async def test_index_degrades_to_keyword_when_embedding_fails(tmp_path: Path) ->
     让这次降级可被看见，不会变成「语义检索某天开始不准」。
     """
     config = make_config(tmp_path)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(tmp_path / "k.db", dims=_DIMS, model="fake:test") as store:
-        knowledge = KnowledgeService(config, store=store, embeddings=_FakeEmbeddings(fail=True))
+        knowledge = KnowledgeService(config, scope=make_root(config), store=store, embeddings=_FakeEmbeddings(fail=True))
         path = _write(config, "notes/login.md", "登录接口超时排查记录。")
 
         result = await knowledge.index_document(path)
@@ -238,7 +238,7 @@ async def test_index_degrades_to_keyword_when_embedding_fails(tmp_path: Path) ->
 async def test_index_rejects_binary_file(service: tuple[KnowledgeService, AppConfig]) -> None:
     """二进制文件被显式拒绝，而不是索引进一堆乱码。"""
     knowledge, config = service
-    target = config.workspace / "blob.bin"
+    target = make_root(config).root / "blob.bin"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"\x00\x01\x02binary")
 
@@ -249,7 +249,7 @@ async def test_index_rejects_binary_file(service: tuple[KnowledgeService, AppCon
 async def test_index_rejects_non_utf8_file(service: tuple[KnowledgeService, AppConfig]) -> None:
     """非 UTF-8 文本给出可操作的失败信息，而不是靠宽松解码吞下乱码。"""
     knowledge, config = service
-    target = config.workspace / "gbk.txt"
+    target = make_root(config).root / "gbk.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes("中文内容".encode("gb18030"))
 
@@ -264,12 +264,12 @@ async def test_index_rejects_oversized_file(tmp_path: Path) -> None:
     断言变慢；把上限压到 1 KB 能测到同一条分支。
     """
     config = make_config(tmp_path, workspace_file_max_bytes=1024)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(
         tmp_path / "k.db", dims=_DIMS, model="", vector_enabled=False
     ) as store:
-        knowledge = KnowledgeService(config, store=store)
-        target = config.workspace / "big.txt"
+        knowledge = KnowledgeService(config, scope=make_root(config), store=store)
+        target = make_root(config).root / "big.txt"
         target.write_text("字" * 500, encoding="utf-8")
 
         with pytest.raises(UnsupportedDocumentError, match="超过索引上限"):
@@ -297,11 +297,11 @@ async def test_index_rejects_path_outside_workspace(
 async def test_index_truncates_chunks_beyond_cap(tmp_path: Path) -> None:
     """分块数超限时截断并记日志，而不是拒绝让用户无法索引。"""
     config = make_config(tmp_path, knowledge_chunk_chars=100, knowledge_chunk_overlap_chars=10, knowledge_max_chunks_per_document=3)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(
         tmp_path / "k.db", dims=_DIMS, model="", vector_enabled=False
     ) as store:
-        knowledge = KnowledgeService(config, store=store)
+        knowledge = KnowledgeService(config, scope=make_root(config), store=store)
         path = _write(config, "big.md", "这一句用来填充内容，需要足够长才能切出多块。" * 40)
 
         result = await knowledge.index_document(path)
@@ -346,9 +346,9 @@ async def test_search_rejects_empty_query(service: tuple[KnowledgeService, AppCo
 async def test_search_degrades_when_query_embedding_fails(tmp_path: Path) -> None:
     """查询嵌入失败时仍返回关键词结果，并标明降级。"""
     config = make_config(tmp_path)
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
     async with open_knowledge_store(tmp_path / "k.db", dims=_DIMS, model="fake:test") as store:
-        knowledge = KnowledgeService(config, store=store, embeddings=_FakeEmbeddings())
+        knowledge = KnowledgeService(config, scope=make_root(config), store=store, embeddings=_FakeEmbeddings())
         path = _write(config, "notes/login.md", "登录接口超时排查记录。")
         await knowledge.index_document(path)
         # 让查询阶段的嵌入失败（索引阶段已成功）
@@ -399,9 +399,9 @@ async def test_index_workspace_skips_binary_and_hidden_dirs(
     """
     knowledge, config = service
     _write(config, "notes/login.md", "登录接口超时排查记录。")
-    (config.workspace / ".tool_outputs").mkdir(parents=True, exist_ok=True)
-    (config.workspace / ".tool_outputs" / "out.txt").write_text("残留输出", encoding="utf-8")
-    (config.workspace / "blob.bin").write_bytes(b"\x00\x01binary")
+    (make_root(config).root / ".tool_outputs").mkdir(parents=True, exist_ok=True)
+    (make_root(config).root / ".tool_outputs" / "out.txt").write_text("残留输出", encoding="utf-8")
+    (make_root(config).root / "blob.bin").write_bytes(b"\x00\x01binary")
 
     summary = await knowledge.index_workspace()
 
@@ -436,4 +436,4 @@ async def test_remove_document_drops_it_from_search(
 
     assert await knowledge.remove_document(path) is True
     assert (await knowledge.search("登录接口"))["hits"] == []
-    assert (config.workspace / "notes/login.md").is_file()
+    assert (make_root(config).root / "notes/login.md").is_file()

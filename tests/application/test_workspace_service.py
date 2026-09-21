@@ -20,8 +20,9 @@ from application.workspace_service import (
     KIND_TOO_LARGE,
     WorkspaceService,
 )
+from runtime.tool_outputs import tool_output_path, write_tool_output
 from runtime.workspace_files import WorkspacePathError
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 
 class _StubAudit:
@@ -57,12 +58,12 @@ def workspace(tmp_path: Path) -> Path:
 def _service(tmp_path: Path, **overrides: Any) -> tuple[WorkspaceService, _StubAudit]:
     audit = _StubAudit()
     config = make_config(tmp_path, **overrides)
-    return WorkspaceService(config, audit_store=audit), audit
+    return WorkspaceService(config, scope=make_root(config), audit_store=audit), audit
 
 
 def test_rejects_none_config():
     with pytest.raises(ValueError, match="config"):
-        WorkspaceService(None)  # type: ignore[arg-type]
+        WorkspaceService(None, scope=None)  # type: ignore[arg-type]
 
 
 # ------------------------------------------------------------------ 列目录
@@ -227,3 +228,41 @@ async def test_read_file_rejects_escaping_path(tmp_path: Path):
 
     with pytest.raises(WorkspacePathError):
         await service.read_file("/../outside.txt")
+
+
+# ------------------------------------------------------------------ 根外挂载点
+
+
+async def test_reads_a_file_that_lives_in_a_mount(tmp_path: Path):
+    """面板要能打开「完整输出」——它在**根外存储**里，经挂载暴露在 ``/_tool_outputs`` 下。
+
+    WHY 单列：工具留存的正文只在这里，而它已经不在工作区里了。少了这一步，前端点开
+    「完整输出」会拿到 404（看起来像留存没写成功），而文件其实好好躺在存储目录里。
+    """
+    audit = _StubAudit()
+    config = make_config(tmp_path)
+    scope = make_root(config)
+    scope.ensure_storage()
+    target = tool_output_path(scope.tool_output_store, "t1", 1, "execute")
+    write_tool_output(target, "完整输出正文\n", max_chars=1000)
+    service = WorkspaceService(config, scope=scope, audit_store=audit)
+
+    content = await service.read_file("/_tool_outputs/t1/0001-execute.txt", Principal(user_id="u1"))
+
+    assert content.kind == KIND_TEXT
+    assert "完整输出正文" in (content.text or "")
+
+
+async def test_list_dir_never_exposes_the_internal_stores(tmp_path: Path):
+    """列举工作区根时不得出现那三个内部名字（技能库 / 技能视图 / 工具留存）。
+
+    WHY 单列：它们现在是**挂载点**而不是根内目录，但这条约束与它们当年在根内时是同一个
+    ——面板是给用户看「我的项目里有什么」的，程序产物混进去只会让人以为是自己建的。
+    """
+    service, _ = _service(tmp_path)
+
+    listing = await service.list_dir("/", Principal(user_id="u1"))
+
+    assert {item.name for item in listing.entries}.isdisjoint(
+        {"skills", ".skills-active", "_tool_outputs"}
+    )

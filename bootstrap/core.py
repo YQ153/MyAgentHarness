@@ -14,16 +14,14 @@ from contextlib import asynccontextmanager
 from agent.graph import AgentFactory, get_registry
 from agent.profiles import ensure_profiles_registered
 from agent.tooling import build_tool_bundle
-from application.attachment_service import AttachmentService
 from application.health import HealthService
 from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
 from application.run_service import RunService
-from application.skill_service import SkillService
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
-from application.workspace_service import WorkspaceService
+from application.session_registry import SessionRegistry
 from bootstrap.context import AppContext
 from config import AppConfig
 from knowledge_runtime import close_service, ensure_service
@@ -82,20 +80,34 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         # 只会把失败推迟到某次具体对话。
         tool_bundle = await build_tool_bundle(config)
         tool_catalog = ToolCatalog(tool_bundle)
-        # WHY 知识库在这里装配：它的连接要活到进程结束，而自定义工具扩展点只把
-        # ``config`` 交给工具模块、没有注入依赖的通道——因此由 knowledge_runtime
-        # 持有整进程唯一的一份，工具与接下来的接口都取用它（理由见该模块 docstring）。
-        knowledge = await ensure_service(config)
 
-        # WHY 技能视图必须在任何图被装配**之前**重建：图的技能来源指向这份派生物
-        # （见 ``runtime.skill_view``），若它还是上一次的内容，新建会话会加载到过时的
-        # 技能集——而技能索引每会话只加载一次，错了不会自愈。
+        # WHY 注册表只构造一次：目录与就绪探测都只需要读它的规格清单，
+        # 构造两份既浪费一次规格解析，也让两处看到不同的默认模型视图。
+        registry = get_registry(config)
+
+        # WHY 工作区注册表在图形工厂之前装配、并立刻装配默认工作区：
         #
-        # WHY 重建失败要拦住启动（不吞掉）：视图建不出来时 ``sources_for_graph`` 会退回
-        # 「全部技能」（见其 docstring），于是「面板说某技能已停用、Agent 却照用」会同时
-        # 成立。宁可起不来，也不要一个界面与实际互相矛盾的实例。
-        skills = SkillService(config, store=skill_store)
-        await skills.refresh_view()
+        # - 图的技能来源指向工作区里的物化视图（``/.skills-active``），而那份派生物由
+        #   ``SkillService.refresh_view`` 重建。它必须**在任何图被装配之前**完成，否则
+        #   新建会话会加载到过时的技能集——而技能索引每会话只加载一次，错了不会自愈。
+        # - 重建失败要拦住启动（不吞掉）：视图建不出来时 ``sources_for_graph`` 会退回
+        #   「全部技能」，于是「面板说某技能已停用、Agent 却照用」会同时成立。宁可起不来，
+        #   也不要一个界面与实际互相矛盾的实例。
+        #
+        # WHY 启动时一个根都不装配：根由会话在创建/首轮交互时确定，启动时不存在「当前
+        # 根」这种东西。装配是按根惰性发生的（见 ``SessionRegistry.services``）——提前
+        # 替用户还没用过的项目建目录、开 SQLite 连接，是替他们做决定。
+        workspaces = SessionRegistry(
+            config,
+            thread_store=thread_store,
+            skill_store=skill_store,
+            model_registry=registry,
+            # WHY 用回调注入知识库的装配入口：``knowledge_runtime`` 是根级模块，且它
+            # 反过来导入 ``application.knowledge_service``；应用层直接依赖它会接成一个环。
+            knowledge_provider=lambda scope: ensure_service(config, scope=scope),
+            audit_store=audit_store,
+        )
+
         graph_factory = AgentFactory(
             config,
             checkpointer=checkpointer,
@@ -103,14 +115,12 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             tools=tool_bundle.tools,
         )
 
-        # WHY 注册表只构造一次：目录与就绪探测都只需要读它的规格清单，
-        # 构造两份既浪费一次规格解析，也让两处看到不同的默认模型视图。
-        registry = get_registry(config)
         catalog = ModelCatalog(registry)
         runs = RunService(
             config,
             thread_store=thread_store,
             graph_factory=graph_factory,
+            workspaces=workspaces,
             audit_store=audit_store,
             usage_store=usage_store,
             tool_catalog=tool_catalog,
@@ -128,6 +138,7 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
                 checkpointer=checkpointer,
                 thread_store=thread_store,
                 graph_factory=graph_factory,
+                workspaces=workspaces,
                 audit_store=audit_store,
             ),
             runs=runs,
@@ -152,28 +163,22 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             # 记忆——各持一份（哪怕指向同一文件）会让「面板显示已删除」与
             # 「Agent 还记得」同时成立。
             memories=MemoryService(config, store=store, audit_store=audit_store),
-            # WHY 与 Agent 共享同一个工作区根：文件面板要展示的正是 Agent 读写
-            # 的那片目录，指向不同根会出现「Agent 写了但面板看不见」。
-            workspace=WorkspaceService(config, audit_store=audit_store),
-            # WHY 复用同一个 registry 实例：附件能不能发给某个模型，取决于它是否
-            # 接受图片；另建一份注册表会让「/api/models 说支持、上传却说不行」。
-            attachments=AttachmentService(
-                config,
-                registry=registry,
-                thread_store=thread_store,
-                audit_store=audit_store,
-            ),
-            knowledge=knowledge,
-            skills=skills,
+            # WHY 只挂注册表、不挂任何「已装配好的会话服务」：文件面板、附件、技能视图
+            # 与知识库都是**按根**各有一份的，而启动时还没有任何根。把某一份摆在这里，
+            # 等于给「顺手用全局那个」留一条捷径——而它的症状是「B 会话的面板显示 A
+            # 项目的文件」，两边都不报错。
+            workspaces=workspaces,
         )
 
         logger.info(
-            "核心依赖装配完成：db=%s auth_mode=%s tools=%d 向量检索=%s",
+            "核心依赖装配完成：db=%s sessions_root=%s auth_mode=%s tools=%d",
             config.db_path,
+            config.resolved_sessions_root,
             config.auth_mode,
             len(tool_bundle.tools),
-            knowledge.capabilities()["vector_enabled"],
         )
+        # 注：知识库的向量能力不再在这里报告——它按根各有一份，启动时一个都没装配。
+        # 该事实由 ``GET /api/knowledge``（按会话）如实回答，那里才是它的归属处。
         try:
             yield context
         finally:

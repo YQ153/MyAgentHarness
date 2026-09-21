@@ -70,6 +70,7 @@ def _stub_context() -> SimpleNamespace:
         audit_store=object(),
         api_key_store=object(),
         threads=object(),
+        workspaces=object(),
         workspace=object(),
         runs=object(),
         catalog=object(),
@@ -139,7 +140,10 @@ async def test_lifespan_shutdown_runs_to_completion(
             assert app.state.context is context
             assert app.state.runs is context.runs
             assert app.state.memories is context.memories
-            assert app.state.knowledge is context.knowledge
+            # WHY 断的是注册表而不是知识库服务本身：工作区在会话级可选之后，那四类
+            # 「按工作区各一份」的服务不在 app.state 上（见 ``_lifespan`` 里的说明），
+            # 路由一律经注册表按会话取。断注册表才是在断这条真实契约。
+            assert app.state.workspaces is context.workspaces
             # WHY 单列这一项：它就是漏铺过的那个——审计查询端点因此 500，而
             # auth/audit.py 的宽容读取还把全部认证审计悄悄丢掉了。
             assert app.state.audit_store is context.audit_store

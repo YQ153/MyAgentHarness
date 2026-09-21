@@ -85,6 +85,13 @@ class RunHandle:
     """停止原因；``None`` 表示尚未收到停止请求，取值见模块级常量。"""
     fork_checkpoint: str = ""
     """本次运行的分叉起点检查点 id；空串表示接着当前分支的头跑。"""
+    workspace: str = ""
+    """本轮运行的工作区绝对路径；空串表示「未声明」。
+
+    WHY 挂在句柄上而不是每次重读配置：工具输出留存与「完整输出」的虚拟路径引用都要
+    按**本轮运行**的工作区换算，而收尾阶段（流结束、写用量、剪留存）已经拿不到入口
+    参数；句柄本来就是「这一轮的全部信息」的载体，与此前的模型别名、所有者同一理由。
+    """
 
     @property
     def stop_requested(self) -> bool:
@@ -265,6 +272,7 @@ class RunRegistry:
         owner_id: str = "",
         actor_id: str = "",
         fork_checkpoint: str = "",
+        workspace: str = "",
     ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
@@ -281,6 +289,7 @@ class RunRegistry:
             owner_id: 会话所有者；认证关闭时为空串。
             actor_id: 发起本轮运行的主体标识，用于工具审计归因。
             fork_checkpoint: 分叉起点检查点 id；空串表示接着当前分支的头。
+            workspace: 本轮运行的工作区绝对路径；空串表示未声明。
 
         Returns:
             本次运行的句柄；停止请求与运行指标都通过它传递。
@@ -314,6 +323,7 @@ class RunRegistry:
                 owner_id=owner_id,
                 actor_id=actor_id,
                 fork_checkpoint=fork_checkpoint,
+                workspace=workspace,
             )
             self._running[thread_id] = handle
             # 累计运行数在此累加：这里是「一轮运行真正开始」的唯一入口，

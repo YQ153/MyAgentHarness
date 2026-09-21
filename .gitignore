@@ -18,12 +18,13 @@ venv/
 # 运行时数据：检查点数据库与会话状态
 .data/
 
-# 工作区：保留记忆模板与技能目录，忽略其余运行产物
+# 工作区：仓库里这一份只是**本机示例工作区**（示例记忆模板 + 示例用户技能），
+# 忽略其余运行产物（`.attachments/`、`_tool_outputs/`、`.skills-active/`）。
+# `workspace/` 只是仓库里的示例目录（会话的工作空间由用户在界面上任意选择，配置里不再有
+# WORKSPACE 这种默认值），因此把它的内容排除在版本控制之外，只保留两个可参考的样板。
 workspace/*
 !workspace/AGENTS.md
 !workspace/skills/
-# 内置技能随仓库交付，必须入库；否则新克隆的机器上「内置技能」这个功能不存在
-!workspace/skills-builtin/
 
 # IDE：各开发者环境配置不同，入库只会产生无意义冲突
 .idea/

@@ -69,6 +69,7 @@ _SERVICE_MODULES: frozenset[str] = frozenset(
         "skill_service",
         "usage_service",
         "workspace_service",
+        "session_registry",
         "model_catalog",
         "tool_catalog",
         "health",

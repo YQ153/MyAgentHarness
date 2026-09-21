@@ -9,10 +9,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from runtime.tool_outputs import (
-    OUTPUT_DIR_NAME,
     prune_tool_outputs,
     sanitize_tool_name,
     tool_output_path,
+    tool_output_virtual_path,
     write_tool_output,
 )
 
@@ -47,15 +47,41 @@ def test_sanitize_caps_length():
 
 
 def test_output_path_layout(tmp_path: Path):
-    path = tool_output_path(tmp_path, "abc123", 1, "execute")
+    """留存的形状：``<存储目录>/<会话 ID>/<NNNN>-<工具>.txt``。
 
-    assert path == tmp_path / OUTPUT_DIR_NAME / "abc123" / "0001-execute.txt"
+    WHY 存储目录现在由调用方给（``store_dir``）：留存已经搬出工作区、落在根外存储里，
+    「放在哪」由 ``config`` 决定；本模块只管「会话分子目录 + 定宽序号 + 清洗过的工具名」。
+    """
+    store = tmp_path / "tool-outputs"
+
+    path = tool_output_path(store, "abc123", 1, "execute")
+
+    assert path == store / "abc123" / "0001-execute.txt"
     # 序号定宽零填充 → 文件名的字典序等于时间序，清理时无需解析时间
-    assert tool_output_path(tmp_path, "abc123", 10, "execute").name > path.name
+    assert tool_output_path(store, "abc123", 10, "execute").name > path.name
+
+
+def test_virtual_path_stays_in_sync_with_the_host_path(tmp_path: Path):
+    """落盘路径与「消息里那个引用」必须同源。
+
+    WHY 单列：这是本条链路上最容易错、又最难从现场看出来的地方——落盘成功、引用也生成了，
+    只是两者指向不同位置；表现是前端点开「完整输出」时拿到 404，看起来像留存没写成功。
+    """
+    store = tmp_path / "tool-outputs"
+
+    path = tool_output_path(store, "abc123", 1, "execute")
+
+    assert tool_output_virtual_path("/_tool_outputs", "abc123", path.name) == (
+        "/_tool_outputs/abc123/0001-execute.txt"
+    )
+    # 两端必须用同一套会话 ID 清洗规则，否则目录段对不上
+    assert tool_output_virtual_path("/_tool_outputs", "my thread/1", "x.txt") == (
+        "/_tool_outputs/my_thread_1/x.txt"
+    )
 
 
 def test_write_creates_directories_and_utf8(tmp_path: Path):
-    path = tool_output_path(tmp_path, "t1", 1, "read_file")
+    path = tool_output_path(tmp_path / "store", "t1", 1, "read_file")
 
     write_tool_output(path, "中文内容\n", max_chars=1000)
 

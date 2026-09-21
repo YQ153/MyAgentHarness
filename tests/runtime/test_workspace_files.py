@@ -204,3 +204,90 @@ def test_looks_binary_by_content_not_suffix(workspace: Path):
     assert looks_binary(b"\x89PNG\r\n\x1a\n\x00\x00") is True
     # 没有空字节的文本即便后缀陌生也按文本处理：Makefile / LICENSE 都属此类
     assert looks_binary(b"all:\n\tpytest\n") is False
+
+
+# ------------------------------------------------------------------ 只读挂载点
+
+
+def test_mounts_resolve_a_virtual_path_to_its_host_directory(tmp_path: Path):
+    """带挂载表时，``/skills/...`` 解析到挂载目录而不是工作区内。
+
+    WHY 需要它：技能库、技能视图与工具留存已经搬出工作区（见 ``SessionRoot.storage_dir``），
+    面板要打开「完整输出」就必须按挂载表还原宿主路径——否则它会去工作区里找一个不存在的
+    文件，报 404。
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = tmp_path / "store"
+    (store / "code-review").mkdir(parents=True)
+    (store / "code-review" / "SKILL.md").write_text("x", encoding="utf-8")
+
+    target = resolve_in_workspace(root, "/skills/code-review/SKILL.md", mounts={"/skills/": store})
+
+    assert target == (store / "code-review" / "SKILL.md").resolve()
+
+
+def test_the_longest_mount_wins(tmp_path: Path):
+    """挂载前缀可以嵌套，必须取最长匹配。
+
+    WHY：取短的那个会把子挂载里的文件解析到父挂载点的错误位置——而两边「都存在」，
+    错误只会在读内容时才暴露。
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outer = tmp_path / "outer"
+    inner = tmp_path / "inner"
+    inner.mkdir(parents=True)
+    (inner / "team.md").write_text("x", encoding="utf-8")
+
+    target = resolve_in_workspace(
+        root, "/skills/team/team.md", mounts={"/skills/": outer, "/skills/team/": inner}
+    )
+
+    assert target == (inner / "team.md").resolve()
+
+
+def test_a_path_escaping_a_mount_is_refused(tmp_path: Path):
+    """挂载点内也要拒绝越界。
+
+    ``..`` 段在归一化阶段就被判非法（不做出「回退一级」的路径运算）；软链那种字面上完全
+    合法的逃逸由 ``resolve()`` 之后的复检发现——字符串级拦截看不出它。
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+
+    with pytest.raises(WorkspacePathError):
+        resolve_in_workspace(root, "/skills/../secret.txt", mounts={"/skills/": store})
+
+
+def test_a_symlink_escaping_a_mount_is_refused(tmp_path: Path):
+    """软链指向挂载点之外：解析后复检必须拦住它。"""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = tmp_path / "store"
+    store.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("x", encoding="utf-8")
+    try:
+        (store / "link.txt").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("本平台不允许创建软链（Windows 需要额外权限）")
+
+    with pytest.raises(WorkspacePathError, match="逃出挂载点"):
+        resolve_in_workspace(root, "/skills/link.txt", mounts={"/skills/": store})
+
+
+def test_mount_resolution_applies_to_listing_too(tmp_path: Path):
+    """列目录同样认挂载表（面板点进挂载点里的目录时用得到）。"""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = tmp_path / "store"
+    (store / "code-review").mkdir(parents=True)
+
+    listing = list_directory(root, "/skills", max_entries=10, mounts={"/skills/": store})
+
+    assert listing.path == "/skills"
+    assert [item.name for item in listing.entries] == ["code-review"]
+    assert listing.entries[0].path == "/skills/code-review"

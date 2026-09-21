@@ -116,6 +116,7 @@ class _StubRuns:
         *,
         principal: Principal | None = None,
         model_name: str | None = None,
+        workspace: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         self.stream_calls.append(
             {

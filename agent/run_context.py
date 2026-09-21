@@ -21,6 +21,7 @@ import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -65,15 +66,29 @@ class AgentRunContext:
 
     Attributes:
         user_id: 本轮运行的主体标识，决定长期记忆的命名空间。
+        workspace: 本轮运行的工作区绝对路径；空串表示「未声明」。
     """
 
     user_id: str = ANONYMOUS_USER_ID
+    workspace: str = ""
+    """本轮运行的工作区绝对路径。
+
+    WHY 要把它也带进图里：工作区在会话级可选之后，**按工作区隔离**的能力就不止文件
+    后端一个——知识库为每个工作区各存一份索引。而知识库工具是在图内被调用的，它
+    只能从这里得知「这一次该查哪个工作区的索引」；不给它，工具就会去查启动时那一个，
+    表现为「检索到的文档不是这个项目的」。
+
+    WHY 与 ``user_id`` 共用同一条通道（``Runtime.context``）而不是另起一个
+    ``ContextVar``：后者会把「这次跑在哪个工作区」变成看不见的全局状态，任何绕过
+    服务层直接调图的代码都会静默落到另一个工作区——与 ``user_id`` 那一段是同一个
+    理由，不是两个。
+    """
 
     def __post_init__(self) -> None:
-        """校验并归一主体标识。
+        """校验并归一主体标识与工作区路径。
 
         Raises:
-            ValueError: ``user_id`` 不是非空字符串。
+            ValueError: ``user_id`` 不是非空字符串，或 ``workspace`` 不是字符串。
         """
         if not isinstance(self.user_id, str) or not self.user_id.strip():
             raise ValueError(
@@ -81,6 +96,16 @@ class AgentRunContext:
             )
         if self.user_id != self.user_id.strip():
             object.__setattr__(self, "user_id", self.user_id.strip())
+        if not isinstance(self.workspace, str):
+            raise ValueError(
+                f"workspace 必须是字符串（路径），实际：{type(self.workspace).__name__}"
+            )
+        if self.workspace.strip():
+            # WHY 归一为绝对路径：知识库按「解析后的路径」做缓存键，写进来的若是相对
+            # 路径，同一个工作区会因 CWD 不同而被当成两个，索引被白白建两遍。
+            object.__setattr__(self, "workspace", str(Path(self.workspace).expanduser().resolve()))
+        elif self.workspace:
+            object.__setattr__(self, "workspace", "")
 
 
 @lru_cache(maxsize=1024)
@@ -123,6 +148,27 @@ def memory_owner_of(runtime: Any) -> str:
 def namespace_of_runtime(runtime: Any) -> tuple[str, str]:
     """``StoreBackend`` 的命名空间工厂：运行时 → 命名空间。"""
     return memory_namespace(memory_owner_of(runtime))
+
+
+def workspace_of(runtime: Any) -> str:
+    """从图运行时里取出本轮运行的工作区路径；取不到时返回空串。
+
+    WHY 全程用 ``getattr`` 兜底：与 :func:`memory_owner_of` 同一理由——图外直接调用
+    工具/Nodes 时拿不到运行时。此处**不设默认工作区**：调用方（知识库工具）拿到空串
+    必须自己决定怎么办（回落或如实报错），而不是由这里悄悄替它选一个目录。
+    替它选，就等于把「查了错的索引」变成一次静默的成功。
+
+    Args:
+        runtime: LangGraph 传入的 ``Runtime``；图外调用时为 ``None``。
+
+    Returns:
+        工作区绝对路径；运行时未携带时返回空串。
+    """
+    workspace = getattr(getattr(runtime, "context", None), "workspace", None)
+    if isinstance(workspace, str) and workspace.strip():
+        return workspace
+    logger.debug("运行时未携带工作区路径")
+    return ""
 
 
 def _namespace_component(user_id: str | None) -> str:
@@ -168,4 +214,5 @@ __all__ = [
     "memory_namespace",
     "memory_owner_of",
     "namespace_of_runtime",
+    "workspace_of",
 ]

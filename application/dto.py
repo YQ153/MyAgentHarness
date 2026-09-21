@@ -123,6 +123,62 @@ class WorkspaceFileContent(BaseModel):
     mime_type: str = Field(default="", description="据扩展名推断的 MIME 类型")
 
 
+class WorkspaceInfo(BaseModel):
+    """当前会话的文件根信息。
+
+    WHY 要把宿主机绝对路径下发给界面：根是**每条会话都可能不同**的运行时状态（用户选了
+    自己的项目，或者应用给它建了一个专属目录）。界面上不显示它，用户在浏览器里看到的那
+    棵树就成了「不知道是哪台机器上哪个目录」的一堆文件名——而「我刚才到底在改哪里」正是
+    这个面板要回答的第一个问题。
+    """
+
+    path: str = Field(description="根目录的宿主机绝对路径")
+    name: str = Field(description="目录名（用于界面标题）")
+    bound: bool = Field(
+        description=(
+            "``True`` 表示这是用户显式选定的工作空间（可容纳多条会话）；"
+            "``False`` 表示这是应用为这条会话自动创建的专属目录"
+        )
+    )
+    locked: bool = Field(
+        description="是否已锁定（产生过第一条交互之后就锁定了，此后不可更换）"
+    )
+
+
+class DirectoryEntry(BaseModel):
+    """目录列表里的一项。
+
+    WHY 只列目录：这一层的用途是「挑一个目录当工作空间」，把文件也列出来只会让用户在
+    几十个文件里找那个目标目录。文件的存在与否由选定之后的文件面板回答。
+    """
+
+    name: str = Field(description="目录名；盘符根这类没有名字的位置会退化成完整路径")
+    path: str = Field(description="绝对路径；选中时原样回传给服务端")
+
+
+class DirectoryListing(BaseModel):
+    """一次目录列表的结果。"""
+
+    path: str = Field(description="当前所在目录的绝对路径；起点页为空串")
+    parent: str | None = Field(
+        default=None, description="上一级目录；已到文件系统顶层时为 None（不能再往上）"
+    )
+    entries: list[DirectoryEntry] = Field(
+        default_factory=list, description="当前目录下的子目录（不可读时为空）"
+    )
+
+
+class WorkspacePickResult(BaseModel):
+    """一次「系统文件夹选择弹窗」的结果。
+
+    WHY 用 ``cancelled`` 而不是把取消当成错误：用户点取消什么都没做错。把它变成 4xx/5xx
+    会让界面弹一条红条，而用户只是改了主意——那条错误还会掩盖真正的失败（比如环境不支持）。
+    """
+
+    cancelled: bool = Field(description="用户是否取消了选择")
+    path: str | None = Field(default=None, description="选中的目录绝对路径；取消时为空")
+
+
 class ThreadSummary(BaseModel):
     """会话列表中的一条记录。
 
@@ -192,6 +248,13 @@ class ThreadExport(BaseModel):
     updated_at: str = Field(default="", description="来源会话最近活动时间（ISO8601 UTC）")
     exported_at: str = Field(default="", description="导出时刻（ISO8601 UTC）")
     branch_id: str = Field(default="", description="导出的是哪条分支；空串表示根分支")
+    workspace: str = Field(
+        default="",
+        description=(
+            "来源会话绑定的工作区绝对路径（**仅供人看**，不作为导入后的绑定值："
+            "它在别的机器上通常不存在，也不在对方的允许清单里）"
+        ),
+    )
     messages: list[HistoryMessage] = Field(default_factory=list, description="该分支的消息")
     notes: list[str] = Field(
         default_factory=list, description="导入方需要知道的事项，随文件一起传给对方"

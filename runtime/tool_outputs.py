@@ -8,8 +8,12 @@ WHY 不把完整正文放进事件：事件会被序列化成 SSE 发给浏览�
 把预览上限彻底废掉（一次工具调用可能是几十万字符）。因此事件里只带**引用**，
 正文落盘，由文件面板按需取。
 
-WHY 目录名以 ``_`` 开头：让它与 Agent 自己的工作产物在文件面板里一眼可辨——
-``_tool_outputs`` 是系统的旁路留存，不是任务成果。
+WHY 留存落在**根外存储**里而不是工作区里（2026-09-21 改）：它是系统的旁路记录，不是
+用户的项目文件——写进用户仓库会污染他的版本控制。落盘由服务端直接用宿主路径完成
+（不经 backend），Agent 只通过只读挂载 ``/_tool_outputs/…`` 回取正文。
+
+WHY 本模块不知道留存放在哪：它只接收「那个目录」（``store_dir``），布局由 ``config``
+决定（当前是 ``<数据目录>/roots/<根标识>/tool-outputs``）。
 """
 
 from __future__ import annotations
@@ -19,9 +23,6 @@ import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-OUTPUT_DIR_NAME = "_tool_outputs"
-"""工具输出留存目录名（位于工作区根下）。"""
 
 _SEQUENCE_WIDTH = 4
 """序号宽度：定宽零填充让文件名的字典序等于时间序，清理旧文件时才不必解析时间。"""
@@ -48,21 +49,39 @@ def sanitize_tool_name(name: str) -> str:
     return cleaned or "tool"
 
 
-def tool_output_path(root: Path, thread_id: str, sequence: int, tool_name: str) -> Path:
+def tool_output_path(store_dir: Path, thread_id: str, sequence: int, tool_name: str) -> Path:
     """算出某次工具输出的留存路径。
 
     Args:
-        root: 工作区根目录。
+        store_dir: 留存根目录（``SessionRoot.tool_output_store``）。
         thread_id: 会话标识（按会话分目录，便于整体清理）。
         sequence: 本轮内的第几次留存（从 1 开始）。
         tool_name: 工具名。
 
     Returns:
-        ``<root>/_tool_outputs/<thread_id>/0001-<tool>.txt``。
+        ``<store_dir>/<thread_id>/0001-<tool>.txt``。
     """
     safe_thread = sanitize_tool_name(thread_id) or "thread"
     filename = f"{sequence:0{_SEQUENCE_WIDTH}d}-{sanitize_tool_name(tool_name)}.txt"
-    return Path(root) / OUTPUT_DIR_NAME / safe_thread / filename
+    return Path(store_dir) / safe_thread / filename
+
+
+def tool_output_virtual_path(virtual_root: str, thread_id: str, filename: str) -> str:
+    """算出留存文件在虚拟文件系统里的路径（消息与事件里带的就是它）。
+
+    WHY 单独一个函数、而不是让调用方拼：这条路径会被**写进对话与事件**，而正文落盘走的是
+    宿主路径——两者一旦漂开，表现是前端点开「完整输出」时拿到 404，看起来像留存没写成功。
+    路径的两半（虚拟根与目录名）都由 ``config`` 给出，这里只负责拼。
+
+    Args:
+        virtual_root: 留存的虚拟根（``SessionRoot.tool_outputs_virtual``）。
+        thread_id: 会话标识（与落盘时用的是同一个清洗规则）。
+        filename: 留存文件名（``tool_output_path(...).name``）。
+
+    Returns:
+        ``/<虚拟根>/<会话 ID>/<文件名>``。
+    """
+    return f"{str(virtual_root).rstrip('/')}/{sanitize_tool_name(thread_id)}/{filename}"
 
 
 def write_tool_output(path: Path, text: str, *, max_chars: int) -> None:
@@ -123,9 +142,9 @@ def prune_tool_outputs(thread_dir: Path, *, keep: int) -> int:
 
 
 __all__ = [
-    "OUTPUT_DIR_NAME",
     "prune_tool_outputs",
     "sanitize_tool_name",
     "tool_output_path",
+    "tool_output_virtual_path",
     "write_tool_output",
 ]

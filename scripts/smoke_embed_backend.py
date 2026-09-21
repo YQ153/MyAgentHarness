@@ -161,7 +161,9 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    config = AppConfig.load() if args.backend is None else AppConfig(embedding_backend=args.backend)
+    # WHY 两个分支都走 ``load()``：工作区是必填项，直接构造在未配置时只会抛 pydantic
+    # 原文；``load()`` 给出「该写哪个变量」的提示，并顺带把目录建好。
+    config = AppConfig.load(embedding_backend=args.backend)
     print(
         f"配置：backend={config.embedding_backend} model={config.embedding_model} "
         f"dims={config.embedding_dims}"

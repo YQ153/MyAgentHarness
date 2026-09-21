@@ -85,18 +85,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.api_key_store = context.api_key_store
             app.state.context = context
             app.state.threads = context.threads
-            app.state.workspace = context.workspace
+            # WHY 只挂注册表、不挂它按启动默认值装配的那四类服务：工作区在会话级可选
+            # 之后，「文件面板 / 附件 / 技能视图 / 知识库」都是**按会话**各有一份的。
+            # 把默认工作区那一份摆在这里，等于给后续代码留了一条「顺手用全局那个」的
+            # 捷径——而它的症状是「B 会话的面板显示 A 项目的文件」，两边都不报错。
+            # 一律经 ``workspaces.services_for(...)`` 取，取错就是 AttributeError。
+            app.state.workspaces = context.workspaces
             app.state.runs = context.runs
             app.state.catalog = context.catalog
             app.state.health = context.health
             app.state.usage = context.usage
             app.state.tools = context.tools
             app.state.memories = context.memories
-            app.state.attachments = context.attachments
-            # WHY 挂的是 context 里那一个：工具侧（knowledge_runtime）取的就是它，
-            # 接口另建一份会让「工具检索得到、清单里没有」这类矛盾同时成立。
-            app.state.knowledge = context.knowledge
-            app.state.skills = context.skills
 
             logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
             yield

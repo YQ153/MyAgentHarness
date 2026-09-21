@@ -11,7 +11,8 @@ WHY 分成「职责域」与「对外契约」两段写：本层有 30 个模块
   ``run_governance`` / ``run_registry``
 - 领域能力服务：``attachment_service`` / ``knowledge_service`` /
   ``memory_service`` / ``skill_service`` / ``usage_service`` /
-  ``workspace_service`` / ``model_catalog`` / ``tool_catalog`` / ``health``
+  ``workspace_service`` / ``session_registry`` / ``model_catalog`` /
+  ``tool_catalog`` / ``health``
 - 对外契约：``dto`` / ``errors`` / ``events`` / ``ports`` / ``principal`` /
   ``audit_recorder`` / ``ownership``
 - 协议翻译与支撑：``event_translator`` / ``interrupt_codec`` / ``usage`` /

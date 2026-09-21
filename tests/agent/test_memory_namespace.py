@@ -24,7 +24,7 @@ from agent.run_context import (
     namespace_of_runtime,
 )
 from application.principal import ANONYMOUS_PRINCIPAL
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 
 def _config(tmp_path):
@@ -158,8 +158,9 @@ def test_context_strips_whitespace():
 
 def test_out_of_graph_write_lands_in_anonymous_pool(tmp_path):
     """图外写入按匿名主体归档：既不报错，也不会凭空造出一个命名空间。"""
+    config = _config(tmp_path)
     store = InMemoryStore()
-    backend = build_backend(_config(tmp_path), store)
+    backend = build_backend(config, store, scope=make_root(config))
 
     backend.write("/memories/notes.md", "hi")
 
@@ -170,8 +171,9 @@ def test_out_of_graph_write_lands_in_anonymous_pool(tmp_path):
 
 def test_memory_pools_are_isolated_per_user(tmp_path, monkeypatch):
     """同一路径下两个主体互不可见——这是「跨用户记忆泄漏」的回归线。"""
+    config = _config(tmp_path)
     store = InMemoryStore()
-    backend = build_backend(_config(tmp_path), store)
+    backend = build_backend(config, store, scope=make_root(config))
 
     monkeypatch.setattr(store_module, "get_runtime", lambda: _Runtime(AgentRunContext("alice")))
     backend.write("/memories/notes.md", "alice 的偏好")
@@ -216,7 +218,8 @@ def test_build_agent_declares_context_schema(tmp_path, monkeypatch):
         lambda **kwargs: captured.update(kwargs) or object(),
     )
 
-    build_agent(_config(tmp_path), store=InMemoryStore())
+    config = _config(tmp_path)
+    build_agent(config, scope=make_root(config), store=InMemoryStore())
 
     assert captured["context_schema"] is AgentRunContext
     assert captured["store"] is not None
@@ -226,16 +229,18 @@ def test_build_agent_requires_store(tmp_path):
     """漏传 store 必须立刻失败：静默退回内存会让长期记忆在重启后消失。"""
     from agent.graph import AgentFactory, build_agent
 
+    config = _config(tmp_path)
     with pytest.raises(ValueError, match="store"):
-        build_agent(_config(tmp_path), store=None)
+        build_agent(config, scope=make_root(config), store=None)
     with pytest.raises(ValueError, match="store"):
         AgentFactory(_config(tmp_path), store=None)
 
 
 def test_hashed_owner_reads_back_its_own_pool(tmp_path, monkeypatch):
     """散列过的标识也要能稳定读写自己的池子（否则换一种标识来源就会一写就丢）。"""
+    config = _config(tmp_path)
     store = InMemoryStore()
-    backend = build_backend(_config(tmp_path), store)
+    backend = build_backend(config, store, scope=make_root(config))
     runtime = _Runtime(AgentRunContext("auth0|abc"))
     monkeypatch.setattr(store_module, "get_runtime", lambda: runtime)
 

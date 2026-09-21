@@ -38,7 +38,7 @@ from thread_utils import normalize_thread_id
 if TYPE_CHECKING:
     from application.ports import AuditLog, ThreadMetadataReader
     from application.principal import Principal
-    from config import AppConfig
+    from config import AppConfig, SessionRoot
     from llm.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,28 @@ WHY 用 ``image_url`` 而不是 provider 私有结构：这是 LangChain / OpenA
 """
 
 
+def attachment_limits(config: AppConfig) -> AttachmentLimits:
+    """算出当前生效的附件上限。
+
+    WHY 做成模块级函数而不是只留服务方法：上限只依赖配置，与「哪个文件根」无关。独立
+    出来之后，那个纯配置查询的端点（``GET /api/attachments/limits``）可以完全绕过会话根
+    解析——否则一个只需要读配置的请求会因为「这条会话还没有根」而变成 409。
+
+    Args:
+        config: 应用配置。
+
+    Returns:
+        上限 DTO。
+    """
+    if config is None:
+        raise ValueError("config 不能为 None")
+    return AttachmentLimits(
+        max_bytes=config.attachment_max_bytes,
+        max_per_thread=config.attachment_max_per_thread,
+        allowed_mime_types=list(config.attachment_allowed_mime_types),
+    )
+
+
 class AttachmentService:
     """会话附件的上传与引用。"""
 
@@ -62,6 +84,7 @@ class AttachmentService:
         self,
         config: AppConfig,
         *,
+        scope: SessionRoot,
         registry: ModelRegistry,
         thread_store: ThreadMetadataReader,
         audit_store: AuditLog | None = None,
@@ -69,7 +92,9 @@ class AttachmentService:
         """构造服务。
 
         Args:
-            config: 应用配置，提供工作区根目录与附件各项上限。
+            config: 应用配置，提供附件各项上限。
+            scope: 本实例服务的工作区；**必填**。附件落在 ``<工作区>/.attachments/``
+                下，指向别的工作区会让「上一条消息引用的图」在新会话里找不到。
             registry: 模型注册表，用于判定目标模型是否接受图片。
             thread_store: 会话元数据存储，用于归属校验。
             audit_store: 审计存储；``None`` 表示不落审计（测试与无库场景）。
@@ -79,6 +104,8 @@ class AttachmentService:
         """
         if config is None:
             raise ValueError("config 不能为 None")
+        if scope is None:
+            raise ValueError("scope 不能为 None：附件目录建在哪个工作区由它决定")
         if registry is None:
             raise ValueError("registry 不能为 None：模型能力判定依赖它")
         if thread_store is None:
@@ -88,7 +115,7 @@ class AttachmentService:
         self._registry = registry
         self._thread_store = thread_store
         self._audit_store = audit_store
-        self._root = Path(config.workspace)
+        self._root = scope.root
         # WHY 需要一把锁：附件数上限的「检查 + 写入」之间隔着磁盘 I/O（``to_thread``
         # 会让出事件循环），并发上传会各自读到同一个旧计数而一起写入，把上限冲破。
         self._upload_lock = asyncio.Lock()
@@ -98,11 +125,7 @@ class AttachmentService:
 
     def limits(self) -> AttachmentLimits:
         """当前生效的附件上限。"""
-        return AttachmentLimits(
-            max_bytes=self._config.attachment_max_bytes,
-            max_per_thread=self._config.attachment_max_per_thread,
-            allowed_mime_types=list(self._config.attachment_allowed_mime_types),
-        )
+        return attachment_limits(self._config)
 
     async def list(self, thread_id: str, principal: Principal | None = None) -> AttachmentListResult:
         """列出某会话的附件。

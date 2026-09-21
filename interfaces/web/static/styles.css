@@ -900,6 +900,209 @@ button.small {
   color: var(--muted);
 }
 
+/*
+ * 新建会话时的文件根选择器。
+ *
+ * WHY 允许换行：侧栏很窄，而这一栏有「标签 + 当前选择 + 三个按钮」五件东西。不换行时
+ * 当前选择会被挤到只剩几十像素——而它显示的路径正是这一栏存在的理由。
+ * 排布：标签一行，当前选择一行（全宽，长路径可读），按钮一行。
+ */
+.workspace-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 当前选择：等宽 + 可换行，长路径不能被截断成看不出是哪一层 */
+.workspace-choice {
+  flex: 1 1 100%;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+  color: var(--text);
+}
+
+.workspace-choice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/*
+ * WHY 单独写一条 [hidden] 规则：上面那条 display: flex 属于**作者样式**，会盖住浏览器
+ * 对 [hidden] 的默认 display: none（作者样式优先于 UA 样式，且两者特异性相同）。缺了这
+ * 一条，JS 里的 picker.hidden = true 完全不起作用——选择器会一直挂在侧栏上。
+ */
+.workspace-picker[hidden] {
+  display: none;
+}
+
+.workspace-picker-label {
+  flex: none;
+}
+
+.workspace-picker select {
+  /* 独占一行：它显示的路径是这一栏的主要信息，不该与按钮抢宽度 */
+  flex: 1 1 100%;
+  min-width: 0;
+  font-size: 12px;
+  padding: 4px 6px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  text-overflow: ellipsis;
+}
+
+/* 只有一项可选时置灰但仍要读得清：它显示的是「这条会话将在哪」这个事实 */
+.workspace-picker select:disabled {
+  color: var(--text);
+  border-style: dashed;
+  cursor: default;
+}
+
+/* 「浏览…」入口：只在服务端配了可浏览的根时出现 */
+.workspace-browse-btn {
+  flex: none;
+  font-size: 12px;
+  padding: 3px 8px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.workspace-browse-btn:hover {
+  border-color: var(--text);
+}
+
+/* ---------------- 工作区浏览弹窗 ---------------- */
+
+.workspace-browse-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.workspace-browse-input {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 5px 8px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.workspace-browse-bar button {
+  flex: none;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.workspace-browse-bar button:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+/*
+ * 当前路径：等宽 + 可换行。路径是这里最重要的信息（决定「选中之后是哪个项目」），
+ * 截断成看不出最后一层就失去意义了。
+ */
+.workspace-browse-bar code {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.workspace-browse-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 10px;
+}
+
+.workspace-browse-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.workspace-browse-item:last-child {
+  border-bottom: 0;
+}
+
+.workspace-browse-item:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.workspace-browse-empty {
+  margin: 0;
+  padding: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.workspace-browse-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.workspace-browse-actions button {
+  font-size: 13px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.workspace-browse-actions button:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+.workspace-picker-hint {
+  margin: 0 12px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.workspace-picker-hint[hidden] {
+  display: none;
+}
+
+/* 工作区绝对路径：等宽字体 + 可换行，长路径不会被截断成看不出是哪一层 */
+.workspace-path {
+  margin: 0 0 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.workspace-path:empty {
+  display: none;
+}
+
 .workspace-body {
   display: grid;
   grid-template-columns: minmax(200px, 280px) 1fr;

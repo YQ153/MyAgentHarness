@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
-from deepagents.backends import FilesystemBackend
+from deepagents.backends import CompositeBackend, FilesystemBackend
 from deepagents.middleware.skills import (
     MAX_SKILL_DESCRIPTION_LENGTH,
     MAX_SKILL_NAME_LENGTH,
@@ -32,7 +32,7 @@ from deepagents.middleware.skills import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -167,14 +167,21 @@ def _validate(name: str, directory: str, description: str) -> tuple[str, ...]:
 
 
 def inspect_skills(
-    workspace_root: Path, sources: Sequence[str], *, backend: object | None = None
+    workspace_root: Path,
+    sources: Sequence[str],
+    *,
+    backend: object | None = None,
+    mounts: Mapping[str, Path] | None = None,
 ) -> SkillInventory:
     """列出来源目录下的技能包并给出诊断。
 
     Args:
-        workspace_root: 工作区根目录；``sources`` 是相对它的虚拟路径。
+        workspace_root: 工作区根目录；工作区内的来源以相对它的虚拟路径表示。
         sources: 来源目录（如 ``["/skills"]``）。空列表直接返回空结果——不构造 backend。
         backend: 复用的 backend；``None`` 表示自建一个只读的文件系统视图。
+        mounts: 「虚拟路径前缀 → 宿主机目录」的挂载表，用于工作区**之外**的来源
+            （随应用交付的内置技能就是这种）。缺了它，区外来源会一个都读不到，
+            且没有任何告警。
 
     Returns:
         巡检结果；**任何单个技能的问题都不会让整次巡检失败**（与上游一致：
@@ -188,7 +195,7 @@ def inspect_skills(
     if not normalized:
         return SkillInventory(packages=(), load_errors=(), sources=())
 
-    view = backend if backend is not None else FilesystemBackend(root_dir=workspace_root, virtual_mode=True)
+    view = backend if backend is not None else _build_view(workspace_root, mounts)
     middleware = SkillsMiddleware(backend=view, sources=list(normalized))  # type: ignore[arg-type]
 
     # WHY 直接调 before_agent：它是中间件真正「读一次技能」的入口，且返回结构里就带着
@@ -221,9 +228,9 @@ def inspect_skills(
     # **每一个被丢掉的候选都被报出来**。
     loaded_directories = {package.directory for package in packages}
     unloadable = tuple(
-        UnloadableSkill(directory=directory, reason=_diagnose_reason(workspace_root, directory))
-        for directory in _candidate_directories(workspace_root, normalized)
-        if directory not in loaded_directories
+        UnloadableSkill(directory=virtual, reason=_diagnose_reason(host_dir))
+        for virtual, host_dir in _candidate_directories(workspace_root, normalized, mounts)
+        if virtual not in loaded_directories
     )
 
     logger.debug(
@@ -260,16 +267,76 @@ def _normalize_sources(sources: Sequence[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _candidate_directories(workspace_root: Path, sources: Sequence[str]) -> list[str]:
+def _build_view(
+    workspace_root: Path, mounts: Mapping[str, Path] | None
+) -> FilesystemBackend | CompositeBackend:
+    """构造技能巡检用的只读虚拟视图（工作区默认根 + 区外来源的挂载路由）。
+
+    WHY 区外来源必须挂载：backend 的根是工作区，而随应用交付的内置技能在工作区
+    之外。挂上虚拟路径后，巡检与上游加载用的是**同一套路径语义**；不挂的话它一个
+    都读不到，且没有任何告警——表现为「内置技能装了却用不上」。
+    """
+    default = FilesystemBackend(root_dir=workspace_root, virtual_mode=True)
+    if not mounts:
+        return default
+    return CompositeBackend(
+        default=default,
+        routes={
+            prefix: FilesystemBackend(root_dir=host_dir, virtual_mode=True)
+            for prefix, host_dir in mounts.items()
+        },
+    )
+
+
+def _host_dir_of(
+    workspace_root: Path, source: str, mounts: Mapping[str, Path] | None
+) -> Path | None:
+    """把一个来源虚拟路径还原成宿主机目录；不属于任何来源时返回 ``None``。
+
+    WHY 取最长匹配而不是第一个命中：来源可以嵌套（``/skills`` 与 ``/skills/team``），
+    取短的会把团队技能当成基础目录下的技能，而它的真实位置不是那里。
+    """
+    normalized = "/" + source.strip("/")
+    best_length = -1
+    best: Path | None = None
+    for prefix, host_dir in (mounts or {}).items():
+        virtual = "/" + prefix.strip("/")
+        if normalized == virtual:
+            candidate = host_dir
+        elif normalized.startswith(virtual + "/"):
+            candidate = host_dir / normalized[len(virtual) + 1 :]
+        else:
+            continue
+        if len(virtual) > best_length:
+            best_length = len(virtual)
+            best = candidate
+    if best is not None:
+        return best
+    if not normalized.strip("/"):
+        return None
+    return workspace_root / normalized.strip("/")
+
+
+def _candidate_directories(
+    workspace_root: Path, sources: Sequence[str], mounts: Mapping[str, Path] | None
+) -> list[tuple[str, Path]]:
     """列出「看起来是技能目录」的候选（含 SKILL.md 的一级子目录）。
 
-    WHY 走真实文件系统而不是 backend：候选枚举只是拿来做差集，工作区的技能本就是真实
-    文件；为此再抽象一层「列出远端存储的一级子目录」没有收益。真正决定「能不能加载」
-    的仍是上游。
+    WHY 走真实文件系统而不是 backend：候选枚举只是拿来做差集，技能包本就是真实文件；
+    为此再抽象一层「列出远端存储的一级子目录」没有收益。真正决定「能不能加载」的仍是上游。
+
+    WHY 同时返回虚拟路径与宿主机目录：虚拟路径是给用户看的（与清单里其余路径同一口径），
+    宿主机目录是诊断读 ``SKILL.md`` 时用的——两者在区外来源上不再相等，只回其中一个
+    都会在另一处再算一遍。
+
+    Returns:
+        ``(虚拟路径, 宿主机目录)`` 列表；来源目录不存在时该来源整体跳过。
     """
-    candidates: list[str] = []
+    candidates: list[tuple[str, Path]] = []
     for source in sources:
-        base = workspace_root / source.strip("/")
+        base = _host_dir_of(workspace_root, source, mounts)
+        if base is None:
+            continue
         try:
             children = sorted(base.iterdir())
         except OSError:
@@ -280,11 +347,11 @@ def _candidate_directories(workspace_root: Path, sources: Sequence[str]) -> list
                     continue
             except OSError:
                 continue
-            candidates.append(f"{source.rstrip('/')}/{child.name}")
+            candidates.append((f"{source.rstrip('/')}/{child.name}", child))
     return candidates
 
 
-def _diagnose_reason(workspace_root: Path, directory: str) -> str:
+def _diagnose_reason(skill_dir: Path) -> str:
     """给出「这个候选为什么没被加载」的**启发式**原因。
 
     WHY 只做文本级判断、不解析 YAML：权威的加载判定在上游，这里只负责把最常见的原因
@@ -292,9 +359,7 @@ def _diagnose_reason(workspace_root: Path, directory: str) -> str:
     先过时，症状都是「面板说没问题、Agent 却加载不了」。
     """
     try:
-        text = (workspace_root / directory.strip("/") / _SKILL_FILE).read_text(
-            encoding="utf-8", errors="replace"
-        )
+        text = (skill_dir / _SKILL_FILE).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return f"读取 SKILL.md 失败：{type(exc).__name__}"
 

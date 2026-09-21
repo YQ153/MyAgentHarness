@@ -61,7 +61,15 @@ _BOUNDARIES: dict[str, frozenset[str]] = {
     # text_utils 是后加的（2026-09-20）：两个插件原本各写一份截断判断，
     # 收敛到中立模块后多出这条边。它不破坏角色——text_utils 自身零仓库内依赖
     # （见上面的中立叶子条目），与已在允许集里的 config / web_safety 同类。
-    "knowledge_tools": frozenset({"agent", "config", "knowledge_runtime", "text_utils"}),
+    #
+    # application 是后加的（2026-09-21）：工作区改为会话级之后，工具要知道「本轮该查哪个
+    # 工作区的索引」，于是从 ``AgentRunContext`` 读工作区，并把知识库服务作为返回类型
+    # 标注出来。那条 import 在 ``if TYPE_CHECKING:`` 里——它只描述类型、不产生任何
+    # 运行期依赖，因此**不构成**上面那条红线（插件仍不能真的去摸应用层对象：
+    # 它拿到的服务实例由知识库句柄给出，归属校验与审计仍在那条路径上）。
+    "knowledge_tools": frozenset(
+        {"agent", "application", "config", "knowledge_runtime", "text_utils"}
+    ),
     "web_tools": frozenset({"agent", "config", "text_utils", "web_safety"}),
     # 入口分发：解析参数后交给适配器，装配由 interfaces -> bootstrap 完成。
     # 若入口自己装配，契约 6 想避免的「第二套组装」会从 main.py 长回来。

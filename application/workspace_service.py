@@ -37,7 +37,7 @@ from runtime.workspace_files import (
 if TYPE_CHECKING:
     from application.ports import AuditLog
     from application.principal import Principal
-    from config import AppConfig
+    from config import AppConfig, SessionRoot
 
 logger = logging.getLogger(__name__)
 
@@ -54,23 +54,38 @@ _BYTES_PER_CHAR = 4
 class WorkspaceService:
     """工作区文件的只读访问。"""
 
-    def __init__(self, config: AppConfig, *, audit_store: AuditLog | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        scope: SessionRoot,
+        audit_store: AuditLog | None = None,
+    ) -> None:
         """构造服务。
 
         Args:
-            config: 应用配置，提供工作区根目录与各项上限。
+            config: 应用配置，提供各项上限。
+            scope: 本实例服务的工作区；**必填**。面板展示的必须正是 Agent 读写的那片
+                目录，指向别处会让「Agent 写了但面板看不见」与「面板看到的其实不是
+                这个项目」同时成立。
             audit_store: 审计存储；``None`` 表示不落审计（测试与无库场景）。
 
         Raises:
-            ValueError: ``config`` 为 ``None``。
+            ValueError: ``config`` 或 ``scope`` 为 ``None``。
         """
         if config is None:
             raise ValueError("config 不能为 None")
+        if scope is None:
+            raise ValueError("scope 不能为 None：面板的根由它决定")
 
         self._config = config
-        self._root = Path(config.workspace)
+        self._root = scope.root
+        # WHY 带上挂载表：技能库、技能视图与工具输出留存住在工作区之外，由只读挂载暴露在
+        # 固定虚拟路径下。面板要能打开「完整输出」（``/_tool_outputs/…``）就得按这张表解析
+        # ——否则那条路径会被当成工作区内的相对路径，读到一个不存在的文件（404）。
+        self._mounts = scope.mount_table
         self._audit_store = audit_store
-        logger.info("WorkspaceService 就绪：root=%s", self._root)
+        logger.info("WorkspaceService 就绪：root=%s mounts=%d", self._root, len(self._mounts))
 
     async def list_dir(
         self, virtual_path: str = "/", principal: Principal | None = None
@@ -95,6 +110,7 @@ class WorkspaceService:
                 self._root,
                 virtual_path,
                 max_entries=self._config.workspace_list_max_entries,
+                mounts=self._mounts,
             )
         except FileNotFoundError as exc:
             raise NotFoundError("目录", virtual_path) from exc
@@ -147,7 +163,9 @@ class WorkspaceService:
 
         # 路径校验必须在读取之前单独走一次：``read_bytes_capped`` 只认真实路径，
         # 把「解析交给它」会让逃逸路径在打开文件那一刻才被发现。
-        target = await asyncio.to_thread(resolve_in_workspace, self._root, virtual_path)
+        target = await asyncio.to_thread(
+            resolve_in_workspace, self._root, virtual_path, mounts=self._mounts
+        )
 
         exists = await asyncio.to_thread(target.exists)
         if not exists:

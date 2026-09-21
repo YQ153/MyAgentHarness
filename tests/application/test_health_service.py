@@ -22,7 +22,7 @@ from tests.application.test_run_service import (
     FakeGraphFactory,
     _drain,
 )
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 @dataclass(frozen=True)
@@ -117,6 +117,7 @@ def _make_health(
         config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(graph or FakeGraph()),
+        workspaces=StubSessionRegistry(config),
     )
     service = HealthService(
         config,
@@ -137,6 +138,7 @@ async def test_constructor_rejects_none_deps(test_config, thread_store):
         test_config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(FakeGraph()),
+        workspaces=StubSessionRegistry(test_config),
     )
 
     with pytest.raises(ValueError):

@@ -22,6 +22,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
@@ -90,7 +91,9 @@ CREATE TABLE IF NOT EXISTS thread_meta (
     turn_count    INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
     archived_at   TEXT NOT NULL DEFAULT '',
-    tags          TEXT NOT NULL DEFAULT ''
+    tags          TEXT NOT NULL DEFAULT '',
+    workspace     TEXT NOT NULL DEFAULT '',
+    workspace_bound INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
@@ -145,11 +148,23 @@ _MIGRATIONS = [
     """
     ALTER TABLE thread_meta ADD COLUMN tags TEXT NOT NULL DEFAULT '';
     """,
+    # 会话的**文件根**（用户绑定的工作空间，或应用为它创建的专属目录）；空串表示
+    # 「尚未确定」——它只在会话还没有产生过任何交互时出现，第一轮交互会把它写死。
+    """
+    ALTER TABLE thread_meta ADD COLUMN workspace TEXT NOT NULL DEFAULT '';
+    """,
+    # 这个根是「用户显式选的工作空间」（1）还是「应用为它建的专属目录」（0）。
+    # WHY 单独存一列而不是从路径形状推断：界面要靠它区分文案（「工作空间：…」还是
+    # 「会话专属目录：…」），而路径本身不携带这个信息——用户完全可以把工作空间选在
+    # sessions 目录里面。
+    """
+    ALTER TABLE thread_meta ADD COLUMN workspace_bound INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 _COLUMNS = (
     "thread_id, owner_id, title, created_at, updated_at, turn_count, "
-    "archived, archived_at, current_branch, tags"
+    "archived, archived_at, current_branch, tags, workspace, workspace_bound"
 )
 
 _MAX_TAG_CHARS = 32
@@ -319,6 +334,28 @@ def _normalize_title(title: str | None) -> str:
     return build_title(title, _MAX_TITLE_CHARS)
 
 
+def _normalize_workspace(workspace: str | None) -> str:
+    """归一会话绑定的工作区路径。
+
+    WHAT：空值/空白 → 空串（表示「用启动默认值」）；否则展开为用户目录下的绝对路径。
+
+    WHY 在此归一而不是原样存：这一列是**路径相等性**的判据——「这个会话绑的是不是我
+    请求的那个工作区」全靠字符串比较。``./proj`` 与 ``C:\\proj`` 指向同一目录却字面
+    不同，会让同一条会话看起来「换了工作区」，进而被服务层判成冲突（或更糟：被放行
+    到另一个根）。存储层只做归一，不做校验（清单判定属于配置层）。
+
+    Raises:
+        ValueError: 取值不是字符串。
+    """
+    if workspace is None:
+        return ""
+    if not isinstance(workspace, str):
+        raise ValueError(f"workspace 必须是字符串，实际：{type(workspace).__name__}")
+    if not workspace.strip():
+        return ""
+    return str(Path(workspace).expanduser().resolve())
+
+
 class ThreadMetaStore:
     """会话元数据的读写门面。
 
@@ -370,6 +407,8 @@ class ThreadMetaStore:
         *,
         title: str = "",
         owner_id: str = "",
+        workspace: str = "",
+        workspace_bound: bool = False,
     ) -> dict[str, Any]:
         """登记一个新会话；已存在时保持原记录不变（幂等）。
 
@@ -377,6 +416,8 @@ class ThreadMetaStore:
             thread_id: 会话 ID。
             title: 初始标题，空串表示尚未命名。
             owner_id: 会话所有者标识；认证关闭时为空串。
+            workspace: 会话的文件根绝对路径；空串表示尚未确定（会话尚未产生交互）。
+            workspace_bound: 该根是否由用户显式选定。
 
         Returns:
             该会话的完整元数据字典。
@@ -388,17 +429,28 @@ class ThreadMetaStore:
         """
         normalized_id = self._validate_thread_id(thread_id)
         normalized_title = _normalize_title(title)
+        normalized_workspace = _normalize_workspace(workspace)
         now = _utc_now()
 
         async with self._lock:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    INSERT INTO thread_meta
+                        (thread_id, owner_id, title, created_at, updated_at,
+                         turn_count, workspace, workspace_bound)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                     ON CONFLICT(thread_id) DO NOTHING
                     """,
-                    (normalized_id, owner_id, normalized_title, now, now),
+                    (
+                        normalized_id,
+                        owner_id,
+                        normalized_title,
+                        now,
+                        now,
+                        normalized_workspace,
+                        int(workspace_bound),
+                    ),
                 ) as cursor:
                     inserted = cursor.rowcount > 0
                 await self._conn.commit()
@@ -409,7 +461,12 @@ class ThreadMetaStore:
         if not inserted:
             logger.warning("会话已登记，保持原记录：thread=%s", normalized_id)
         else:
-            logger.info("会话已登记：thread=%s", normalized_id)
+            logger.info(
+                "会话已登记：thread=%s root=%s bound=%s",
+                normalized_id,
+                normalized_workspace,
+                workspace_bound,
+            )
 
         record = await self.get(normalized_id)
         if record is None:
@@ -425,6 +482,8 @@ class ThreadMetaStore:
         title_hint: str | None = None,
         turn_delta: int = 1,
         owner_id: str = "",
+        workspace: str = "",
+        workspace_bound: bool = False,
     ) -> dict[str, Any] | None:
         """记录一轮对话：刷新活动时间、累加轮次，并在标题为空时补写标题。
 
@@ -432,11 +491,18 @@ class ThreadMetaStore:
         同时保证「未登记过的会话」（例如历史遗留数据）也能被自动补齐，
         而不是在列表里凭空消失。
 
+        WHY 顺带把「这条会话的文件根」一并写死（下面 SQL 里的 CASE 只在为空时生效）：
+        根一旦确定就不再改变，而**第一轮交互就是它确定的时刻**——这条规则与「会话创建
+        时可以选择工作空间」合起来，正好实现「选定后产生第一条交互即永久锁定」。放在这
+        条 UPSERT 里是顺带，不需要第二趟写入，也就没有「两趟之间失败」的中间态。
+
         Args:
             thread_id: 会话 ID。
             title_hint: 用于生成标题的原始文本；为 ``None`` 时不改动标题。
             turn_delta: 本轮新增的对话轮次，恢复执行传 0（同一次运行的延续）。
             owner_id: 新建会话时的所有者；已存在会话不会被覆盖所有者。
+            workspace: 本条会话的文件根绝对路径；**已有取值的会话不会被改写**。
+            workspace_bound: 该根是否由用户显式选定；同样只在首次写入时生效。
 
         Returns:
             更新后的元数据；``None`` 表示该会话此前未登记且本次未能写入。
@@ -452,14 +518,17 @@ class ThreadMetaStore:
             raise ValueError(f"turn_delta 必须在 0..{_MAX_TURN_DELTA} 之间，实际：{turn_delta}")
 
         normalized_title = _normalize_title(title_hint)
+        normalized_workspace = _normalize_workspace(workspace)
         now = _utc_now()
 
         async with self._lock:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO thread_meta
+                        (thread_id, owner_id, title, created_at, updated_at,
+                         turn_count, workspace, workspace_bound)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         turn_count = thread_meta.turn_count + ?,
@@ -471,6 +540,16 @@ class ThreadMetaStore:
                             WHEN thread_meta.owner_id = '' OR thread_meta.owner_id IS NULL
                                 THEN excluded.owner_id
                             ELSE thread_meta.owner_id
+                        END,
+                        workspace = CASE
+                            WHEN thread_meta.workspace = '' OR thread_meta.workspace IS NULL
+                                THEN excluded.workspace
+                            ELSE thread_meta.workspace
+                        END,
+                        workspace_bound = CASE
+                            WHEN thread_meta.workspace = '' OR thread_meta.workspace IS NULL
+                                THEN excluded.workspace_bound
+                            ELSE thread_meta.workspace_bound
                         END
                     """,
                     (
@@ -480,6 +559,8 @@ class ThreadMetaStore:
                         now,
                         now,
                         turn_delta,
+                        normalized_workspace,
+                        int(workspace_bound),
                         turn_delta,
                     ),
                 ) as cursor:

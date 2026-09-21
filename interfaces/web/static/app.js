@@ -60,8 +60,23 @@
     memoryRefresh: document.getElementById('memory-refresh'),
     memoryList: document.getElementById('memory-list'),
     workspaceOpen: document.getElementById('workspace-open'),
+    workspacePicker: document.getElementById('workspace-picker'),
+    workspaceChoiceText: document.getElementById('workspace-choice'),
+    workspaceClear: document.getElementById('workspace-clear'),
+    workspacePick: document.getElementById('workspace-pick'),
+    workspacePickStatus: document.getElementById('workspace-pick-status'),
+    workspaceBrowseOpen: document.getElementById('workspace-browse'),
+    workspaceBrowseModal: document.getElementById('workspace-browse-modal'),
+    workspaceBrowseClose: document.getElementById('workspace-browse-close'),
+    workspaceBrowseInput: document.getElementById('workspace-browse-input'),
+    workspaceBrowseGo: document.getElementById('workspace-browse-go'),
+    workspaceBrowseUp: document.getElementById('workspace-browse-up'),
+    workspaceBrowsePath: document.getElementById('workspace-browse-path'),
+    workspaceBrowseList: document.getElementById('workspace-browse-list'),
+    workspaceBrowseUse: document.getElementById('workspace-browse-use'),
     workspaceModal: document.getElementById('workspace-modal'),
     workspaceClose: document.getElementById('workspace-close'),
+    workspacePath: document.getElementById('workspace-path'),
     workspaceTree: document.getElementById('workspace-tree'),
     workspacePreview: document.getElementById('workspace-preview'),
     knowledgeOpen: document.getElementById('knowledge-open'),
@@ -103,12 +118,43 @@
     threadFilter: { query: '', includeArchived: false },
     memories: { items: [], truncated: false },
     /**
-     * 工作区目录树状态。
+     * 工作区目录树状态（含根作用域代号 ``generation``）。
      *
      * WHY 只存「已加载的目录」而不是整棵树：面板按需展开下一层，未展开的目录
      * 不该存在于客户端状态里——否则「树」与「服务端实际情况」就有两份真相。
+     *
+     * WHY 它由 WorkspaceScope 造而不是写成一个字面量：这四份缓存**只对一条会话的根成立**
+     * （``dirs`` 甚至按虚拟路径缓存，而 ``/`` 在两条会话下都合法却指向不同目录），换会话
+     * 必须整份丢掉。把「它长什么样」交给那个模块，规则与它的用例就是同一份定义。
      */
-    workspace: { dirs: {}, expanded: {}, selected: null, text: null },
+    workspace: WorkspaceScope.begin(null),
+    /**
+     * 本次新建会话选择的工作空间；``null`` 表示**不绑定**。
+     *
+     * WHY 选择只存在本地、直到首条消息才交给服务端：文件根在会话真正确立的那一刻锁定
+     * （服务端以首条消息上的取值为准）。草稿态还不存在会话，此时提交只会造出一条
+     * 「有根但没有内容」的记录。
+     *
+     * WHY 用 ``null`` 而不是某个默认路径表示「不绑定」：不绑定是一种**正常结果**——
+     * 这条会话将使用应用为它创建的专属目录，而不是退回某个项目目录。给一个默认路径，
+     * 等于把「用户没选」偷偷变成「用户选了配置里那个」，而两者本该落到不同的根上。
+     */
+    workspaceChoice: null,
+    /**
+     * 浏览弹窗的当前一层：``{path, parent, roots, entries}``。
+     *
+     * WHY 只存一层而不是把走过的路都留下：服务端每一步都重新算（它才是边界的所有者，
+     * 而且目录可能随时被删）。客户端缓存整棵树只会造出第二份事实。
+     */
+    workspaceBrowse: { path: '', parent: null, roots: [], entries: [] },
+    /**
+     * 是否正在等系统文件夹弹窗返回。
+     *
+     * WHY 需要它：这一步要等用户关掉一个**在服务端屏幕上**的窗口（最长几分钟），期间
+     * 请求是挂着的。不锁住按钮，用户会以为没反应而连点，于是服务端叠出第二个对话框
+     * ——而他并不知道自己开了两个。
+     */
+    workspacePickPending: false,
     /** 编辑态：待改写的用户消息下标；null 表示正常发送新消息。 */
     editTarget: null,
     /** 正在查看的分支标识；null 表示会话的当前分支。 */
@@ -169,6 +215,29 @@
     const now = new Date();
     if (date.toDateString() === now.toDateString()) return clock;
     return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${clock}`;
+  }
+
+  /**
+   * 给面板类请求补上「看哪个工作区」。
+   *
+   * WHY 需要这一层：工作区在会话级可选之后，文件面板、附件、技能与知识库都按工作区
+   * 各有一份。不带这个参数，服务端只能按启动默认工作区作答——于是 B 会话的面板显示
+   * A 项目的文件，而两边都不会报错，用户只会发现「Agent 说改好了，面板里看不到」。
+   *
+   * 有会话时带 `thread_id`（服务端按绑定值解析，此时**不能**再带 workspace：一旦与
+   * 绑定值不同就会被 409 拒绝）；草稿态带 `workspace`（这条会话还没绑定，取用户当前的
+   * 选择）——两种情形互相排斥，正是这里分叉的原因。
+   *
+   * WHY 统一走一个函数而不是各调用点自己拼：本文件有近十处面板请求，漏一处的表现是
+   * 「某一个面板指向了别的项目」——这正是最不容易被联想到调用点的一类症状。
+   */
+  function scoped(path) {
+    const separator = path.includes('?') ? '&' : '?';
+    if (state.threadId) {
+      return path + separator + 'thread_id=' + encodeURIComponent(state.threadId);
+    }
+    if (!state.workspaceChoice) return path;
+    return path + separator + 'workspace=' + encodeURIComponent(state.workspaceChoice);
   }
 
   async function api(path, options) {
@@ -266,6 +335,10 @@
   function startDraft() {
     state.threadId = null;
     state.assistantEl = null;
+    // 回到草稿态 = 要新建会话，此时工作区**尚未**绑定，选择器该出现（若有多项可选）
+    renderWorkspacePicker();
+    // 退回草稿态同样换了根（落回「本次选定的工作空间」，或还没有根）。
+    syncWorkspaceScope();
     state.toolNodes = [];
     els.messages.innerHTML = '';
     els.messages.appendChild(
@@ -488,6 +561,10 @@
     state.editTarget = null;
     els.messages.innerHTML = '';
     markActiveThread();
+    // 打开既有会话 = 工作区已经绑定且不可变更，选择器该收起来（路径改在「工作区」面板里看）
+    renderWorkspacePicker();
+    // 换会话就是换文件根：面板的路径、悬停提示、目录树与预览都必须跟着这条会话走。
+    syncWorkspaceScope();
 
     try {
       const response = await api(historyUrl(threadId));
@@ -1057,19 +1134,24 @@
     });
   }
 
-  async function uploadOne(threadId, entry) {
+  async function uploadOne(threadId, entry, workspace) {
     const form = new FormData();
     form.append('file', entry.file, entry.file.name);
     // WHY 不手写 Content-Type：multipart 的 boundary 必须由浏览器生成，自己拼头
     // 会得到一个缺 boundary 的类型串，服务端解析直接失败。
-    const response = await api(`/api/threads/${threadId}/attachments`, {
+    //
+    // WHY 上传时要带上工作区：附件是在**首条消息之前**上传的，那一刻会话还没绑定工作区，
+    // 服务端只能按启动默认值落盘——而这条会话可能运行在另一个工作区里，附件当场失效
+    // （「附件不存在」，而它明明刚上传成功）。带上选择值之后，上传与运行落在同一个根上。
+    const query = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+    const response = await api(`/api/threads/${threadId}/attachments${query}`, {
       method: 'POST',
       body: form,
     });
     return response.json();
   }
 
-  async function uploadPendingAttachments(threadId) {
+  async function uploadPendingAttachments(threadId, workspace) {
     const pending = state.attachments.filter((entry) => !entry.id);
     for (const entry of pending) {
       if (entry.status === 'failed') {
@@ -1078,7 +1160,7 @@
       entry.status = 'uploading';
       renderAttachmentStrip();
       try {
-        const info = await uploadOne(threadId, entry);
+        const info = await uploadOne(threadId, entry, workspace);
         entry.id = info.id;
         entry.status = 'uploaded';
       } catch (err) {
@@ -1155,7 +1237,7 @@
       if (!target) continue;
       try {
         const response = await api(
-          '/api/workspace/file?path=' + encodeURIComponent(refs[index].path)
+          scoped('/api/workspace/file?path=' + encodeURIComponent(refs[index].path))
         );
         const payload = await response.json();
         if (payload.kind === 'image' && payload.text) {
@@ -1176,6 +1258,12 @@
     const content = els.input.value.trim();
     if (!content) return;
 
+    // WHY 在 ensureThread 之前读：它会把 state.threadId 填上，之后就分不清
+    // 「这条会话是刚新建的」与「已有会话」了。而这个区分决定了要不要把工作区选择
+    // 交给服务端——工作区只在**首条消息**上绑定，后续轮次带上它只会撞 409。
+    const drafting = !state.threadId;
+    const workspace = drafting ? state.workspaceChoice : null;
+
     setRunning(true);
     try {
       // WHY 先申请再渲染用户气泡：申请失败时输入内容仍留在输入框里，
@@ -1194,7 +1282,7 @@
       let attachmentIds = [];
       let sentAttachments = [];
       if (editing === null && state.attachments.length) {
-        attachmentIds = await uploadPendingAttachments(state.threadId);
+        attachmentIds = await uploadPendingAttachments(state.threadId, workspace);
         sentAttachments = state.attachments.slice();
       }
 
@@ -1211,6 +1299,8 @@
               content: content,
               model: els.modelSelect.value || null,
               attachment_ids: attachmentIds,
+              // 只在新会话的首条消息上带：服务端以它作为这条会话的绑定值
+              workspace: workspace,
             }
           : {
               message_index: editing,
@@ -1848,7 +1938,7 @@
     els.knowledgeList.innerHTML = '';
     els.knowledgeList.appendChild(el('div', 'knowledge-empty', '加载中…'));
     try {
-      const response = await api('/api/knowledge');
+      const response = await api(scoped('/api/knowledge'));
       state.knowledge = await response.json();
       renderKnowledge();
     } catch (err) {
@@ -1925,7 +2015,7 @@
     // 多份相同的工作，而它们之间没有任何互斥。
     els.knowledgeIndex.disabled = true;
     try {
-      const response = await api('/api/knowledge', {
+      const response = await api(scoped('/api/knowledge'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -1957,7 +2047,9 @@
     try {
       // WHY 用查询参数而不是路径段：虚拟路径本身含 `/`，放进路径段要靠百分号编码
       // 才能传对，而那正是最容易写错、且在日志里最难辨认的写法。
-      await api(`/api/knowledge?path=${encodeURIComponent(item.source_path)}`, { method: 'DELETE' });
+      await api(scoped(`/api/knowledge?path=${encodeURIComponent(item.source_path)}`), {
+      method: 'DELETE',
+    });
       await loadKnowledge();
     } catch (err) {
       window.alert(`移除失败：${err.message}`);
@@ -2001,7 +2093,7 @@
     els.skillsList.innerHTML = '';
     els.skillsList.appendChild(el('div', 'knowledge-empty', '加载中…'));
     try {
-      const response = await api('/api/skills');
+      const response = await api(scoped('/api/skills'));
       state.skills = await response.json();
       renderSkills();
     } catch (err) {
@@ -2109,7 +2201,7 @@
       return;
     }
     try {
-      await api(`/api/skills/${encodeURIComponent(item.name)}`, {
+      await api(scoped(`/api/skills/${encodeURIComponent(item.name)}`), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
@@ -2136,8 +2228,225 @@ function formatSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * 渲染这条会话的文件根（路径 + 它属于哪一类）。
+ *
+ * WHY 每次打开面板都重取而不是首屏取一次：根是**会话级**状态（用户选的项目，或应用为
+ * 这条会话建的专属目录），而页面可以比会话活得久——缓存一次会让面板显示一个已经不再
+ * 生效的目录，而「我到底在改哪里」正是这个面板要回答的第一个问题。
+ *
+ * WHY 要区分「工作空间」与「会话专属目录」：两者的路径形态可能很像，但含义完全不同——
+ * 前者是你的项目目录（多条会话可共用），后者只有这条会话在用。混在一起说，用户会以为
+ * 自己一直在改自己的项目。
+ */
+async function loadWorkspaceInfo() {
+  const generation = state.workspace.generation;
+  try {
+    const response = await api(scoped('/api/workspace/info'));
+    const payload = await response.json();
+    // 期间换过会话：这份结果说的是**上一条**会话的根，写上去会让顶栏提示与事实相反。
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
+    const label = payload.bound ? '工作空间' : '会话专属目录';
+    // 锁定是用户最需要知道的一条事实：它解释了「为什么换不了」。
+    const lockNote = payload.locked ? '（已锁定：本条会话不再支持更换）' : '';
+    els.workspacePath.textContent = payload.path
+      ? `${label}：${payload.path}${lockNote}`
+      : '';
+    els.workspacePath.title = payload.path || '';
+    // 顶栏入口也带上路径：面板不打开时，悬停是确认「现在在改哪个目录」最省事的路径。
+    els.workspaceOpen.title = payload.path ? `${label}：${payload.path}` : '工作区';
+  } catch (err) {
+    // 期间换过会话：这条失败说的是上一条会话的根，写上去会让用户以为**当前**这条读取失败。
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
+    // 409 的两种含义都是**正常形态**而不是故障：草稿态且没选工作空间（还没有根）、
+    // 或这条会话选定的目录不见了。把它们统一说成「读取失败」会让用户去查网络，
+    // 而该做的是选一个工作空间 / 把那个目录恢复回来——服务端给的文案里已经写明了。
+    const text = err.status === 409 ? err.message : `文件根读取失败：${err.message}`;
+    // WHY 降级为一行提示而不是弹错：路径显示失败不该挡住目录树本身——
+    // 面板的主要用途（看 Agent 产出了什么）仍然可用。
+    els.workspacePath.textContent = text;
+    els.workspacePath.title = '';
+    els.workspaceOpen.title = `工作区（${text}）`;
+  }
+}
+
+/**
+ * 把工作区相关的界面切到**当前会话**的根上。
+ *
+ * WHY 换会话时必须调用它：根是会话级状态，而这里的界面状态有四份——面板里的路径文案、
+ * 顶栏悬停提示、按虚拟路径缓存的目录树、以及文件预览。``dirs`` 是按**虚拟路径**缓存的
+ * （``/``、``/src``），而服务端对每个根都从 ``/`` 开始编号：于是切到 B 之后，
+ * ``openWorkspaceModal`` 会因为 ``dirs['/']`` 命中缓存而**不再请求**、直接重画，
+ * 面板就变成「左上角写着 B 的路径、右边列着 A 的文件」，全程不报错。
+ *
+ * WHY 收成一个函数而不是在切换的两处各写一遍：切换有两条路径（打开既有会话、
+ * 退回草稿态），而这份清理漏掉任何一处，都只有在特定顺序下点界面才会暴露。
+ */
+function syncWorkspaceScope() {
+  // 先换作用域再发请求：在途的旧请求回来时会发现自己的代号过期，自己丢弃结果。
+  state.workspace = WorkspaceScope.begin(state.workspace);
+  clearWorkspacePreview();
+  loadWorkspaceInfo();
+  // 面板没开就不发目录请求：它下次打开时会自己取（``openWorkspaceModal``）。
+  if (els.workspaceModal.style.display !== 'none') loadDirectory('/');
+}
+
+/**
+ * 清空文件预览。
+ *
+ * WHY 换根时必须清：预览里是**上一个根**里的文件内容，留着它等于在 B 会话里显示
+ * A 的文件正文——而左侧的树已经是 B 的，用户会把那当成「这条会话里也有这个文件」。
+ * 草稿态没有根时留一个说明，比一个空白框更容易理解。
+ */
+function clearWorkspacePreview() {
+  els.workspacePreview.innerHTML = '';
+  els.workspacePreview.appendChild(
+    el('div', 'workspace-empty', '从左侧选择一个文件查看内容')
+  );
+}
+
+/**
+ * 渲染「本次会话工作空间」选择器。
+ *
+ * WHY 只在草稿态出现：文件根在**第一条交互**上锁定，之后不可变更（换项目要新建会话）。
+ * 会话已存在时继续显示一个改不动的控件，只会让用户以为「选一下就能切」——而服务端会以
+ * 409 拒绝，那个报错看起来像 bug 而不是设计。
+ *
+ * WHY 不选也是一种显式状态、且必须写出来：不绑定时这条会话落在应用为它建的专属目录里，
+ * 而不是某个项目目录。不写出来的话，用户会默认「没选 = 用默认项目」——然后在自己的项目
+ * 里找不到 Agent 刚产出的文件。
+ */
+function renderWorkspacePicker() {
+  const drafting = !state.threadId;
+  els.workspacePicker.hidden = !drafting;
+  if (!drafting) return;
+
+  const chosen = state.workspaceChoice;
+  els.workspaceChoiceText.textContent = chosen
+    ? chosen
+    : '未选择 —— 本条会话将使用应用为它创建的专属目录';
+  els.workspaceChoiceText.title = chosen || '';
+  // 「不绑定」按钮只在已选时可用：没选的时候它什么也不做，留着反而像个必须点的步骤。
+  els.workspaceClear.disabled = !chosen;
+}
+
+/* ------------------------------------------------------------------ 工作区浏览 */
+
+/**
+ * 拉取并渲染浏览弹窗的一层目录。
+ *
+ * WHY 只拉一层、点一次拉一次：服务端才是边界的所有者（目录也可能随时被删），客户端
+ * 缓存整棵树只会造出第二份会过时的事实。层数也不多——用户点几下就到目标目录了。
+ */
+async function loadWorkspaceBrowse(path) {
+  const query = path ? `?path=${encodeURIComponent(path)}` : '';
+  const response = await api(`/api/workspaces/dirs${query}`);
+  state.workspaceBrowse = await response.json();
+  renderWorkspaceBrowse();
+}
+
+function renderWorkspaceBrowse() {
+  const view = state.workspaceBrowse;
+  const atStart = !view.path;
+  els.workspaceBrowsePath.textContent = atStart ? '选择一个位置' : view.path;
+  // 输入框跟随当前目录：它既是「粘一个新路径」的入口，也是「我现在在哪」的显示。
+  // 不同步的话，进到下一层后框里还留着上一个路径，用户按回车又跳回去。
+  els.workspaceBrowseInput.value = view.path || '';
+  // 到文件系统顶层（盘符根或 /）时服务端给 parent=null：那里没有「上一级」，
+  // 按钮该是禁用的（点了也只会原地不动）。
+  els.workspaceBrowseUp.disabled = !view.parent;
+  // 起点页（还没进到任何目录里）不能「使用此目录」——那时没有「此目录」这回事
+  els.workspaceBrowseUse.disabled = atStart;
+
+  els.workspaceBrowseList.replaceChildren();
+  if (!view.entries.length) {
+    els.workspaceBrowseList.appendChild(
+      el('p', 'workspace-browse-empty', atStart ? '没有可浏览的位置' : '这里没有子目录')
+    );
+    return;
+  }
+  view.entries.forEach((entry) => {
+    const row = el('button', 'workspace-browse-item', entry.name);
+    row.type = 'button';
+    row.title = entry.path;
+    row.addEventListener('click', () => {
+      loadWorkspaceBrowse(entry.path).catch((err) => {
+        els.workspaceBrowseList.replaceChildren(
+          el('p', 'workspace-browse-empty', `读取失败：${err.message}`)
+        );
+      });
+    });
+    els.workspaceBrowseList.appendChild(row);
+  });
+}
+
+async function openWorkspaceBrowse() {
+  els.workspaceBrowseModal.style.display = '';
+  try {
+    // 不传 path 表示「起点」：服务端给出顶层（Windows 是盘符列表，POSIX 是 /）
+    await loadWorkspaceBrowse(null);
+  } catch (err) {
+    els.workspaceBrowseList.replaceChildren(
+      el('p', 'workspace-browse-empty', `无法浏览目录：${err.message}`)
+    );
+  }
+}
+
+function closeWorkspaceBrowse() {
+  els.workspaceBrowseModal.style.display = 'none';
+}
+
+/**
+ * 跳到输入框里那个路径。
+ *
+ * WHY 走浏览端点而不是单独加一个「校验路径」接口：那条接口要处理「存在吗 / 允许吗 /
+ * 是目录吗」三件事，而浏览端点本来就要回答同样三个问题。复用它，等于保证「跳得进去的
+ * 位置」与「选得中的位置」永远是同一个集合——这两个集合一旦分叉，用户会看到「路径明明
+ * 能打开、却选不了」。
+ */
+function goToTypedPath() {
+  const value = els.workspaceBrowseInput.value.trim();
+  if (!value) return;
+  loadWorkspaceBrowse(value).catch((err) => {
+    // 失败原因直接显示在列表区：那是用户刚看一眼的地方，弹 toast 反而会让他找不到
+    // 「路径到底哪里不对」的上下文。
+    els.workspaceBrowseList.replaceChildren(el('p', 'workspace-browse-empty', err.message));
+  });
+}
+
+/**
+ * 把浏览到的当前目录定为这条会话的工作空间。
+ *
+ * WHY 只写本地状态、不立刻发给服务端：文件根在**首条消息**上锁定（会话在那一刻才真正
+ * 诞生）。提前提交只会造出一条「有根但没有内容」的记录。
+ */
+function useBrowsedWorkspace() {
+  const chosen = state.workspaceBrowse.path;
+  if (!chosen) return;
+  applyWorkspaceChoice(chosen);
+  closeWorkspaceBrowse();
+}
+
+/**
+ * 记下选择（或清除选择），并把界面与已打开的面板同步到它。
+ *
+ * WHY 收成一个函数：选择有三个入口（系统弹窗、网页内浏览、「不绑定」），三处各写一遍
+ * 必然会漏掉「刷新已打开的面板」这一步——而那一步漏掉的表现是「面板还显示上一个目录
+ * 的文件」，用户会把那当成「新工作空间里居然有旧文件」。
+ */
+function applyWorkspaceChoice(chosen) {
+  state.workspaceChoice = chosen || null;
+  renderWorkspacePicker();
+  setWorkspacePickStatus('');
+  // WHY 复用「换根」那一份逻辑（而不是只清目录树）：选了工作空间同样是换了根，而
+  // 「换根要丢哪些缓存、在途请求怎么作废」的规则只有一份——写第二份就会漂开，
+  // 而漂开的表现是「某种换根方式下面板还列着上一个目录的文件」。
+  syncWorkspaceScope();
+}
+
 function openWorkspaceModal() {
   els.workspaceModal.style.display = '';
+  loadWorkspaceInfo();
   if (!state.workspace.dirs['/']) {
     loadDirectory('/');
   } else {
@@ -2149,18 +2458,62 @@ function closeWorkspaceModal() {
   els.workspaceModal.style.display = 'none';
 }
 
+/**
+ * 打开**服务端**的系统文件夹选择弹窗。
+ *
+ * WHY 要提示「窗口在服务端那台机器上」：这个对话框出现在运行服务端的那台机器的屏幕上
+ * （浏览器拿不到宿主的绝对路径，只能由服务端进程自己弹）。不说清楚，用户在远程或容器
+ * 部署里会一直盯着浏览器等一个永远不会出现在这里的窗口。
+ */
+async function pickWorkspaceFolder() {
+  if (state.workspacePickPending) return;
+  state.workspacePickPending = true;
+  els.workspacePick.disabled = true;
+  setWorkspacePickStatus('请在系统对话框里选择目录…（窗口出现在运行服务端的那台机器上）');
+  try {
+    const chosen = state.workspaceChoice
+      ? `?workspace=${encodeURIComponent(state.workspaceChoice)}`
+      : '';
+    const response = await api(`/api/workspaces/pick${chosen}`, { method: 'POST' });
+    const payload = await response.json();
+    if (payload.cancelled) {
+      // 取消不是错误：清掉提示即可，不弹任何红条
+      setWorkspacePickStatus('');
+      return;
+    }
+    applyWorkspaceChoice(payload.path);
+  } catch (err) {
+    // WHY 在提示里直接给出替代路径：最常见的失败是「这个部署没有图形环境」（501），
+    // 那时用户需要知道的不是错误码，而是「改用哪个按钮」。
+    setWorkspacePickStatus(`${err.message}；可改用「浏览…」在网页里逐级挑选。`);
+  } finally {
+    state.workspacePickPending = false;
+    els.workspacePick.disabled = false;
+  }
+}
+
+function setWorkspacePickStatus(text) {
+  els.workspacePickStatus.textContent = text || '';
+  els.workspacePickStatus.hidden = !text;
+}
+
 async function loadDirectory(path) {
+  // 记下这次请求属于哪个根作用域：面板开着时换会话，旧请求可能在新请求之后返回，
+  // 而它带回来的是**上一个根**的目录内容（虚拟路径同名却指向别处，所以连报错都没有）。
+  const generation = state.workspace.generation;
   try {
     // WHY 编码整个 path 作为一个查询参数：虚拟路径里可能含中文与空格，
     // 而这里它是 query value，不是路径段——整体编码才是正确做法。
-    const response = await api(`/api/workspace/files?path=${encodeURIComponent(path)}`);
+    const response = await api(scoped(`/api/workspace/files?path=${encodeURIComponent(path)}`));
     const payload = await response.json();
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
     state.workspace.dirs[payload.path] = {
       entries: payload.entries || [],
       truncated: !!payload.truncated,
     };
     renderTree();
   } catch (err) {
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
     state.workspace.dirs[path] = { entries: [], truncated: false, error: err.message };
     renderTree();
   }
@@ -2230,19 +2583,26 @@ function renderTree() {
 }
 
 async function openWorkspaceFile(path) {
+  const generation = state.workspace.generation;
   state.workspace.selected = path;
   // 展开并加载父目录，让用户能看出「我打开的这份文件在哪」
   const parent = path.split('/').slice(0, -1).join('/') || '/';
   state.workspace.expanded[parent] = true;
   if (!state.workspace.dirs[parent]) await loadDirectory(parent);
+  // 上面那次 ``await`` 期间可能已经换了会话：树的缓存已被整份丢掉，此时再画一遍
+  // 只是画空（无害），但下面的预览必须先确认自己还在同一个根上。
+  if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
   renderTree();
 
   els.workspacePreview.innerHTML = '';
   els.workspacePreview.appendChild(el('div', 'workspace-empty', '加载中…'));
   try {
-    const response = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`);
-    renderFile(await response.json());
+    const response = await api(scoped(`/api/workspace/file?path=${encodeURIComponent(path)}`));
+    const payload = await response.json();
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
+    renderFile(payload);
   } catch (err) {
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
     els.workspacePreview.innerHTML = '';
     els.workspacePreview.appendChild(
       el('div', 'workspace-empty', `打开失败：${err.message}`)
@@ -2303,13 +2663,18 @@ function renderFile(payload) {
 async function loadMoreFile(button, pre) {
   const cursor = state.workspace.text;
   if (!cursor) return;
+  const generation = state.workspace.generation;
   button.disabled = true;
   button.textContent = '加载中…';
   try {
     const response = await api(
-      `/api/workspace/file?path=${encodeURIComponent(cursor.path)}&offset=${cursor.offset}`
+      scoped(`/api/workspace/file?path=${encodeURIComponent(cursor.path)}&offset=${cursor.offset}`)
     );
     const payload = await response.json();
+    // 期间换过会话：预览区已被换成新根的内容，这份响应属于上一个根——而这条分支会
+    // 往**活的**预览区里追加「已显示全部 N 字符」，那正是最难被解释成「上一条会话的
+    // 残留」的东西（它看起来像新文件自己的一行）。
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
     pre.textContent += payload.text || '';
     cursor.offset = (payload.offset || 0) + (payload.text || '').length;
     if (payload.truncated) {
@@ -2322,6 +2687,7 @@ async function loadMoreFile(button, pre) {
       );
     }
   } catch (err) {
+    if (!WorkspaceScope.isCurrent(state.workspace, generation)) return;
     // 失败时保留按钮：这是可以重试的动作，把入口弄没等于让人重新找文件
     button.disabled = false;
     button.textContent = `加载更多（失败：${err.message}）`;
@@ -2338,6 +2704,34 @@ function bindWorkspaceEvents() {
   els.workspaceOpen.addEventListener('click', openWorkspaceModal);
   els.workspaceClose.addEventListener('click', closeWorkspaceModal);
   els.workspaceModal.querySelector('.modal-backdrop').addEventListener('click', closeWorkspaceModal);
+
+  els.workspaceBrowseOpen.addEventListener('click', openWorkspaceBrowse);
+  els.workspaceBrowseClose.addEventListener('click', closeWorkspaceBrowse);
+  els.workspaceBrowseModal
+    .querySelector('.modal-backdrop')
+    .addEventListener('click', closeWorkspaceBrowse);
+  els.workspaceBrowseUp.addEventListener('click', () => {
+    // parent 为空说明已到达浏览根（服务端不再给上级），此时按钮是禁用的
+    if (!state.workspaceBrowse.parent) return;
+    loadWorkspaceBrowse(state.workspaceBrowse.parent).catch((err) => {
+      els.workspaceBrowseList.replaceChildren(
+        el('p', 'workspace-browse-empty', `读取失败：${err.message}`)
+      );
+    });
+  });
+  els.workspaceBrowseUse.addEventListener('click', useBrowsedWorkspace);
+  els.workspaceBrowseGo.addEventListener('click', goToTypedPath);
+  els.workspaceBrowseInput.addEventListener('keydown', (event) => {
+    // Enter 直接前往：粘贴路径之后按回车是最自然的动作
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    goToTypedPath();
+  });
+  // 选中的工作空间只存在本地，直到首条消息发出时才交给服务端（锁定发生在那时）。
+  els.workspacePick.addEventListener('click', pickWorkspaceFolder);
+  // 「不绑定」：把选择清成 null。它不是「取消」而是另一种正常结果——这条会话将使用应用
+  // 为它创建的专属目录。
+  els.workspaceClear.addEventListener('click', () => applyWorkspaceChoice(null));
 }
 
 async function loadAuth() {

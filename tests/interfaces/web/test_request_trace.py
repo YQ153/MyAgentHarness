@@ -32,6 +32,7 @@ from interfaces.web.request_context import (
     resolve_trace_id,
 )
 from tests.application.test_run_service import FakeGraphFactory, FakeGraph, _drain
+from tests.conftest import StubSessionRegistry
 
 
 async def _echo(request: Request) -> JSONResponse:
@@ -196,6 +197,7 @@ async def test_one_trace_reaches_audit_and_usage(
         test_config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(FakeGraph()),
+        workspaces=StubSessionRegistry(test_config),
         audit_store=audit,
         usage_store=usage,
     )
@@ -225,6 +227,7 @@ async def test_trace_is_null_outside_a_request(test_config, thread_store):
         test_config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(FakeGraph()),
+        workspaces=StubSessionRegistry(test_config),
         audit_store=audit,
         usage_store=usage,
     )

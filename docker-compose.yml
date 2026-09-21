@@ -30,8 +30,12 @@ services:
       # 允许由 .env 覆盖，便于本机临时用 disabled 做一次性排查。
       AUTH_MODE: ${AUTH_MODE:-apikey}
       DB_PATH: /app/.data/agent.db
-      WORKSPACE: /app/workspace
-      MEMORY_FILE: /app/workspace/AGENTS.md
+      # WHY 显式给：不绑定工作空间的会话，其专属目录落在这里（默认就是 <数据目录>/sessions，
+      # 写出来是为了让人一眼看到「那些会话的文件在卷里，不在镜像层」）。
+      # 想让容器读到宿主上的项目目录，用绑定挂载把那个目录挂进来，再在界面上选它。
+      SESSIONS_ROOT: /app/.data/sessions
+      # 长期记忆：所有会话共用一份。不设置则按 <会话根>/AGENTS.md 派生（每条会话一个）。
+      MEMORY_FILE: /app/.data/AGENTS.md
       # 模型密钥留在宿主环境变量里（本机 .env 未保存它），因此在这里显式透传。
       # 缺省为空串：缺密钥时服务能启动、/ready 会如实报未就绪，而不是启动就崩。
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
@@ -41,14 +45,14 @@ services:
     volumes:
       # WHY 用命名卷而不是绑定挂载宿主机目录：容器以 uid 10001 运行，绑定挂载的属主
       # 由宿主机决定，最省事的结果往往是「跑起来但写不进去」。命名卷首次挂载会继承
-      # 镜像里该目录的属主（Dockerfile 已把 /app/.data 与 /app/workspace 交给 app），
-      # 因此开箱可用。要直接看容器产出的文件，见 README 里换成绑定挂载的写法。
+      # 镜像里该目录的属主（Dockerfile 已把 /app/.data 交给 app），因此开箱可用。
+      #
+      # WHY 只有一个卷：会话的检查点、审计、用量与「未绑定工作空间的会话专属目录」
+      # 全都在这一个目录里——备份/搬迁只需要搬它。
       - agent-data:/app/.data
-      - agent-workspace:/app/workspace
 
     # 探活沿用镜像内的 HEALTHCHECK（打 /health）。此处不重复声明：
     # 同一个判据写在两处，改一处忘一处时编排行为会与文档分叉。
 
 volumes:
   agent-data:
-  agent-workspace:

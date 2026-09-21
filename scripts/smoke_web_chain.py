@@ -53,7 +53,9 @@ async def _main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
     query = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else _DEFAULT_QUERY
 
-    config = AppConfig(_env_file=str(ROOT / ".env") if (ROOT / ".env").exists() else None)
+    # WHY 走 ``load()`` 而不是直接构造：工作区是必填项，直接构造在未配置时只会抛一条
+    # pydantic 原文；``load()`` 会给出「该写哪个变量 / 写在哪」的提示，并把目录建好。
+    config = AppConfig.load(_env_file=str(ROOT / ".env") if (ROOT / ".env").exists() else None)
     registry = ToolRegistry()
     register_tools(registry, config)
     tools = {item.name: item for item in registry.tools()}

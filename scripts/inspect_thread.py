@@ -86,14 +86,17 @@ _EXPLAIN_FIELDS = (
 # --------------------------------------------------------------------- 基础设施
 
 
-_KNOWLEDGE_DB_NAME = "knowledge.db"
-"""知识库文件名的兜底取值，与 ``knowledge_runtime.KNOWLEDGE_DB_NAME`` 同值。
+_KNOWLEDGE_DB_PREFIX = "knowledge-"
+"""知识库文件名的前缀，与 ``knowledge_runtime.KNOWLEDGE_DB_PREFIX`` 同值。
 
-WHY 允许这份重复：正常路径取 ``knowledge_runtime.KNOWLEDGE_DB_NAME``（见
-``knowledge_db_name``），只有在该模块导入不了时才用它。而导入不了恰恰是排障的典型
-场景——``knowledge_runtime`` 会连带拉起 ``application`` → ``agent.graph`` →
-``deepagents``，依赖没装全时这个脚本必须在**没有**它们的情况下也能跑，否则它
-最需要的时候正好用不了。
+WHY 允许这份重复：正常路径取 ``knowledge_runtime.KNOWLEDGE_DB_PREFIX``，只有在该模块
+导入不了时才用它。而导入不了恰恰是排障的典型场景——``knowledge_runtime`` 会连带拉起
+``application`` → ``agent.graph`` → ``deepagents``，依赖没装全时这个脚本必须在**没有**
+它们的情况下也能跑，否则它最需要的时候正好用不了。
+
+WHY 是「前缀」而不是「完整文件名」：知识库**按会话的文件根各存一份**
+（``knowledge-<根标识>.db``）。库里以「根内虚拟路径」为键去重，两个项目的
+``/README.md`` 是同一个键——共用一个库会互相覆盖索引。
 """
 
 _DEFAULT_DATA_DIR = ".data"
@@ -125,27 +128,66 @@ def resolve_agent_db(db_override: str | None) -> Path:
         return ROOT / _DEFAULT_DATA_DIR / "agent.db"
 
 
-def knowledge_db_name() -> str:
-    """知识库文件名：优先取 ``knowledge_runtime`` 的常量，导入不了时用兜底值。
+def knowledge_db_prefix() -> str:
+    """知识库文件名前缀：优先取 ``knowledge_runtime`` 的常量，导入不了时用兜底值。
 
     WHY 允许兜底：该模块会连带拉起 ``application`` → ``agent.graph`` → ``deepagents``，
     依赖没装全时这条 import 会失败——而那时正是最需要这个脚本的时候。
     """
     try:
-        from knowledge_runtime import KNOWLEDGE_DB_NAME  # noqa: PLC0415 - 按需导入
+        from knowledge_runtime import KNOWLEDGE_DB_PREFIX  # noqa: PLC0415 - 按需导入
     except ImportError as exc:
-        logger.warning("knowledge_runtime 导入失败，用兜底文件名：%s", exc)
-        return _KNOWLEDGE_DB_NAME
-    return KNOWLEDGE_DB_NAME
+        logger.warning("knowledge_runtime 导入失败，用兜底前缀：%s", exc)
+        return _KNOWLEDGE_DB_PREFIX
+    return KNOWLEDGE_DB_PREFIX
 
 
-def resolve_knowledge_db(agent_db: Path) -> Path:
-    """由主库路径推导知识库路径。
+def resolve_knowledge_dbs(agent_db: Path) -> list[Path]:
+    """列出这个数据目录下的全部知识库文件（**每个会话根一份**）。
+
+    WHY 返回列表而不是单个路径：知识库按会话的文件根隔离（库里以「根内虚拟路径」为键
+    去重，两个项目的 ``/README.md`` 是同一个键）。因此「那个知识库」已经不存在了——
+    写死一个文件名会让脚本查到一个空库，而症状看起来像「我什么都没索引」。
 
     WHY 跟着主库推导：知识库与检查点库同处一个数据目录是一等约定（``knowledge_runtime``
     的 docstring 写明），容器部署下两者同在一个可写卷里。
     """
-    return agent_db.parent / knowledge_db_name()
+    return sorted(agent_db.parent.glob(f"{knowledge_db_prefix()}*.db"))
+
+
+def choose_knowledge_db(agent_db: Path, *, override: str | None) -> Path | None:
+    """在「一个根一份库」的前提下挑出要查的那一个；挑不出来时返回 ``None``。
+
+    WHY 要挑而不是随便取一个：库按会话的文件根隔离，取错一个会读到空表——而症状看起来
+    像「我什么都没索引」，把人引向完全相反的方向。候选多于一个时把清单打出来，让人明确
+    指定哪一个。
+
+    Args:
+        agent_db: 主库路径（用于定位数据目录）。
+        override: 显式指定的知识库文件；给了就直接用它。
+
+    Returns:
+        要查的库路径；无法唯一确定时返回 ``None``（并已打印候选）。
+    """
+    if override:
+        chosen = Path(override).expanduser().resolve()
+        if not chosen.is_file():
+            print(f"指定的知识库文件不存在：{chosen}")
+            return None
+        return chosen
+
+    candidates = resolve_knowledge_dbs(agent_db)
+    if not candidates:
+        print(f"数据目录里没有知识库文件：{agent_db.parent}")
+        print("（知识库在第一次索引之后才会出现；路径前缀见 knowledge_runtime.KNOWLEDGE_DB_PREFIX）")
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    print(f"这个数据目录里有 {len(candidates)} 个知识库（每个会话根一份），请用 --knowledge-db 指定：")
+    for item in candidates:
+        print(f"  {item}")
+    return None
 
 
 def snapshot(source: Path, target_dir: Path) -> Path:
@@ -606,6 +648,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     knowledge_parser = subparsers.add_parser("knowledge", help="知识库规模与已索引文档")
     knowledge_parser.add_argument("--db", default=None, help="覆盖 agent.db 路径（默认取配置）")
+    knowledge_parser.add_argument(
+        "--knowledge-db",
+        default=None,
+        help=(
+            "指定要查的知识库文件；不传时若数据目录里只有一个就用它，"
+            "有多个会把候选列出来（知识库按会话的文件根各一份）"
+        ),
+    )
 
     return parser.parse_args(argv)
 
@@ -627,7 +677,13 @@ def main(argv: list[str] | None = None) -> int:
         thread = ""
 
     agent_db = resolve_agent_db(args.db)
-    target = resolve_knowledge_db(agent_db) if args.command == "knowledge" else agent_db
+    if args.command == "knowledge":
+        chosen = choose_knowledge_db(agent_db, override=args.knowledge_db)
+        if chosen is None:
+            return 2
+        target = chosen
+    else:
+        target = agent_db
     print(f"目标库：{target}")
     logger.info("取证开始：command=%s target=%s", args.command, target)
 

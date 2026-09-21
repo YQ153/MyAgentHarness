@@ -26,6 +26,10 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -146,41 +150,80 @@ def _normalize_virtual_path(virtual_path: str) -> str:
     return "/" + "/".join(parts)
 
 
-def resolve_in_workspace(root: Path, virtual_path: str) -> Path:
-    """把虚拟路径解析为工作区内的绝对路径。
+def _matched_mount(
+    normalized: str, mounts: Mapping[str, Path] | None
+) -> tuple[str, Path] | None:
+    """按**最长前缀**找出这条虚拟路径落在哪个挂载点里；没有命中时返回 ``None``。
+
+    WHY 最长匹配：挂载前缀可以嵌套，取短的那个会把子挂载里的文件解析到父挂载点的错误
+    位置——而两边「都存在」，于是错误只会在读内容时才暴露。
+
+    Args:
+        normalized: 已归一化的虚拟路径（``/skills/code-review/SKILL.md``）。
+        mounts: ``{虚拟前缀: 宿主目录}``；``None`` 表示没有挂载。
+
+    Returns:
+        ``(虚拟前缀去掉尾斜杠的写法, 宿主目录)``，或 ``None``。
+    """
+    best: tuple[str, Path] | None = None
+    for prefix, host_dir in (mounts or {}).items():
+        virtual = "/" + str(prefix).strip("/")
+        if normalized == virtual or normalized.startswith(virtual + "/"):
+            if best is None or len(virtual) > len(best[0]):
+                best = (virtual, Path(host_dir))
+    return best
+
+
+def resolve_in_workspace(
+    root: Path, virtual_path: str, *, mounts: Mapping[str, Path] | None = None
+) -> Path:
+    """把虚拟路径解析为宿主上的绝对路径（工作区内，或某个**只读挂载点**内）。
 
     WHY 必须在 ``resolve()`` 之后复检：字符串级拦截挡不住符号链接 / 目录联接——
     ``/link/secret`` 里没有 ``..``，字面上完全合法，但 ``link`` 指向工作区之外时
     真实落点已经跑出去了。只有解析出真实路径再比较前缀才能发现。
 
+    WHY 要认挂载表（2026-09-21 改）：技能库、技能视图与工具输出留存已经搬到工作区之外，
+    由只读挂载暴露在 ``/skills``、``/.skills-active``、``/_tool_outputs`` 下。面板要能打开
+    「完整输出」（``/_tool_outputs/<会话 ID>/0001-execute.txt``），就得先按挂载表把那一条
+    还原成宿主路径——否则它会被当成工作区内的相对路径，读到一个不存在的文件。
+
     Args:
         root: 工作区根目录（不含虚拟路径）。
         virtual_path: 以 ``/`` 开头的虚拟路径。
+        mounts: ``{虚拟前缀: 宿主目录}``；``None`` 表示只认工作区。
 
     Returns:
-        位于 ``root`` 之内的绝对路径。路径**不要求存在**：列目录与读文件各自
+        宿主绝对路径（工作区内，或挂载点内）。路径**不要求存在**：列目录与读文件各自
         负责把「不存在」映射成 404。
 
     Raises:
-        WorkspacePathError: 路径非法，或解析后逃出了工作区。
+        WorkspacePathError: 路径非法，或解析后逃出了它应当在的那个根。
     """
     if root is None:
         raise WorkspacePathError("工作区根目录不能为空")
 
     normalized = _normalize_virtual_path(virtual_path)
-    relative = normalized.lstrip("/")
+    matched = _matched_mount(normalized, mounts)
+    if matched is None:
+        base = Path(root).resolve()
+        relative = normalized.lstrip("/")
+    else:
+        virtual, host_dir = matched
+        base = host_dir.resolve()
+        relative = normalized[len(virtual) :].lstrip("/")
 
     # WHY 显式拦盘符：``Path("ws") / "C:/x"`` 在 Windows 上会**丢弃**左侧基目录，
     # 直接得到 ``C:\\x``——这是拼接式实现最容易漏掉的一条逃逸路径。
     if relative and PureWindowsPath(relative).drive:
         raise WorkspacePathError(f"path 不能包含盘符：{virtual_path}")
 
-    resolved_root = Path(root).resolve()
-    candidate = (resolved_root / relative).resolve() if relative else resolved_root
+    candidate = (base / relative).resolve() if relative else base
 
-    if not candidate.is_relative_to(resolved_root):
+    if not candidate.is_relative_to(base):
         # 报出不逃逸的那一侧，避免把宿主的绝对路径回显给调用方
-        raise WorkspacePathError(f"path 逃出工作区：{virtual_path}")
+        scope = "挂载点" if matched is not None else "工作区"
+        raise WorkspacePathError(f"path 逃出{scope}：{virtual_path}")
 
     return candidate
 
@@ -192,8 +235,16 @@ def to_virtual_path(root: Path, target: Path) -> str:
     return "/" + relative.as_posix() if relative.as_posix() != "." else "/"
 
 
-def _entry_of(root: Path, child: Path) -> WorkspaceEntry | None:
-    """构造一条目录项；无法 ``stat`` 的条目返回 ``None``。"""
+def _entry_of(child: Path, *, virtual_dir: str) -> WorkspaceEntry | None:
+    """构造一条目录项；无法 ``stat`` 的条目返回 ``None``。
+
+    WHY 用「所在目录的虚拟路径 + 子项名」拼、而不再从宿主路径反算（2026-09-21 改）：
+    条目可能位于**挂载点**里（技能库 / 工具留存已经搬出工作区），从宿主路径反算需要先
+    知道它在哪个挂载点下；而子项名本身就是虚拟路径的最后一段，拼出来永远正确。
+    顺带避开一个更早的坑：反算要走 ``resolve()``，而指向根外的软链会让它抛异常，
+    一次列举因此整条失败。
+    """
+    virtual = f"{virtual_dir.rstrip('/')}/{child.name}" if virtual_dir != "/" else f"/{child.name}"
     try:
         info = child.lstat()
     except OSError:
@@ -216,7 +267,7 @@ def _entry_of(root: Path, child: Path) -> WorkspaceEntry | None:
 
     return WorkspaceEntry(
         name=child.name,
-        path=to_virtual_path(root, child),
+        path=virtual,
         is_dir=child.is_dir(),
         size=size,
         modified_at=modified,
@@ -224,7 +275,13 @@ def _entry_of(root: Path, child: Path) -> WorkspaceEntry | None:
     )
 
 
-def list_directory(root: Path, virtual_path: str, *, max_entries: int) -> WorkspaceListing:
+def list_directory(
+    root: Path,
+    virtual_path: str,
+    *,
+    max_entries: int,
+    mounts: Mapping[str, Path] | None = None,
+) -> WorkspaceListing:
     """列出一级目录内容（懒加载：一次只列一层）。
 
     WHY 只列一层：工作区里会有 ``node_modules`` 这类成千上万条目的目录，
@@ -234,21 +291,23 @@ def list_directory(root: Path, virtual_path: str, *, max_entries: int) -> Worksp
         root: 工作区根目录。
         virtual_path: 目标目录的虚拟路径。
         max_entries: 单次返回的条目数上限。
+        mounts: ``{虚拟前缀: 宿主目录}``；面板要能列进行挂载点里的目录时需要它。
 
     Returns:
         目录项按「目录在前、名称不区分大小写升序」排列。
 
     Raises:
-        WorkspacePathError: 路径非法或逃出工作区。
+        WorkspacePathError: 路径非法或逃出工作区 / 挂载点。
         NotADirectoryError: 目标存在但不是目录。
         FileNotFoundError: 目标不存在。
     """
-    target = resolve_in_workspace(root, virtual_path)
+    target = resolve_in_workspace(root, virtual_path, mounts=mounts)
     if not target.exists():
         raise FileNotFoundError(f"目录不存在：{virtual_path}")
     if not target.is_dir():
         raise NotADirectoryError(f"不是目录：{virtual_path}")
 
+    normalized = _normalize_virtual_path(virtual_path)
     entries: list[WorkspaceEntry] = []
     truncated = False
     with os.scandir(target) as iterator:
@@ -258,13 +317,12 @@ def list_directory(root: Path, virtual_path: str, *, max_entries: int) -> Worksp
                 break
             # WHY 用 scandir 的 DirEntry 转 Path：Windows 上 DirEntry 已带类型
             # 信息，省掉一次 stat 系统调用；而构造条目仍需 lstat（要大小与时间）。
-            entry = _entry_of(Path(root).resolve(), Path(child.path))
+            entry = _entry_of(Path(child.path), virtual_dir=normalized)
             if entry is not None:
                 entries.append(entry)
 
     entries.sort(key=lambda item: (not item.is_dir, item.name.lower()))
 
-    normalized = _normalize_virtual_path(virtual_path)
     return WorkspaceListing(
         path=normalized,
         parent=None if normalized == "/" else "/".join(normalized.rstrip("/").split("/")[:-1]) or "/",

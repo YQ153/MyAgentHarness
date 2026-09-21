@@ -86,8 +86,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # WHY 只有 cli 有 --workspace：一个 CLI 进程就是一条会话，「选择工作空间」发生在启动
+    # 那一刻（与 Web 形态在界面上选是同一件事的两种形态）。而 Web 进程会承载很多条会话，
+    # 它的工作空间由每条会话各自决定——在启动参数上再放一个默认值，只会让「不选」与
+    # 「选了配置里那个」变成同一件事，而它们在本模型下必须落到不同的根上。
     cli = sub.add_parser("cli", help="命令行交互式运行")
     cli.add_argument("--model", default=None, help="模型别名，默认取配置中的 default_model")
+    cli.add_argument(
+        "--workspace",
+        default=None,
+        help=(
+            "本次 CLI 会话的工作空间（Agent 的文件根）。必须是已存在的目录；"
+            "不传表示不绑定——本会话将使用应用为它自动创建的专属目录"
+        ),
+    )
 
     web = sub.add_parser("web", help="启动 Web 服务")
     web.add_argument("--host", default=None, help="监听地址，默认取配置")
@@ -97,14 +109,14 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_cli(config: AppConfig, model_name: str | None) -> int:
+def _run_cli(config: AppConfig, model_name: str | None, workspace: str | None) -> int:
     from interfaces.cli import run_cli
 
     # CLI 不监听端口，但「HOST 非回环 + 未启用认证」说明的是部署形态不安全，
     # 而同一份 .env 通常也用于 Web 形态；在跑 CLI 时就提示，比等暴露之后再
     # 从别处发现更早。
     config.warn_if_unauthenticated_exposure()
-    return asyncio.run(run_cli(config, model_name=model_name))
+    return asyncio.run(run_cli(config, model_name=model_name, workspace=workspace))
 
 
 def _run_web(config: AppConfig, host: str | None, port: int | None) -> int:
@@ -153,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.log_level or config.log_level, config.log_format)
 
     if args.command == "cli":
-        return _run_cli(config, args.model)
+        return _run_cli(config, args.model, args.workspace)
     return _run_web(config, args.host, args.port)
 
 

@@ -77,7 +77,8 @@ def _tiny_png() -> bytes:
 async def _main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 
-    config = AppConfig()
+    # WHY 走 ``load()``：工作区必填，直接构造在未配置时只会抛 pydantic 原文。
+    config = AppConfig.load()
     app = create_app(config)
     failures: list[str] = []
     skipped = False

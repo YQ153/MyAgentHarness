@@ -25,7 +25,7 @@ from application.principal import Principal
 from application.run_service import RunHandle, RunService
 from runtime.thread_store import ThreadMetaStore, open_thread_store
 
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 # ------------------------------------------------------------------ 测试替身
@@ -71,7 +71,7 @@ class FakeGraphFactory:
     def __init__(self, graph: Any) -> None:
         self._graph = graph
 
-    def get(self, name: str | None = None) -> Any:
+    def get(self, name: str | None = None, *, scope: Any = None) -> Any:
         if name is not None and name != "deepseek-flash":
             raise KeyError(name)
         return self._graph
@@ -104,6 +104,7 @@ def _make_service(
         config,
         thread_store=store,
         graph_factory=FakeGraphFactory(graph or FakeGraph()),
+        workspaces=StubSessionRegistry(config),
     )
 
 
@@ -119,12 +120,21 @@ async def _drain(events: AsyncIterator[Any]) -> list[Any]:
 
 
 async def test_constructor_rejects_none_deps(test_config, thread_store):
+    """每一项必需依赖为 ``None`` 都要当场失败。
+
+    WHY 把 ``workspaces`` 也列进来：它是「本轮跑在哪个工作区」的唯一来源，缺了它
+    就必须要么报错、要么悄悄退回某个默认值——后者正是本次要消除的那类失败。
+    """
+    workspaces = StubSessionRegistry(test_config)
+    graph = FakeGraphFactory(FakeGraph())
     with pytest.raises(ValueError):
-        RunService(None, thread_store=thread_store, graph_factory=FakeGraphFactory(FakeGraph()))
+        RunService(None, thread_store=thread_store, graph_factory=graph, workspaces=workspaces)
     with pytest.raises(ValueError):
-        RunService(test_config, thread_store=None, graph_factory=FakeGraphFactory(FakeGraph()))
+        RunService(test_config, thread_store=None, graph_factory=graph, workspaces=workspaces)
     with pytest.raises(ValueError):
-        RunService(test_config, thread_store=thread_store, graph_factory=None)
+        RunService(test_config, thread_store=thread_store, graph_factory=None, workspaces=workspaces)
+    with pytest.raises(ValueError):
+        RunService(test_config, thread_store=thread_store, graph_factory=graph, workspaces=None)
 
 
 # ------------------------------------------------------------------ 输入校验

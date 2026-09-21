@@ -20,7 +20,7 @@ from runtime.sandbox import factory as factory_module
 from runtime.sandbox.docker_runner import DockerSandboxRunner
 from runtime.sandbox.errors import SandboxPolicyError, SandboxUnavailableError
 from runtime.sandbox.models import CommandRequest, SandboxPolicy
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 
 def _runner(tmp_path: Path, **kwargs: Any) -> tuple[DockerSandboxRunner, Path]:
@@ -245,10 +245,10 @@ def test_factory_fails_closed_when_probe_fails(
     config = make_config(tmp_path, sandbox_tier=SandboxTier.DOCKER)
     # WHY 要建工作区目录：runner 的构造函数会校验它（挂载根不存在就无从挂载），
     # 不建的话这里抛的是 SandboxPolicyError，而本用例要钉的是「探测失败 → 不降级」。
-    config.workspace.mkdir(parents=True, exist_ok=True)
+    make_root(config).root.mkdir(parents=True, exist_ok=True)
 
     with pytest.raises(SandboxUnavailableError):
-        factory_module.build_sandbox_runner(config)
+        factory_module.build_sandbox_runner(config, workspace=make_root(config).root)
 
 
 def test_factory_passes_config_to_the_runner(
@@ -276,12 +276,12 @@ def test_factory_passes_config_to_the_runner(
         sandbox_docker_user="1000:1000",
     )
 
-    factory_module.build_sandbox_runner(config)
+    factory_module.build_sandbox_runner(config, workspace=make_root(config).root)
 
     assert captured["image"] == "custom:1"
     assert captured["workspace_read_only"] is True
     assert captured["user"] == "1000:1000"
-    assert captured["workspace_root"] == config.workspace
+    assert captured["workspace_root"] == make_root(config).root
 
 
 # --------------------------------------------------------------- 审批联动

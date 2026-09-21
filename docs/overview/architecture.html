@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -297,11 +297,15 @@
 <table>
   <thead><tr><th>组件</th><th>实现位置</th><th>职责</th></tr></thead>
   <tbody>
-    <tr><td>配置中心 <code>AppConfig</code></td><td><code>config.py:306</code></td><td>环境变量装载、路径展开、目录创建、技能/记忆路径换算</td></tr>
+    <tr><td>配置中心 <code>AppConfig</code></td><td><code>config.py:352</code></td><td>环境变量装载、工作区与允许清单校验、路径展开、目录创建</td></tr>
+    <tr><td>工作区作用域 <code>SessionRoot</code></td><td><code>config.py:1373</code></td><td>一个**已解析的工作区**：由它派生的长期记忆文件、技能来源与虚拟路径映射都只在这里算一份</td></tr>
+    <tr><td>记忆方案 <code>MemoryPlan</code></td><td><code>config.py:1344</code></td><td>本会话要加载的记忆来源 **与**为它们准备的只读挂载点（两者同源，避免「列了来源却没有挂载」）</td></tr>
+    <tr><td>会话根注册表 <code>SessionRegistry</code></td><td><code>application/session_registry.py</code></td><td>按会话解析工作区，并按工作区装配文件面板 / 附件 / 技能视图 / 知识库四类服务</td></tr>
     <tr><td>模型注册表 <code>ModelRegistry</code></td><td><code>llm/registry.py:132</code></td><td>按别名提供模型实例，双检锁懒加载，密钥与地址校验</td></tr>
-    <tr><td>装配入口 <code>build_agent</code></td><td><code>agent/graph.py:80</code></td><td>唯一的图构造点，挂载中间件、Backend、权限、中断与 Profile</td></tr>
+    <tr><td>装配入口 <code>build_agent</code></td><td><code>agent/graph.py:81</code></td><td>唯一的图构造点，挂载中间件、Backend、权限、中断与 Profile</td></tr>
     <tr><td>图工厂 <code>AgentFactory</code></td><td><code>agent/graph.py</code></td><td>按模型别名缓存已编译图；缓存上下文含 checkpointer 与 store，随工厂实例失效</td></tr>
-    <tr><td>Backend 工厂</td><td><code>agent/backends.py:161</code></td><td>按执行档位决定「文件落在哪、命令在哪跑」</td></tr>
+    <tr><td>Backend 工厂</td><td><code>agent/backends.py:162</code></td><td>按执行档位决定「文件落在哪、命令在哪跑」，并把全局记忆挂成只读路由</td></tr>
+    <tr><td>只读挂载</td><td><code>agent/readonly_mount.py:79</code></td><td>两类：<code>ReadOnlyFileMount</code> 只暴露<strong>一个文件</strong>（父目录不可见，用于全局记忆）；<code>ReadOnlyDirectoryMount</code> 暴露<strong>一棵子树</strong>（用于技能库 / 技能视图 / 工具留存），两者写、改、删、上传一律拒绝</td></tr>
     <tr><td>护栏 <code>build_permissions</code></td><td><code>agent/guardrails.py:77</code></td><td>敏感文件黑名单 + 读写放行规则（顺序敏感）</td></tr>
     <tr><td>中断配置 <code>build_interrupt_on</code></td><td><code>agent/guardrails.py:135</code></td><td>仅 <code>local</code> 档位为 <code>execute</code> 开启审批</td></tr>
     <tr><td>会话服务 <code>ThreadService</code></td><td><code>application/thread_service.py</code></td><td>会话标识、清单、历史读取、删除</td></tr>
@@ -313,7 +317,7 @@
     <tr><td>事件翻译器</td><td><code>application/event_translator.py</code></td><td>LangGraph 流增量 → 应用事件（有状态解析器）</td></tr>
     <tr><td>中断编解码</td><td><code>application/interrupt_codec.py</code></td><td>解析 <code>__interrupt__</code>、规整 decisions、构造 <code>Command</code></td></tr>
     <tr><td>检查点上下文</td><td><code>runtime/checkpointer.py:19</code></td><td>异步 SQLite 保存器的建立、建表与关闭</td></tr>
-    <tr><td>会话元数据 <code>ThreadMetaStore</code></td><td><code>runtime/thread_store.py:322</code></td><td>会话标题、创建/活动时间与轮次的读写，与检查点共用同一个 SQLite 文件</td></tr>
+    <tr><td>会话元数据 <code>ThreadMetaStore</code></td><td><code>runtime/thread_store.py:359</code></td><td>会话标题、创建/活动时间、轮次与<strong>绑定的工作区</strong>的读写，与检查点共用同一个 SQLite 文件</td></tr>
   </tbody>
 </table>
 
@@ -352,7 +356,7 @@
 │   └── web.py              Web 专有资源（限流器、审计清理、运行治理）
 ├── agent/                  内核层：装配、后端、护栏、Profile
 │   ├── graph.py            ★ 全应用唯一的 create_deep_agent 调用点
-│   ├── backends.py         ★ CompositeBackend 装配（工作区 + /memories/）
+│   ├── backends.py         ★ CompositeBackend 装配（工作区 + /memories/ + 全局记忆挂载）
 │   ├── guardrails.py       ★ 文件权限规则与 HITL 中断配置
 │   ├── profiles.py         HarnessProfile 注册（提示词、子 Agent 开关）
 │   ├── tools.py            工具注册器与自定义工具模块加载（ToolRegistry / ToolSource）
@@ -360,6 +364,7 @@
 │   ├── mcp.py              MCP 服务器接入与逐台加载状态
 │   ├── run_context.py      图运行时上下文与记忆命名空间
 │   ├── sandbox_backend.py  文件走工作区、命令走 SandboxRunner 的 Backend
+│   ├── readonly_mount.py   ★ 只读挂载：单文件（全局记忆）与整棵子树（技能库/视图/留存）
 │   ├── path_safety.py      Windows 扩展路径前缀容错
 │   └── __init__.py         导出 build_agent / AgentFactory
 ├── application/            应用层：会话编排与对外协议（29 个模块）
@@ -386,6 +391,7 @@
 │   ├── knowledge_service.py   知识库切分 / 索引 / 检索
 │   ├── memory_service.py      长期记忆管理（按主体隔离）
 │   ├── skill_service.py       技能清单 / 启停 / 物化视图重建
+│   ├── session_registry.py ★ 会话级工作区：按会话解析 + 按工作区装配下面四类服务
 │   ├── usage.py / usage_service.py  Token 用量提取与统计
 │   ├── thread_export.py       会话导出 Markdown
 │   ├── tool_catalog.py        工具目录服务
@@ -402,7 +408,7 @@
 │       ├── health.py       运维端点 /health /ready /metrics
 │       ├── attachment_routes.py / knowledge_routes.py / skill_routes.py / workspace_routes.py
 │       ├── auth/           认证子包：deps（身份提取与权限闸门）/ identity / apikey / audit / audit_api / utils / router
-│       └── static/         前端静态资源（无构建步骤：index.html / app.js / styles.css / markdown.js / auth_credential.js）
+│       └── static/         前端静态资源（无构建步骤：index.html / app.js / styles.css / markdown.js / auth_credential.js / workspace_scope.js）
 ├── llm/                    模型层
 │   ├── registry.py         ★ 模型注册表与构造
 │   ├── embeddings.py       嵌入后端协议
@@ -424,25 +430,218 @@
 ├── scripts/                运维与回归脚本（probe_* 探针 / smoke_* 冒烟 / 一次性维护）
 ├── tests/                  测试（按被测层镜像组织；含根级模块边界契约）
 ├── docker/                 沙箱执行镜像的 Dockerfile（与应用自身的根 Dockerfile 分开）
-└── workspace/              Agent 的活动边界
-    ├── AGENTS.md           长期记忆（被 config.memory_paths 加载）
-    ├── skills/             用户技能库（可为空，缺失时降级跳过）
-    └── skills-builtin/     内置技能（随仓库交付）
+├── skills-builtin/         随应用交付的内置技能（工作区之外，由 skill_mounts 挂虚拟路径）
+└── workspace/              本机示例目录（配置里没有指向它的默认值，仅便于本机试跑）
+    ├── AGENTS.md           全局长期记忆示例（.env 的 MEMORY_FILE 指向它时只读挂载到 /global/）
+    └── skills/             用户技能库（可为空，缺失时降级跳过）
 </code></pre>
+
+<h3>会话根：一条会话的「文件根」</h3>
+
+<p>
+  每个会话有且只有一个<strong>文件根</strong>：Agent 的文件工具、沙箱挂载根、附件目录、
+  技能来源与知识库索引全部以它为准。根只有两种来源，没有第三种：
+</p>
+
+<ul>
+  <li>
+    <strong>用户绑定的工作空间</strong>——新建会话时从宿主机上<strong>任意目录</strong>里挑一个
+    （不限制路径范围，这是产品规则）。同一个工作空间可以承载多条会话：它们的文件、附件与索引
+    都落在同一个项目目录里。
+  </li>
+  <li>
+    <strong>会话专属目录</strong>——没选工作空间的会话，由应用在 <code>SESSIONS_ROOT</code>
+    （默认 <code>&lt;数据目录&gt;/sessions</code>，见 <code>resolved_sessions_root</code>
+    <code>config.py:1287</code>）下按会话 ID 自动创建独立子目录（<code>session_dir</code>
+    <code>config.py:1309</code>），只有它自己用。WHY 要跟着数据目录走：会话的检查点、审计与
+    用量都在数据目录里，「备份/搬迁只需要搬一个目录」才成立。
+  </li>
+</ul>
+
+<p>
+  已有会话的根存在 <code>thread_meta.workspace</code>；<code>thread_meta.workspace_bound</code>
+  记录它当初是「用户选的」还是「应用建的」——界面靠它决定文案（「工作空间：…」还是
+  「会话专属目录：…」）。WHY 单独存这一列而不从路径推断：用户完全可以把工作空间选在
+  <code>sessions</code> 目录里面。
+</p>
+
+<h4>锁定：产生第一条交互之后不可更换</h4>
+
+<div class="box">
+  <span class="t">锁定发生在「这条会话第一次真正跑起来」的那一刻</span>
+  登记与锁定是同一条 UPSERT（<code>ThreadMetaStore.record_turn</code>
+  <code>runtime/thread_store.py:478</code>），而它只在会话的根还为空时才写入（SQL 里的
+  <code>CASE</code> 分支）。WHY 不放在更早的建会话接口里：那个接口只发号、不落库（会话在
+  首条消息时才诞生），提前写入会凭空造出一种「有根但没有内容」的记录。
+</div>
+
+<div class="box">
+  <span class="t">锁定之后不再接受改值</span>
+  后续请求如果给出<strong>不同</strong>的工作空间，直接 409 拒绝
+  （<code>SessionRootLockedError</code>）。WHY 不「以请求为准」：这条会话的文件、技能视图、
+  附件目录与索引都已经锚在旧根上，中途换根会把半条会话留在旧目录、半条写到新目录，
+  而两侧都不会报错。要换项目请<strong>新建会话</strong>。
+</div>
+
+<div class="box">
+  <span class="t">还没有根时如实说「还没有」——但仅限「连会话 ID 都没有」</span>
+  草稿态（连 ID 都还没申请）下的面板请求既没有可派生的专属目录，也没有用户指定的工作空间，
+  此时返回 <code>409</code>（<code>SessionRootNotReadyError</code>）并说明原因，而不是悄悄退到
+  某个默认目录：那会让用户在「以为在看自己的项目」的面板里看到别处的文件，而两边都不报错。
+  <br />
+  「未绑定工作空间的<strong>新</strong>会话」<strong>不属于</strong>这一种：它的 ID 在首次发送前
+  就已经发出，专属目录由该 ID 派生得出，因此解析直接给出那个目录（并与第一轮交互登记的根一致）。
+  WHY 这点值得单列：首条消息的附件构造与运行前的根解析都必须赶在会话登记之前完成，一旦这里报
+  「还没有根」，<strong>不选工作空间</strong>这条正常路径就会被自己的提示（「请先发出第一条
+  消息」）挡在门外——照着提示再发一次，结果一模一样。
+</div>
+
+<div class="box">
+  <span class="t">解析出来的根一定可用（专属目录按需创建）</span>
+  <code>SessionRegistry.resolve</code> 返回之前会保证那个目录存在：<strong>应用自己建的</strong>
+  专属目录按需建出来；<strong>用户选定的</strong>目录不见了则报 <code>409</code>
+  （<code>SessionRootUnavailableError</code>），并提示「恢复该目录，或删除这条会话」。
+  WHY 收在这一处：下游（Agent 装配、Backend、附件索引、文件面板）全都假定根存在，而专属目录
+  在第一次真正需要落文件之前并不存在——少了这一步，「打开一条还没发过消息的会话」会在构造
+  Backend 时撞上它那条「根必须是已存在的目录」的断言，用户点开自己的会话看到的是一个与他的
+  操作毫无关系的 500（<code>NotADirectoryError</code> 还是 <code>OSError</code>，
+  连 <code>except RuntimeError</code> 的兜底都接不住）。
+  WHY 不替用户重建：那是他选定的项目目录，建一个同名空目录会让「我的项目被清空了」看起来成真。
+</div>
+
+<h4>长期记忆：一份全局的，一份随工作区走的</h4>
+
+<p>
+  记忆分两层，来源不同、生效范围也不同：<strong>全局</strong>那份由
+  <code>MEMORY_FILE</code> 指定（人工维护、跨会话共享的偏好与约定），<strong>工作区</strong>
+  那份是各会话根下的 <code>AGENTS.md</code>（项目自己的说明）。两者合起来由
+  <code>SessionRoot.memory_plan</code>（<code>config.py:1650</code>）给出：来源列表
+  <strong>与</strong>为它们准备的挂载点。
+</p>
+
+<div class="box">
+  <span class="t">全局记忆为什么要「挂载」而不是「要求它放在工作区里」</span>
+  Agent 的文件根是本会话的工作区，而全局记忆按定义就在任何工作区之外。deepagents 的
+  <code>memory</code> 参数只收<strong>虚拟路径</strong>，而它对读不到的来源是<strong>静默跳过</strong>的
+  （只留一行 WARNING）——于是「配了全局记忆的实例里所有会话都少一条记忆」这件事不会以任何
+  错误的形式出现，用户看到的是「我明明写了约定，Agent 不照做」。做法是把那个文件作为
+  <strong>只读挂载点</strong>接进虚拟文件系统（<code>/global/AGENTS.md</code>，见
+  <code>agent/readonly_mount.py</code>）：Agent 读得到、引用得到，但写不动——
+  「人工维护」这条承诺因此有硬保证，而不是靠提示语叮嘱。
+  WHY 不复制/软链进根：那会让文件出现第二份真相，人工改了源文件而副本没变时，Agent 读到旧
+  内容且不报错。WHY 不放行任意绝对路径：那等于拆掉「Agent 能碰宿主哪片目录」这条边界。
+</div>
+
+<div class="box">
+  <span class="t">两处记忆只留一个来源</span>
+  <code>MEMORY_FILE</code> 一旦配置，工作区自带的 <code>AGENTS.md</code> 就<strong>不再</strong>
+  作为来源（它存在时记一行 INFO）。WHY：deepagents 只是把来源一起塞进提示，两处说法冲突时
+  没有任何优先级依据，用户很难理解「我改的是全局那份，Agent 却不照做」。同理，配了全局记忆
+  但文件不在时<strong>不</strong>静默回落到工作区那份——那会让用户以为生效的是 A，实际是 B。
+</div>
+
+<h4>根外存储：应用自己的目录不住在工作区里</h4>
+
+<p>
+  技能库、技能视图与工具输出留存原本住在工作区里（<code>&lt;根&gt;/skills</code>、
+  <code>&lt;根&gt;/.skills-active</code>、<code>&lt;根&gt;/_tool_outputs</code>）。
+  2026-09-21 起它们搬到<strong>根外存储</strong>：
+  <code>&lt;数据目录&gt;/roots/&lt;可读名&gt;-&lt;短哈希&gt;/{skills, skills-active, tool-outputs}</code>
+  （<code>SessionRoot.storage_dir</code>，<code>config.py:1695</code>）。
+</p>
+
+<div class="box">
+  <span class="t">为什么要搬：往用户的项目里写东西是越界</span>
+  工作区可能是<strong>用户的仓库</strong>——「挑一个目录当工作空间」不该等于「应用往那个目录里
+  放三个自己的名字」（污染他的版本控制，也让「这次操作到底动了什么」说不清）。搬出来之后，
+  工作区里只剩用户自己的文件与 Agent 的产物。
+  <br />
+  <strong>为什么必须挂回来</strong>：Agent 的文件工具只认虚拟路径，而 backend 的根就是工作区；
+  技能视图还得被 <code>SkillsMiddleware</code> 读到、工具留存要能被 <code>read_file</code>
+  回取、文件面板也要能打开「完整输出」。三者因此都挂在固定虚拟路径上：
+  <code>/skills</code>、<code>/.skills-active</code>、<code>/_tool_outputs</code>——
+  由 <code>agent/readonly_mount.py</code> 的<strong>目录挂载</strong>提供，写一律拒绝
+  （技能库由人工维护、视图是派生物、留存由服务端自己落盘）。
+  <br />
+  <strong>为什么按根派生、不按会话分</strong>：同一个工作空间可能承载多条会话，而「这里装了
+  什么技能」本来就该共享（启停状态也是全应用一份）；按会话分会让第二条会话看不到第一条装好的
+  技能——那正是「技能库」这个概念要消除的重复。
+</div>
+
+<div class="box">
+  <span class="t">迁移：技能包会搬，派生物不搬</span>
+  该根第一次被使用时，旧位置（<code>&lt;根&gt;/skills</code>）里的技能包会被<strong>搬</strong>到
+  根外存储（技能是用户放进来的东西，静默丢掉等于让它凭空消失）；空目录顺手清掉。
+  <code>.skills-active</code> 是派生物（重建即可）、<code>_tool_outputs</code> 是「最近若干次
+  输出」的缓存（有上限会自然淘汰），都不迁移。
+  <br />
+  <strong>例外</strong>：显式配置了 <code>SKILL_DIRS</code> 时技能库<strong>就是</strong>那些
+  目录——此时既不建我们那份，更不能把 <code>&lt;根&gt;/skills</code> 当旧位置搬走（那可能是
+  用户自己配进去的路径，搬走会让配置里的路径凭空消失）。
+</div>
+
+
+<h4>怎么挑：两种入口</h4>
+
+<table>
+  <thead><tr><th>入口</th><th>端点</th><th>适用与限制</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>系统文件夹选择对话框</td>
+      <td><code>POST /api/workspaces/pick</code></td>
+      <td>
+        原生弹窗、最省事。<strong>窗口出现在运行服务端的那台机器上</strong>——浏览器页面
+        拿不到宿主的绝对路径（<code>&lt;input webkitdirectory&gt;</code> 只给相对名，
+        File System Access API 只给一个 handle），要拿到 <code>D:\projects\my-app</code>
+        这种取值只能由服务端进程在自己的桌面上弹。因此容器 / 无桌面 / 浏览器与服务端分离
+        的部署会得到 <code>501</code>。
+      </td>
+    </tr>
+    <tr>
+      <td>网页内逐级浏览（也可直接粘贴路径）</td>
+      <td><code>GET /api/workspaces/dirs</code></td>
+      <td>只列目录、一次一层，从盘符（Windows）或 <code>/</code>（POSIX）出发。任何部署都能用，
+        是上面那条路走不通时的替代。</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  两条路都<strong>没有位置限制</strong>：工作空间允许用户任意选择（这是产品规则），服务端
+  不再过滤位置，唯一的门槛是权限本身（<code>file:read</code>）——能选任意目录，就意味着能读
+  任意目录。
+</p>
+
+<p>
+  实现落在 <code>runtime/folder_picker.py</code>（宿主侧进程控制，与 <code>sandbox</code>
+  同类），经应用层的 <code>choose_workspace_folder</code>（<code>application/session_registry.py:216</code>）
+  与 <code>list_directories</code>（<code>application/session_registry.py:150</code>）暴露给路由：
+  <code>interfaces</code> 按分层契约不能直接依赖 <code>runtime</code>。弹窗的失败各自映射到
+  不同状态码——环境不支持 <code>501</code>（该换入口）、已有弹窗 <code>409</code>（该重试）、
+  超时 <code>504</code>（窗口可能还留在屏幕上）；用户取消是 <code>200 cancelled=true</code>
+  （他什么都没做错）。
+</p>
+
+<p>
+  解析与装配集中在 <code>SessionRegistry</code>（<code>application/session_registry.py:264</code>）：
+  前者按上述规则算出「这次请求用哪个根」，后者按根装配文件面板 / 附件 / 技能视图 / 知识库四类
+  服务并缓存（同一个根只装配一份）。WHY 两者必须挨着：分开取用迟早拼出「面板指向 A、附件写到 B」
+  这种组合，而那不会报错。
+</p>
 
 <h3>关键文件职责与入口函数</h3>
 
 <table>
   <thead><tr><th>文件</th><th>对外入口</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td><code>main.py</code></td><td><code>main()</code> <code>main.py:137</code></td><td>子命令解析（<code>_build_parser</code> <code>main.py:82</code>）、配置失败兜底（退出码 2）、按命令分发到 <code>_run_cli</code> / <code>_run_web</code></td></tr>
-    <tr><td><code>config.py</code></td><td><code>AppConfig.load()</code> <code>config.py:1227</code></td><td>装载后立即 <code>ensure_directories()</code>；<code>get_config()</code> <code>config.py:1242</code> 以 <code>lru_cache</code> 保证进程内共享同一份</td></tr>
+    <tr><td><code>main.py</code></td><td><code>main()</code> <code>main.py:149</code></td><td>子命令解析（<code>_build_parser</code> <code>main.py:82</code>，含 <code>--workspace</code>）、配置失败兜底（退出码 2）、按命令分发到 <code>_run_cli</code> / <code>_run_web</code></td></tr>
+    <tr><td><code>config.py</code></td><td><code>AppConfig.load()</code> <code>config.py:1376</code></td><td>装载后立即 <code>ensure_directories()</code>（数据目录 + 会话目录的父目录 + 技能目录）；<code>get_config()</code> <code>config.py:2020</code> 以 <code>lru_cache</code> 保证进程内共享同一份</td></tr>
     <tr><td><code>agent/graph.py</code></td><td><code>build_agent()</code> / <code>AgentFactory.get()</code></td><td><code>AgentFactory</code> 为带锁双检的缓存版本，由装配层构造后注入服务</td></tr>
-    <tr><td><code>agent/backends.py</code></td><td><code>build_backend()</code></td><td>校验工作区存在性；<code>sandbox</code> 档位显式抛 <code>NotImplementedError</code> 而非静默降级</td></tr>
-    <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>runtime/thread_store.py:1063</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>runtime/thread_store.py:322</code> 提供登记、轮次累加、列表与删除</td></tr>
+    <tr><td><code>agent/backends.py</code></td><td><code>build_backend()</code></td><td>校验工作区存在性；<code>sandbox</code> 档位由 <code>build_sandbox_runner()</code> 按能力探测装配，档位不可用时显式抛 <code>SandboxUnavailableError</code> 而非静默降级（即下面档位表里的 <code>sandbox</code> 行）</td></tr>
+    <tr><td><code>runtime/thread_store.py</code></td><td><code>open_thread_store()</code> <code>runtime/thread_store.py:1144</code></td><td>会话元数据表（<code>thread_meta</code>）的连接托管与建表；<code>ThreadMetaStore</code> <code>runtime/thread_store.py:359</code> 提供登记、轮次累加、列表与删除</td></tr>
     <tr><td><code>application/run_service.py</code></td><td><code>RunService.stream()</code> / <code>resume()</code></td><td>普通协程，<strong>在进入流之前</strong>完成校验与模型初始化；返回产出 <code>AgentEvent</code> 的异步迭代器</td></tr>
     <tr><td><code>application/thread_service.py</code></td><td><code>ThreadService.history()</code> / <code>rename_thread()</code> / <code>set_archived()</code> / <code>delete_thread()</code></td><td>删除返回 <code>DeleteResult</code>，用 <code>DeleteOutcome</code> 区分不存在 / 部分成功 / 失败</td></tr>
-    <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>interfaces/cli.py:242</code></td><td>主循环 + <code>_run_turn()</code> <code>interfaces/cli.py:209</code> 中断循环 + <code>ask_human()</code> <code>interfaces/cli.py:98</code> 决策采集</td></tr>
+    <tr><td><code>interfaces/cli.py</code></td><td><code>run_cli()</code> <code>interfaces/cli.py:262</code></td><td>主循环 + <code>_run_turn()</code> <code>interfaces/cli.py:210</code> 中断循环 + <code>ask_human()</code> <code>interfaces/cli.py:99</code> 决策采集</td></tr>
     <tr><td><code>interfaces/web/app.py</code></td><td><code>create_app()</code> <code>interfaces/web/app.py:128</code></td><td>路由注册必须在静态挂载之前，否则 API 被 <code>/</code> 吞掉</td></tr>
     <tr><td><code>interfaces/web/routes.py</code></td><td><code>router</code>（前缀 <code>/api</code>）</td><td>19 个端点，4 个以 SSE 返回（<code>media_type="text/event-stream"</code>）</td></tr>
   </tbody>
@@ -453,7 +652,7 @@
 
 <p>
   <code>config.py</code> 是全应用<strong>唯一的</strong>环境变量解析点，读取优先级为
-  <code>环境变量 &gt; .env 文件 &gt; 字段默认值</code>（<code>config.py:313-318</code>）。
+  <code>环境变量 &gt; .env 文件 &gt; 字段默认值</code>（<code>config.py:352</code>）。
   选用 <code>pydantic-settings</code> 而非裸 <code>os.getenv</code>，是为了让类型转换、
   缺省值与非法值拦截由框架统一处理。
 </p>
@@ -461,30 +660,52 @@
 <h4>三类字段</h4>
 <ul>
   <li><strong>模型与 LLM 参数</strong>：<code>deepseek_*</code>、<code>llm_temperature</code>（限 0–2）、<code>llm_timeout</code>（&gt;0）、<code>llm_max_retries</code>（&gt;=0）。</li>
-  <li><strong>运行时路径</strong>：<code>workspace</code>、<code>memory_file</code>、<code>db_path</code>、<code>skill_dirs</code>。</li>
+  <li><strong>运行时路径</strong>：<code>sessions_root</code>（未绑定工作空间的会话，其专属目录的父目录，留空按 <code>&lt;数据目录&gt;/sessions</code> 派生）、<code>memory_file</code>（<strong>全局</strong>长期记忆，留空即改用各会话根下的 <code>AGENTS.md</code>）、<code>db_path</code>、<code>skill_dirs</code>（留空即按各会话根派生）。</li>
   <li><strong>安全与护栏</strong>：<code>execution_mode</code>、<code>shell_timeout</code>、<code>shell_max_output_bytes</code>、<code>max_model_calls_per_run</code>、<code>recursion_limit</code>。</li>
 </ul>
 
 <h4>路径处理的两个关键约定</h4>
 
+<p class="lede">
+  这两条都落在 <code>SessionRoot</code>（<code>config.py:1576</code>）而不是
+  <code>AppConfig</code> 上。WHY：工作区在会话级可选之后，凡是由它派生的东西
+  （技能目录、虚拟路径映射、工作区自带的记忆文件）都必须<strong>跟着某一个具体工作区</strong>算。
+  把这些方法留在配置对象上并各加一个 <code>root</code> 参数，任何一处漏传都会静默
+  退回启动默认值——而症状是文件落进了别人的项目。收进一个必须显式获得的对象里，漏了就是
+  <code>AttributeError</code>。
+</p>
+
+<p>
+  唯一的例外是<strong>全局</strong>长期记忆：它按定义不跟着任何工作区走，因此它的路径来自
+  <code>AppConfig.memory_file</code>——但它进入 Agent 的方式（只读挂载）仍然由
+  <code>SessionRoot</code> 统一给出，免得「来源」与「挂载」两处各算一份而漂开。
+</p>
+
 <div class="box">
   <span class="t">1. 路径统一展开为绝对路径</span>
-  <code>_expand_path</code>（<code>config.py:912</code>）对 <code>workspace</code> /
-  <code>memory_file</code> / <code>db_path</code> 执行 <code>expanduser().resolve()</code>。
-  WHY：Backend 的 <code>root_dir</code> 若为相对路径，进程工作目录一旦变化就会指向不同物理目录。
+  <code>_expand_path</code>（<code>config.py:1053</code>）对 <code>memory_file</code> /
+  <code>db_path</code> 执行 <code>expanduser().resolve()</code>；根目录
+  在同一位置展开，并额外校验它<strong>已存在且是目录</strong>。
+  WHY：Backend 的 <code>root_dir</code> 若为相对路径，进程工作目录一旦变化就会指向不同物理目录；
+  而工作区若交给 <code>ensure_directories()</code> 去 <code>mkdir</code>，
+  一个拼错的路径会被「成功」地变成一个空目录。
 </div>
 
 <div class="box">
   <span class="t">2. 传给 deepagents 的路径必须是「相对工作区的 POSIX 路径」</span>
-  <code>skill_source_paths()</code>（<code>config.py:1180</code>）与 <code>memory_paths</code>
-  （<code>config.py:1204</code>）都做了 <code>relative_to(workspace)</code> 再前置 <code>/</code>。
-  WHY：虚拟文件系统内部以 <code>/</code> 为根分隔符，且 Backend 的根就是 <code>workspace</code>；
-  传宿主机绝对路径（Windows 下还带盘符与反斜杠）永远命中不了。位于工作区之外的目录无法映射，只能跳过并告警。
+  <code>skill_source_paths()</code>（<code>config.py:1971</code>）与 <code>memory_plan</code>
+  （<code>config.py:1650</code>）都给出相对本工作区的虚拟路径。<strong>唯一的例外</strong>是全局长期
+  记忆：它在工作区之外，走只读挂载（<code>/global/…</code>），因此给出的是<strong>挂载点内的
+  路径</strong>而不是工作区内的相对路径。
+  WHY：虚拟文件系统内部以 <code>/</code> 为根分隔符，且 Backend 的根就是这条会话的文件根；
+  传宿主机绝对路径（Windows 下还带盘符与反斜杠）永远命中不了。
+  工作区**之外**的技能目录（内置技能就是这种）不能靠拼接映射，改由
+  <code>read_only_mounts</code> 挂一个虚拟路径——不挂的话它一个都读不到，且没有任何告警。
 </div>
 
 <p>
-  <code>existing_skill_dirs()</code>（<code>config.py:1156</code>）在技能目录缺失时只记录告警
-  而不报错——技能库属于可选能力，缺失应当降级而非让应用无法启动。
+  <code>skill_sources()</code>（<code>config.py:1932</code>）在技能目录缺失时只记录告警
+  并跳过该来源，而不报错——技能库属于可选能力，缺失应当降级而非让应用无法启动。
 </p>
 
 <!-- ============================================================ -->
@@ -544,7 +765,7 @@
 <h3>6.1 <code>agent/graph.py</code>：唯一装配点</h3>
 
 <p>
-  全应用只有 <code>build_agent()</code>（<code>agent/graph.py:80</code>）一处调用
+  全应用只有 <code>build_agent()</code>（<code>agent/graph.py:81</code>）一处调用
   <code>create_deep_agent</code>。这是<strong>刻意的收敛</strong>：该函数的参数组合会随
   Backend、权限、技能、Profile 指数增长，散落多处调用必然导致护栏口径不一致，
   也让安全审计失去锚点。
@@ -555,7 +776,7 @@
   <thead><tr><th>参数</th><th>取值来源</th><th>作用</th></tr></thead>
   <tbody>
     <tr><td><code>model</code></td><td><code>registry.get(别名)</code></td><td>按别名解析到具体模型实例</td></tr>
-    <tr><td><code>system_prompt</code></td><td><code>_FALLBACK_SYSTEM_PROMPT</code> <code>agent/graph.py:58</code></td><td>兜底提示；确保 Profile 未注册时仍保留规划与结果落盘引导</td></tr>
+    <tr><td><code>system_prompt</code></td><td><code>_FALLBACK_SYSTEM_PROMPT</code> <code>agent/graph.py:59</code></td><td>兜底提示；确保 Profile 未注册时仍保留规划与结果落盘引导</td></tr>
     <tr><td><code>backend</code></td><td><code>build_backend()</code></td><td>文件落点与命令执行策略</td></tr>
     <tr><td><code>skills</code> / <code>memory</code></td><td><code>config</code> 换算后的 POSIX 路径</td><td>技能库与长期记忆，空则传 <code>None</code></td></tr>
     <tr><td><code>permissions</code></td><td><code>build_permissions()</code></td><td>文件系统安全规则</td></tr>
@@ -609,22 +830,22 @@
   <tbody>
     <tr>
       <td><code>local</code></td>
-      <td><code>_ExtendedPathSafeLocalShellBackend</code> <code>agent/backends.py:67</code></td>
+      <td><code>_ExtendedPathSafeLocalShellBackend</code> <code>agent/backends.py:68</code></td>
       <td>宿主机直跑 shell。<code>inherit_env=False</code> 是刻意的——宿主机环境变量常含 API Key，
-      会顺着子进程泄漏。装配前会打印高危告警（<code>agent/backends.py:179</code>）</td>
+      会顺着子进程泄漏。装配前会打印高危告警（<code>agent/backends.py:161</code> 的 <code>build_backend</code>）</td>
     </tr>
     <tr>
       <td><code>sandbox</code></td>
-      <td><code>SandboxedFilesystemBackend</code> <code>agent/backends.py:195</code></td>
+      <td><code>SandboxedFilesystemBackend</code> <code>agent/sandbox_backend.py:40</code></td>
       <td><strong>（2026-09-20 订正）</strong>该档位已实现，不再抛
       <code>NotImplementedError</code>：runner 由 <code>build_sandbox_runner()</code>
-      （<code>agent/backends.py:194</code>）按能力探测装配，装配失败直接抛出，<strong>不退化成本机执行</strong>。
-      装配后打印告警说明「只做资源管控，不是安全边界」（<code>agent/backends.py:205-209</code>）。
+      （<code>runtime/sandbox/factory.py:88</code>）按能力探测装配，装配失败直接抛出，<strong>不退化成本机执行</strong>。
+      装配后打印告警说明「只做资源管控，不是安全边界」（<code>runtime/sandbox/factory.py:88</code>）。
       此前这里写的是「显式抛 <code>NotImplementedError</code>」——Tier 2 容器沙箱落地后已不成立</td>
     </tr>
     <tr>
       <td><code>disabled</code>（默认）</td>
-      <td><code>_ExtendedPathSafeFilesystemBackend</code> <code>agent/backends.py:215</code></td>
+      <td><code>_ExtendedPathSafeFilesystemBackend</code> <code>agent/backends.py:150</code></td>
       <td>非沙盒后端不满足 <code>SandboxBackendProtocol</code>，<code>execute</code> 工具存在但调用即返回错误，
       模型可据此调整策略</td>
     </tr>
@@ -1029,13 +1250,13 @@ ON CONFLICT(thread_id) DO UPDATE SET
   <tbody>
     <tr><td><code>render_event()</code></td><td><code>interfaces/cli.py:40</code></td>
       <td>按事件类型渲染：token 不换行并强制 <code>flush</code>（否则用户以为卡死）；tool_call 压成单行参数摘要；todos 打印清单；step 静默</td></tr>
-    <tr><td><code>ask_human()</code></td><td><code>interfaces/cli.py:98</code></td>
+    <tr><td><code>ask_human()</code></td><td><code>interfaces/cli.py:99</code></td>
       <td>逐条渲染待审批调用，按 <code>allowed_decisions</code> 动态给出 <code>a/r/e/s</code> 选项；
       <code>edit</code> 会循环重新输入直到 JSON 合法；返回 <code>{"decisions": [...]}</code></td></tr>
-    <tr><td><code>_run_turn()</code></td><td><code>interfaces/cli.py:209</code></td>
+    <tr><td><code>_run_turn()</code></td><td><code>interfaces/cli.py:210</code></td>
       <td>先消费 <code>stream</code>，再用 <code>while pending_payload</code> 循环处理多次中断。
       恢复时<strong>沿用同一 <code>model_name</code></strong>——中断与恢复是同一次运行的两个半程</td></tr>
-    <tr><td><code>run_cli()</code></td><td><code>interfaces/cli.py:242</code></td>
+    <tr><td><code>run_cli()</code></td><td><code>interfaces/cli.py:262</code></td>
       <td>检查点托管 → 构造 service → <strong>启动即校验模型别名</strong>（只比对名称，不需要密钥，可快速失败）
       → 主循环（<code>EOFError</code> 视为正常结束以支持管道输入）</td></tr>
   </tbody>
@@ -1125,14 +1346,14 @@ ON CONFLICT(thread_id) DO UPDATE SET
 
 <h4><code>schemas.py</code>：请求/响应模型</h4>
 <ul>
-  <li><code>ChatRequest</code>（<code>interfaces/web/schemas.py:55</code>）：<code>content</code>（<code>min_length=1</code>）+ 可选 <code>model</code>；</li>
-  <li><code>ResumeRequest</code>（<code>interfaces/web/schemas.py:82</code>）：<code>decisions</code>（非空列表）+ 可选 <code>model</code>；</li>
+  <li><code>ChatRequest</code>（<code>interfaces/web/schemas.py:55</code>）：<code>content</code>（<code>min_length=1</code>）+ 可选 <code>model</code> + 可选 <code>workspace</code>（<strong>只在会话首条消息上生效</strong>，见「工作区」一节）；</li>
+  <li><code>ResumeRequest</code>（<code>interfaces/web/schemas.py:89</code>）：<code>decisions</code>（非空列表）+ 可选 <code>model</code>；</li>
   <li><code>DecisionPayload</code>（<code>interfaces/web/schemas.py:24</code>）：<code>type</code> 用 <code>Literal</code> 限定为
     <code>approve/edit/reject/respond</code> 四值，越界在框架层就被拦下；</li>
   <li><code>ModelInfo</code>（定义在 <code>application/dto.py:40</code>，本模块在第 14 行再导出）
     刻意不含任何密钥字段；</li>
-  <li><code>ThreadSummary</code>（定义在 <code>application/dto.py:126</code>）与
-    <code>ThreadListResponse</code>（<code>interfaces/web/schemas.py:135</code>）：
+  <li><code>ThreadSummary</code>（定义在 <code>application/dto.py:182</code>）与
+    <code>ThreadListResponse</code>（<code>interfaces/web/schemas.py:142</code>）：
     会话清单的条目与分页包装，时间以 ISO8601 字符串直接透出（库中即此格式，免去一次无意义的转换）。</li>
 </ul>
 
@@ -1441,10 +1662,10 @@ StreamingResponse(text/event-stream)
   <thead><tr><th>数据</th><th>落点</th><th>生命周期</th></tr></thead>
   <tbody>
     <tr><td>会话消息与图状态</td><td><code>.data/agent.db</code>（SQLite）</td><td>持久，进程重启后可续聊</td></tr>
-    <tr><td>工作文件（模型读写）</td><td><code>workspace/</code></td><td>持久，与用户磁盘一致</td></tr>
+    <tr><td>工作文件（模型读写）</td><td>会话根：用户选的工作空间，或应用为这条会话建的专属目录</td><td>持久，与用户磁盘一致</td></tr>
     <tr><td>会话元数据（标题 / 时间 / 轮次）</td><td><code>.data/agent.db</code> 的 <code>thread_meta</code> 表</td><td>持久，与检查点同库</td></tr>
     <tr><td>长期记忆（<code>/memories/</code>，Agent 自写）</td><td><code>.data/agent.db</code> 的 Store 表</td><td>持久，<strong>按主体隔离命名空间</strong></td></tr>
-    <tr><td>长期记忆（<code>AGENTS.md</code>，人工维护）</td><td><code>workspace/AGENTS.md</code></td><td>持久，作为 <code>memory</code> 参数加载</td></tr>
+    <tr><td>长期记忆（<code>AGENTS.md</code>，人工维护）</td><td><code>&lt;会话根&gt;/AGENTS.md</code></td><td>持久，作为 <code>memory</code> 参数加载</td></tr>
   </tbody>
 </table>
 
@@ -1468,8 +1689,8 @@ StreamingResponse(text/event-stream)
     <tr><td><code>SHELL_MAX_OUTPUT_BYTES</code></td><td><code>100000</code></td><td>&gt;0</td><td>shell 输出截断阈值</td></tr>
     <tr><td><code>MAX_MODEL_CALLS_PER_RUN</code></td><td><code>60</code></td><td>&gt;0</td><td>单轮模型调用上限，防死循环</td></tr>
     <tr><td><code>RECURSION_LIMIT</code></td><td><code>100</code></td><td>&gt;0</td><td>图递归深度上限</td></tr>
-    <tr><td><code>WORKSPACE</code></td><td><code>./workspace</code></td><td>展开为绝对路径</td><td>文件工具的活动边界</td></tr>
-    <tr><td><code>MEMORY_FILE</code></td><td><code>./workspace/AGENTS.md</code></td><td>须在工作区内</td><td>长期记忆文件</td></tr>
+    <tr><td><code>SESSIONS_ROOT</code></td><td><code>&lt;数据目录&gt;/sessions</code></td><td>父目录按需创建</td><td>未绑定工作空间的会话，其专属目录的父目录；每个会话一个子目录（名字就是会话 ID）</td></tr>
+    <tr><td><code>MEMORY_FILE</code></td><td><code>&lt;会话根&gt;/AGENTS.md</code></td><td>须在会话根内</td><td>长期记忆文件；注释掉即按各会话根派生</td></tr>
     <tr><td><code>DB_PATH</code></td><td><code>./.data/agent.db</code></td><td>展开为绝对路径</td><td>SQLite 数据库（检查点表 + 会话元数据表）</td></tr>
     <tr><td><code>THREAD_TITLE_MAX_CHARS</code></td><td><code>24</code></td><td>1–200</td><td>会话列表标题的字符上限，超出以省略号截断</td></tr>
     <tr><td>HOST / PORT</td><td><code>127.0.0.1</code> / <code>8000</code></td><td>端口 1–65535</td><td>Web 监听地址与端口</td></tr>
@@ -1481,8 +1702,9 @@ StreamingResponse(text/event-stream)
 </table>
 
 <p class="lede">
-  另有 <code>SKILL_DIRS</code>（默认 <code>./workspace/skills</code>）：已补进
-  <code>.env.example</code>，并按路径分隔符解析多目录（Windows <code>;</code>、
+  另有 <code>SKILL_DIRS</code>（默认派生两项：随应用交付的
+  <code>&lt;应用目录&gt;/skills-builtin</code> 与工作区内的 <code>skills/</code>）：
+  已补进 <code>.env.example</code>，并按路径分隔符解析多目录（Windows <code>;</code>、
   POSIX <code>:</code>，与 <code>PATH</code> 同口径）——路径本身可能含逗号，
   按逗号切会把一个目录拆成两个不存在的目录，症状是「技能没加载」。
   <code>SANDBOX_ENV_ALLOWLIST</code>、<code>CUSTOM_TOOL_MODULES</code> 用逗号分隔，
@@ -1552,15 +1774,18 @@ StreamingResponse(text/event-stream)
 </details>
 
 <details>
-  <summary>为什么 <code>sandbox</code> 档位抛异常而不是降级？</summary>
-  <p>静默降级会让使用者误以为命令跑在容器里，而实际作用在宿主机上——
-  这是安全语义的欺骗，比启动失败严重得多。</p>
+  <summary>为什么 <code>sandbox</code> 档位不可用时抛异常而不是降级？</summary>
+  <p>静默降级会让使用者误以为命令跑在隔离环境里，而实际作用在宿主机上——
+  这是安全语义的欺骗，比启动失败严重得多。同理，<code>auto</code> 档位在候选
+  探测失败而回落到更弱档位时，会把跳过了哪些档位写进日志，而不是悄悄换一个。</p>
 </details>
 
 <details>
-  <summary>为什么 HITL 只在 <code>local</code> 档位开启？</summary>
+  <summary>为什么 <code>disabled</code> 档位不配审批？</summary>
   <p><code>disabled</code> 下 <code>execute</code> 自身返回错误，再叠加审批只是让用户
-  反复确认一个注定失败的调用；<code>sandbox</code> 由沙箱本身提供隔离保证。</p>
+  反复确认一个注定失败的调用。<code>local</code> 与<strong>三个沙箱档位</strong>都默认
+  开启审批，文案按档位取值、写明该档的真实边界；<code>sandbox</code> 下只有显式设
+  <code>SANDBOX_REQUIRE_APPROVAL=false</code> 才会关闭，关闭时打告警。</p>
 </details>
 
 <details>
@@ -1633,7 +1858,11 @@ StreamingResponse(text/event-stream)
 <h3>18.2 已知限制</h3>
 <ul>
   <li><strong>模型供应商单一</strong>：注册表当前只注册 <code>deepseek-flash</code>，其余 provider 未接入。</li>
-  <li><strong><code>sandbox</code> 档位未实现</strong>：需接入外部沙盒实现后才能启用。</li>
+  <li><strong>沙箱三档都不是安全边界</strong>：Tier 0（进程沙箱）/ Tier 1（WSL 发行版）/
+    Tier 2（容器）均已实现（<strong>2026-09-20 订正</strong>：此处原写「<code>sandbox</code>
+    档位未实现」，T24 落地后已不成立），它们解决的是「命令失控」而不是提权与逃逸——
+    Tier 1 经 <code>/mnt</code> 可读写宿主文件、且 WSL interop 允许反向启动 Windows 程序，
+    Tier 2 共享宿主内核，三档都必须与人工审批配合。</li>
   <li><strong>长期记忆无跨主体管理入口</strong>：记忆已持久化并按主体隔离，但
     <code>GET/DELETE /api/memories</code> 只作用于调用者自己的那一份，管理员也无法
     查看或清理他人记忆——跨主体读取需要独立的授权与审计设计，本期未做。</li>

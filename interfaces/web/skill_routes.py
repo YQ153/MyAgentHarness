@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from application.errors import NotFoundError
 from application.principal import Principal
 from application.skill_service import SkillService
 from interfaces.web.auth import require_permission
-from interfaces.web.deps import require_state
+from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import (
     SkillListResponse,
     SkillToggleRequest,
@@ -37,9 +37,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["skills"])
 
 
-def get_skills(request: Request) -> SkillService:
-    """取出技能库服务单例。"""
-    return require_state(request, "skills", "技能库服务")
+async def get_skills(
+    request: Request,
+    thread_id: str | None = Query(default=None, description="会话 ID；给了就按该会话的工作区解析"),
+    workspace: str | None = Query(
+        default=None,
+        description="仅在该会话尚未绑定时生效（草稿态预览就是这种情况）",
+    ),
+) -> SkillService:
+    """取出**该会话工作区**的技能库服务。
+
+    WHY 按会话解析：物化视图（``/.skills-active``）与用户技能目录都是按工作区各一份的
+    衍生物。用全局那一个会让面板显示 A 工作区的技能集，而 Agent 在 B 工作区里按另一份
+    做事——两边都不报错，用户看到的却是两套事实。
+
+    WHY 还要一个 ``workspace`` 参数：草稿态下这条会话还没登记，而用户可能已经选了别的
+    工作区；不认这个取值，面板展示的技能集与即将使用的那份就是两回事。
+
+    WHY ``allow_missing``：同上，新会话在首条消息之前还没登记。
+    """
+    bundle = await resolve_scoped_services(request, thread_id=thread_id, requested=workspace)
+    return bundle.skills
 
 
 @router.get("/api/skills", response_model=SkillListResponse)

@@ -54,7 +54,10 @@ def test_compose_keeps_authentication_on_and_persists_state() -> None:
     # 注意断言的是「带默认值的可覆盖形式」——改回硬编码会让本机排查时无法临时覆盖。
     assert "${AUTH_MODE:-apikey}" in compose
     assert "/app/.data" in compose
-    assert "/app/workspace" in compose
+    # WHY 断的是「会话专属目录也在那个卷里」：不绑定工作空间的会话，其文件根落在
+    # SESSIONS_ROOT 下——它必须在可写卷里，否则容器重建一次，那些会话的产物就没了，
+    # 而用户不会收到任何提示。
+    assert "/app/.data/sessions" in compose
 
 
 def test_compose_binds_to_loopback_by_default() -> None:

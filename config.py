@@ -8,17 +8,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import re
+import shutil
+from dataclasses import dataclass
 from enum import StrEnum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -64,14 +67,121 @@ provider 的多模态接口共同支持的集合；把 PDF / 文本也放进来�
 但构造消息时才失败」的入口，而那正是本任务要消除的静默失败。
 """
 
+_APP_ROOT = Path(__file__).resolve().parent
+"""应用自身的目录（源码树根，容器内为 ``/app``）。
+
+WHY 用 ``__file__`` 定位而不是 ``./``：按进程工作目录解析的默认值会在「从别的目录
+启动进程」时指向一个不存在的路径，而表现是内置资产凭空消失，没有任何报错。
+"""
+
+BUILTIN_SKILLS_DIR: Path = _APP_ROOT / "skills-builtin"
+"""随应用交付的内置技能目录。
+
+WHY 不在用户工作区内：工作区由用户显式指定（可能是任意项目目录），把随产品交付的
+资产写进别人的项目里既越界，也会在用户换一个工作区之后失效——而失效形态只是几行
+WARNING，功能上是「内置技能装了却用不上」。
+"""
+
+_MEMORY_FILE_NAME = "AGENTS.md"
+"""长期记忆文件的默认文件名（与 ``AGENTS.md`` 生态惯例一致）。"""
+
+GLOBAL_MEMORY_PREFIX = "/global/"
+"""**全局**长期记忆在虚拟文件系统里的挂载前缀。
+
+WHY 需要独立前缀、不直接挂在虚拟根上：虚拟根就是**本会话的工作区**，``/AGENTS.md``
+在那里表示「这个工作区自带的说明文件」。两者来源不同（一个跨全部会话、一个只对落在该
+工作区的会话），挤到同一个路径上就只能二选一——而用户要的是「全局那份额外对我生效」。
+"""
+
+_ROOTS_STORE_DIR_NAME = "roots"
+"""根外存储的父目录名（在数据目录下）：一个会话根一个子目录。
+
+WHY 跟着数据目录、不做成配置项：它必须与数据目录**同卷**（搬迁/备份只搬数据目录这件事
+才成立），而多一个配置项只会多一种「配到别的盘」的机会，换不来任何能力。
+"""
+
+_SKILLS_STORE_DIR_NAME = "skills"
+"""技能库子目录名（位于某个根的存储目录里）：用户放技能包的地方。"""
+
+_SKILL_VIEW_STORE_DIR_NAME = "skills-active"
+"""技能视图子目录名（同上）：只把**启用中**的技能物化出来的派生物。"""
+
+_TOOL_OUTPUTS_STORE_DIR_NAME = "tool-outputs"
+"""工具输出留存子目录名（同上）。"""
+
+VIRTUAL_SKILLS = "/skills"
+"""技能库在虚拟文件系统里的挂载点（Agent 只读）。"""
+
+VIRTUAL_BUILTIN_SKILLS = "/skills-builtin"
+"""随应用交付的内置技能在虚拟文件系统里的挂载点（Agent 只读）。"""
+
+VIRTUAL_SKILL_VIEW = "/.skills-active"
+"""技能视图在虚拟文件系统里的挂载点：**建图时的技能来源就是它**。
+
+WHY 名字带点：它是程序产物，不是用户的资料——虽然它已经不在工作区里（面板不会再遍历到
+它），但保留这个前缀能让日志与虚拟路径一眼区分「技能包本体」与「它的派生物」。
+"""
+
+VIRTUAL_TOOL_OUTPUTS = "/_tool_outputs"
+"""工具输出留存在虚拟文件系统里的挂载点。
+
+WHY 名字带下划线：与技能视图同理——它是系统的旁路留存，不是任务成果；消息与日志里出现
+``/_tool_outputs/...`` 时，读者应当立刻知道那是「可回取的完整输出」而不是用户文件。
+"""
+
+_USER_SKILLS_DIR_NAME = "skills"
+"""旧版本里「会话根下用户技能目录」的目录名。
+
+WHY 还留着它：根外存储落地后，技能库搬到了 ``<数据目录>/roots/<根标识>/skills``，但
+**工作区里可能还留着旧位置**——启动时要能认出它并把技能包搬过去（见
+``SessionRoot._migrate_legacy_skills``）。名字另取一个常量会让迁移代码与旧布局对不上。
+"""
+
+_SESSIONS_DIR_NAME = "sessions"
+"""未绑定工作空间的会话，其专属目录在数据目录下的默认位置。"""
+
+_UNSAFE_DIR_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _readable_dir_name(root: Path, *, limit: int = 32) -> str:
+    """把工作区路径的最后一段压成一个可安全用作目录名的可读片段。
+
+    WHY 要可读：``roots/`` 下会住着十几个存储目录，纯哈希名在排障时无法对应回工作区。
+    WHY 还要截断与清洗：目录名可能含空格、中文、超长路径段，直接拼进路径既可能超出平台
+    上限，也可能与分隔符撞上。
+
+    Args:
+        root: 工作区根目录。
+        limit: 片段的最大字符数。
+
+    Returns:
+        仅含 ``[A-Za-z0-9._-]`` 的片段；清洗后为空时返回 ``root``。
+    """
+    cleaned = _UNSAFE_DIR_NAME.sub("_", root.name.strip())[:limit].strip("._")
+    return cleaned or "root"
+
+
+@dataclass(frozen=True)
+class SkillSource:
+    """一个技能来源：宿主机上的真实目录 + 它在虚拟文件系统里的挂载路径。
+
+    WHY 需要这一对：技能包由 ``SkillsMiddleware`` 经 backend 读取，而 backend 只认虚拟
+    路径。技能库已经搬到工作区之外的存储目录（``SessionRoot.skills_store``），内置技能
+    随应用交付、同样在工作区之外——两者都必须显式挂一个虚拟路径才读得到
+    （见 ``SessionRoot.read_only_mounts``），否则**一个都读不到且没有任何告警**。
+    """
+
+    host_dir: Path
+    virtual: str
+
 
 class ExecutionMode(StrEnum):
     """``execute`` 工具的执行档位。
 
     local:    宿主机直跑 shell，仅限本机开发，与 ``LocalShellBackend`` 的安全
               警告一致——绝不可用于 Web 或多租户环境。
-    sandbox:  沙箱内执行 shell。具体隔离强度由 ``SandboxTier`` 决定，当前已
-              实现 Tier 0（进程沙箱，零依赖），需与人工审批配合使用。
+    sandbox:  沙箱内执行 shell。隔离强度由 ``SandboxTier`` 决定，Tier 0 / 1 / 2
+              （进程 / WSL / 容器）均已实现；都不是安全边界，须与人工审批配合。
     disabled: 使用非沙盒后端，``execute`` 工具仍存在但调用后返回错误；
               这是默认档位，保证进程上线即处于安全状态。
     """
@@ -361,23 +471,54 @@ class AppConfig(BaseSettings):
 
 
     # ---------------- 运行时路径 ----------------
-    workspace: Path = Path("./workspace")
-    memory_file: Path = Path("./workspace/AGENTS.md")
+    #
+    # WHY 没有「默认工作空间」这一项：会话的工作空间由用户在**创建会话时**指定，也可以
+    # 不指定。配置里再放一个默认值，就等于把「不指定」偷偷变成「指定了配置里那个」——
+    # 而这两种选择在本模型下必须产生不同的结果（后者落到应用管理的会话专属目录里）。
+    #
+    memory_file: Path | None = None
+    """**全局**长期记忆文件（人工维护，Agent 只读）。
+
+    ``None`` 表示不配全局记忆，改用 ``<会话根>/AGENTS.md``（若存在）——那一份是**工作区
+    自带**的说明文件，只对落在该工作区的会话生效。
+
+    WHY 显式配置的这一份按「全局」对待：它的用途就是跨会话共享的偏好与约定（称呼、
+    语言、项目惯例）。要求它落在会话根之内，等于要求用户为每条会话各维护一份，而那恰好
+    是它要消除的重复。它由应用以**只读挂载**的方式进入虚拟文件系统
+    （``/global/<文件名>``，见 ``SessionRoot.memory_plan``），因此不需要、也不应该位于
+    任何工作区内部。
+    """
+
     db_path: Path = Field(default=Path("./.data/agent.db"))
-    skill_dirs: Annotated[list[Path], NoDecode] = Field(
-        default_factory=lambda: [
-            Path("./workspace/skills-builtin"),
-            Path("./workspace/skills"),
-        ]
-    )
-    """技能目录（按顺序查找）。
+
+    sessions_root: Path | None = None
+    """**未绑定工作空间的会话**其专属目录的父目录。
+
+    ``None`` 表示按 ``<数据目录>/sessions`` 派生（见 ``resolved_sessions_root``）——
+    数据目录就是 ``DB_PATH`` 所在目录。WHY 跟着数据目录走：会话的检查点、审计与用量
+    都在那个库里，把「会话专属目录」放在别处会让「备份/搬迁只需要搬一个目录」不再成立。
+
+    WHY 需要它：要求「不绑定工作空间的会话，在应用指定的文件夹下自动创建独立子文件夹」。
+    没有这一项，那些会话就没有文件根——而 Agent 的文件工具、沙箱挂载根、附件与知识库
+    索引都需要一个根。
+
+    每个会话的子目录名就是它的会话 ID（见 ``session_dir``）。
+    """
+
+    skill_dirs: Annotated[list[Path], NoDecode] = Field(default_factory=list)
+    """技能目录（按顺序查找）。**空列表表示按工作区派生**，见 ``SessionRoot``。
 
     **顺序有语义：越靠后优先级越高**（上游 ``SkillsMiddleware`` 的规则是同名技能由后面的
     来源覆盖前面的）。因此内置目录排在**前面**（低优先级），用户才能用同名技能覆盖内置的
     那一个；顺序反过来会让内置技能永远赢，而「我改了却不生效」不会有任何报错。
 
-    WHY 内置技能也放进工作区：``skill_source_paths()`` 只能映射工作区内的目录（后端是工作区
-    限定视图），放在包内或仓库其它位置会被跳过——表现为「内置技能装了却用不上」。
+    为空时每个根派生两项：随应用交付的 ``BUILTIN_SKILLS_DIR``（应用目录里），以及该根的
+    技能库 ``SessionRoot.skills_store``（在**根外存储**里，不在工作区内）。两项都在工作区
+    之外，因此都由 ``read_only_mounts`` 挂上虚拟路径——backend 只认虚拟路径，不挂载就会
+    「一个都读不到且没有任何告警」。
+
+    WHY 一旦显式配置就**对所有工作区生效**（不再按工作区分叉）：显式给的是绝对路径，
+    它表达的是「技能包放在这些固定位置」，与当前是哪个工作区无关。
 
     环境变量支持两种写法：路径分隔符（Windows ``;`` / POSIX ``:``，与 ``PATH``
     同口径）或 JSON 数组。**不用逗号**——路径本身可能含逗号，按逗号切会把
@@ -907,14 +1048,16 @@ class AppConfig(BaseSettings):
     每一次本地排障都先过一道格式转换。结构化是「上线时需要」的能力，不是默认形态。
     """
 
-    @field_validator("workspace", "memory_file", "db_path", mode="after")
+    @field_validator("memory_file", "db_path", "sessions_root", mode="after")
     @classmethod
-    def _expand_path(cls, value: Path) -> Path:
-        """展开用户目录并转绝对路径。
+    def _expand_path(cls, value: Path | None) -> Path | None:
+        """展开用户目录并转绝对路径；``None`` 表示「未配置，稍后派生」。
 
-        WHY 统一在此处理：backend 的 ``root_dir`` 若用相对路径，进程工作目录
-        一旦变化就会指向不同的物理目录，属于难以复现的隐患。
+        WHY 统一在这里转绝对路径：backend 的 ``root_dir`` 与会话目录若用相对路径，
+        进程工作目录一旦变化就会指向不同的物理目录，属于难以复现的隐患。
         """
+        if value is None:
+            return None
         return value.expanduser().resolve()
 
     @field_validator("skill_dirs", mode="before")
@@ -1140,29 +1283,81 @@ class AppConfig(BaseSettings):
         )
         return True
 
+    @property
+    def resolved_sessions_root(self) -> Path:
+        """未绑定工作空间的会话，其专属目录的父目录（绝对路径）。
+
+        ``SESSIONS_ROOT`` 未配置时按 ``<数据目录>/sessions`` 派生——WHY 不写成一个固定
+        默认值：数据目录是可以换的（``DB_PATH``），而「会话专属目录」与库在同一个
+        可搬迁单元里，备份/搬迁才只需要搬一个目录。
+        """
+        if self.sessions_root is not None:
+            return self.sessions_root
+        return self.db_path.parent / _SESSIONS_DIR_NAME
+
+    @property
+    def roots_store_root(self) -> Path:
+        """根外存储的父目录：``<数据目录>/roots``。
+
+        WHY 派生而不是再加一项配置：它必须与数据目录**同卷**——否则「备份/搬迁只搬数据
+        目录」这句话就不成立（技能库与工具留存会留在原地），而多一个配置项只会多一种
+        「配到别的盘」的机会。会话专属目录已经按同一口径跟着数据目录走
+        （``resolved_sessions_root``），这里保持一致。
+        """
+        return self.db_path.parent / _ROOTS_STORE_DIR_NAME
+
+    def session_dir(self, thread_id: str) -> Path:
+        """返回某个**未绑定工作空间**的会话的专属目录。
+
+        WHY 用会话 ID 当子目录名：它就是这条会话的稳定标识，而「一个会话一个目录」正是
+        不共享工作空间时要保证的事（两个会话落在同一个目录里会互相看到对方的产物）。
+
+        WHY 必须校验 ID 是**单个安全的路径片段**：这个目录名会直接来自请求——前端在首次
+        发送前申请一个 ID，服务端按它派生目录；面板、附件上传与首条消息的根解析都走同一条
+        路径。而 ``Path(sessions_root) / "../../evil"`` 会解析到会话目录之外，于是 Agent 的
+        文件根、附件与产物全部落在别处，且没有任何提示。拒绝而不是「清洗」：清洗会让两个
+        不同的 ID 撞进同一个目录——那比报错危险得多。
+
+        Args:
+            thread_id: 会话 ID（已规范化）。
+
+        Returns:
+            ``<SESSIONS_ROOT>/<thread_id>``；目录本身按需创建。
+
+        Raises:
+            ValueError: ID 不是非空字符串、含路径分隔符或上级引用，或解析后落在会话目录
+                之外（盘符、UNC 之类由最后一道兜住）。
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError(f"会话 ID 必须是非空字符串，实际：{thread_id!r}")
+        separators = {"/", "\\", os.sep, os.altsep or os.sep}
+        if thread_id in {".", ".."} or any(sep in thread_id for sep in separators):
+            raise ValueError(f"会话 ID 不能包含路径分隔符或上级引用：{thread_id!r}")
+
+        target = self.resolved_sessions_root / thread_id
+        # WHY 还要再判一次包含关系：上面按字符判分隔符是**按平台**的（POSIX 上 ``a\b``
+        # 是合法文件名，Windows 上却是两级路径），盘符、UNC 与前缀写法也各有各的坑。
+        # 这一道只看结果：解析之后必须仍在会话目录之内。
+        if not target.resolve().is_relative_to(self.resolved_sessions_root):
+            raise ValueError(f"会话 ID 会解析到会话目录之外：{thread_id!r}")
+        return target
+
     def ensure_directories(self) -> None:
-        """创建运行时必需的目录并记录真实落点。
+        """创建启动所需的目录：数据目录、会话目录的父目录、根外存储的父目录、技能目录。
 
         WHY 显式创建：``FilesystemBackend`` 与 SQLite 都需要父目录存在，
         缺少时报错信息通常与根因无关，排查成本高。
+
+        WHY 只建**父目录**、不建任何会话目录：会话专属目录要等到那条会话真的产生文件时
+        才创建（见 ``SessionRoot.ensure_directories``）——启动时替所有会话建目录，会在
+        用户还没发过消息时就在磁盘上留下一堆空目录。同理，``roots/`` 下也只在某个根真的
+        被用到时才建它自己的存储目录（见 ``SessionRoot.ensure_storage``）。
         """
-        self.workspace.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.memory_file.parent != Path("."):
-            self.memory_file.parent.mkdir(parents=True, exist_ok=True)
+        self.resolved_sessions_root.mkdir(parents=True, exist_ok=True)
+        self.roots_store_root.mkdir(parents=True, exist_ok=True)
         for directory in self.skill_dirs:
             directory.mkdir(parents=True, exist_ok=True)
-
-    def existing_skill_dirs(self) -> list[Path]:
-        """返回真实存在的技能目录。
-
-        WHY 过滤而非报错：技能库是可选能力，缺失只应降级而不是让应用无法启动。
-        """
-        existing = [item for item in self.skill_dirs if item.is_dir()]
-        missing = [item for item in self.skill_dirs if item not in existing]
-        if missing:
-            logger.warning("以下技能目录不存在，已跳过：%s", [str(item) for item in missing])
-        return existing
 
     def active_mcp_servers(self) -> list[MCPServerSpec]:
         """返回本次启动需要真正连接的 MCP 服务器。
@@ -1177,65 +1372,648 @@ class AppConfig(BaseSettings):
             return []
         return [spec for spec in self.mcp_servers if spec.enabled]
 
-    def skill_source_paths(self) -> list[str]:
-        """返回 deepagents ``skills`` 参数所需的 POSIX 路径列表。
-
-        WHY 必须换算成相对工作区的虚拟路径：技能由 ``SkillsMiddleware`` 经
-        backend 读取，而 backend 的根就是 ``workspace``，直接传宿主机绝对路径
-        在虚拟模式下会被当成工作区内的子路径，导致技能永远命中不了。
-
-        位于工作区之外的目录无法映射，只能跳过并记录告警。
-        """
-        resolved: list[str] = []
-        for directory in self.existing_skill_dirs():
-            try:
-                relative = directory.relative_to(self.workspace)
-            except ValueError:
-                logger.warning(
-                    "技能目录不在工作区内，已跳过：%s（工作区：%s）",
-                    directory,
-                    self.workspace,
-                )
-                continue
-            resolved.append("/" + relative.as_posix())
-        return resolved
-
-    @property
-    def memory_paths(self) -> list[str]:
-        """返回 deepagents ``memory`` 参数所需的 POSIX 路径列表。
-
-        WHY 必须是 POSIX 正斜杠且相对工作区：虚拟文件系统内部以 ``/`` 作为根
-        分隔符，Windows 原生分隔符会被当成普通字符；同时 backend 的根就是
-        ``workspace``，绝对路径同样解析不到。
-        """
-        if not self.memory_file.is_file():
-            logger.warning("长期记忆文件不存在，跳过加载：%s", self.memory_file)
-            return []
-
-        try:
-            relative = self.memory_file.relative_to(self.workspace)
-        except ValueError:
-            logger.warning(
-                "长期记忆文件不在工作区内，已跳过：%s（工作区：%s）",
-                self.memory_file,
-                self.workspace,
-            )
-            return []
-        return ["/" + relative.as_posix()]
-
     @classmethod
-    def load(cls) -> AppConfig:
-        """加载并完成一次性的落地校验与目录准备。"""
-        instance = cls()
+    def load(cls, **overrides: Any) -> AppConfig:
+        """加载并完成一次性的落地校验与目录准备。
+
+        Args:
+            **overrides: 覆盖字段。**取值为 ``None`` 的项会被丢弃**：CLI 未提供参数时
+                传进来的就是 ``None``，而它若被当作「显式设为 None」，会把 ``.env`` 里的
+                值一起盖掉。
+
+        Returns:
+            已校验、已建目录的配置实例。
+
+        Raises:
+            ValidationError: 任一字段非法。
+        """
+        params = {key: value for key, value in overrides.items() if value is not None}
+        instance = cls(**params)
         instance.ensure_directories()
+        # WHY 在这里检查未知键：``extra="ignore"`` 让它们静默失效，而一句「配置里写着
+        # 某个已不存在的项」足以把排查带到完全错误的方向（实测：残留的
+        # ``WORKSPACE=./workspace`` 被读成「未绑定的会话会落到 ./workspace」）。
+        instance.warn_unknown_env_keys(overrides.get("_env_file"))
         logger.info(
-            "配置加载完成：model=%s mode=%s tier=%s workspace=%s",
+            "配置加载完成：model=%s mode=%s tier=%s sessions_root=%s",
             instance.default_model,
             instance.execution_mode,
             instance.sandbox_tier,
-            instance.workspace,
+            instance.resolved_sessions_root,
         )
         return instance
+
+    def warn_unknown_env_keys(self, env_file: Path | None = None) -> list[str]:
+        """列出配置文件里**不被任何字段读取**的键并告警，返回这些键。
+
+        WHY 需要它：``extra="ignore"`` 把未知键静默丢掉——这在部署里是必要的（同一份
+        ``.env`` 常混着别的工具的变量，判成错误会让升级直接起不来），但**一声不响**
+        这次实测出了代价：``.env`` 里残留的 ``WORKSPACE=./workspace``（旧模型的「默认
+        工作空间」）读起来就是「未绑定的会话会落到 ./workspace」，而应用根本不读它。
+        用户据此以为「自动建目录」没生效，排查方向被引到了完全错误的地方。
+
+        WHY 只扫文件、不扫 ``os.environ``：进程环境里混着 shell / CI / 容器运行时的上百个
+        变量，对它们逐个告警会把这条提示淹掉；而 ``.env`` 是本项目自己维护的那一份。
+
+        Args:
+            env_file: 要检查的文件；``None`` 表示取 ``model_config`` 里的 ``env_file``。
+
+        Returns:
+            未知键（去重、按出现顺序）；没有则返回空列表。
+        """
+        target = self._resolve_env_file(env_file)
+        unknown = self._unknown_env_keys(target)
+        if unknown:
+            logger.warning(
+                "配置文件里有 %d 个键不被任何字段读取，已忽略：%s（%s）——"
+                "多半是旧版本的残留，删掉即可；留着它会让配置看起来在做一件实际没做的事",
+                len(unknown),
+                "、".join(unknown),
+                target,
+            )
+        return unknown
+
+    @classmethod
+    def _resolve_env_file(cls, override: Any) -> Path | None:
+        """取本次加载实际使用的 env 文件路径（``_env_file`` 覆盖优先）。
+
+        Args:
+            override: 调用方显式传入的 ``_env_file``；``None`` 表示用 ``model_config``
+                里的默认值。
+
+        Returns:
+            文件路径；没有配置任何 env 文件时返回 ``None``。
+        """
+        raw = override if override is not None else cls.model_config.get("env_file")
+        if raw is None:
+            return None
+        if isinstance(raw, (str, Path)):
+            return Path(raw)
+        if isinstance(raw, (list, tuple)) and raw:
+            # pydantic-settings 允许给一串文件（后加载的覆盖先加载的）；这里看第一个足够了。
+            return Path(str(raw[0]))
+        return None
+
+    @classmethod
+    def _unknown_env_keys(cls, env_file: Path | None) -> list[str]:
+        """扫出 ``env_file`` 里不被任何字段读取的键。
+
+        WHY 按 ``KEY=VALUE`` 逐行解析而不是引入 dotenv：这里只做「键名是否被读过」的
+        粗粒度判定，而多一个依赖换来的解析细节（引号、续行、插值）对这条提示没有影响。
+
+        Args:
+            env_file: 要检查的文件；``None`` 或文件不存在时返回空列表。
+
+        Returns:
+            未知键（去重、按出现顺序）。
+        """
+        if env_file is None or not env_file.is_file():
+            return []
+        known = {name.lower() for name in cls.model_fields}
+        encoding = str(cls.model_config.get("env_file_encoding") or "utf-8")
+        try:
+            text = env_file.read_text(encoding=encoding)
+        except (OSError, UnicodeDecodeError) as exc:
+            # 读不了就跳过检查：这条提示的价值远小于「因为读不到 .env 而拒绝启动」。
+            logger.warning("读取配置文件失败，跳过未知键检查：%s（%s）", env_file, exc)
+            return []
+
+        unknown: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            # WHY 大小写不敏感：``case_sensitive=False`` 下 ``db_path`` 与 ``DB_PATH`` 等价，
+            # 把它们判成未知键会是纯噪音（而噪音会让这条提示被忽略）。
+            if key and key.lower() not in known and key not in unknown:
+                unknown.append(key)
+        return unknown
+
+
+MountKind = Literal["file", "dir"]
+"""挂载对象的类型：单个文件（父目录不可见），或整棵目录树（写一律拒绝）。"""
+
+
+@dataclass(frozen=True)
+class VirtualMount:
+    """一个**只读**挂进虚拟文件系统的宿主路径。
+
+    Attributes:
+        prefix: 虚拟路径前缀（如 ``/global/``、``/skills/``）；``CompositeBackend``
+            按它路由，并在转发前**剥掉**它。
+        host_path: 宿主上的真实路径（文件或目录）。
+        label: 错误文案与日志里对它的说法（如「全局长期记忆」「技能库」）。
+        kind: ``file`` 只暴露那一个文件（父目录里的其它文件不可见）；``dir`` 暴露整棵
+            子树，但写操作一律拒绝。
+    """
+
+    prefix: str
+    host_path: Path
+    label: str
+    kind: MountKind = "file"
+
+    def __post_init__(self) -> None:
+        """校验取值，避免拼出一个路由不到、或文案说不清的挂载点。
+
+        WHY 校验前缀形态：``CompositeBackend`` 按前缀匹配并**剥掉**它再转发，前缀写错
+        （少一个斜杠）会落进默认 backend——于是这个文件连同路径语义都跑到工作区里去了，
+        而装配与运行都不会报错。
+
+        Raises:
+            ValueError: 前缀不是 ``/`` 开头 ``/`` 结尾、``host_path`` 不是 ``Path``、
+                ``kind`` 不是 ``file`` / ``dir``、文件挂载没有文件名、``label`` 为空。
+        """
+        if not self.prefix.startswith("/") or not self.prefix.endswith("/"):
+            raise ValueError(f"挂载前缀必须以 / 开头并以 / 结尾：{self.prefix!r}")
+        if not isinstance(self.host_path, Path):
+            raise ValueError(f"host_path 必须是 Path，实际：{type(self.host_path).__name__}")
+        if self.kind not in ("file", "dir"):
+            raise ValueError(f"kind 只能是 file 或 dir，实际：{self.kind!r}")
+        if self.kind == "file" and not self.host_path.name:
+            raise ValueError(f"host_path 必须指向一个文件（有文件名）：{self.host_path}")
+        if not self.label or not str(self.label).strip():
+            raise ValueError("label 不能为空：错误文案要靠它说明这是哪一种挂载")
+
+    @property
+    def virtual_path(self) -> str:
+        """该路径在虚拟文件系统里的位置：文件含文件名，目录就是前缀本身。"""
+        if self.kind == "file":
+            return f"{self.prefix}{self.host_path.name}"
+        return self.prefix.rstrip("/") or "/"
+
+
+@dataclass(frozen=True)
+class MemoryPlan:
+    """本会话的长期记忆方案：根内的来源 + 需要挂载的根外文件。
+
+    WHY 把两者放进同一个对象、且 ``sources`` 由挂载**派生**：``sources`` 里的
+    ``/global/AGENTS.md`` 只有在 ``mounts`` 里挂了对应文件时才读得到，而 deepagents 对
+    读不到的来源是**静默跳过**的（只留一行 WARNING）。分成两个方法返回（一个给来源、
+    一个给挂载），调用方漏接一半就会得到「记忆少了一条」，且没有任何错误指向它。
+
+    Attributes:
+        in_root_sources: 落在会话根内、无需挂载就能读到的来源（如工作区自带的
+            ``/AGENTS.md``）。
+        mounts: 需要只读挂进虚拟文件系统的根外文件。
+    """
+
+    in_root_sources: list[str]
+    mounts: list[VirtualMount]
+
+    @property
+    def sources(self) -> list[str]:
+        """deepagents ``memory`` 参数所需的来源列表（挂载出来的在前）。"""
+        return [mount.virtual_path for mount in self.mounts] + list(self.in_root_sources)
+
+    @property
+    def mounted_files(self) -> list[Path]:
+        """当前挂载的宿主文件（供日志与排错使用）。"""
+        return [mount.host_path for mount in self.mounts]
+
+
+@dataclass(frozen=True)
+class SessionRoot:
+    """一条会话的**文件根**：配置 + 具体根目录，附上全部由它派生的路径。
+
+    根只有两种来源，本模型下没有第三种：
+
+    1. **用户绑定的工作空间**——用户在创建会话时选定的目录，可以同时容纳多条会话；
+    2. **会话专属目录**——没绑定工作空间的会话，在 ``SESSIONS_ROOT`` 下按会话 ID
+       自动创建的子目录，只有它自己用。
+
+    两者在本对象看来完全一样（一个绝对路径），因为文件工具、沙箱挂载根、附件目录与
+    知识库索引需要的都只是「一个根」。区分它们的地方只有两处：解析时（谁决定这个根）
+    与界面文案（「工作空间」还是「会话专属目录」）。
+
+    WHY 单独成为一个对象，而不是给 ``AppConfig`` 的那些方法各加一个 ``root`` 参数：
+
+    1. **漏传必须炸，而不是静默退回某个默认值**。「用错了根」是这套设计里最危险的
+       失败形态（写进别人的项目、把附件的根指错、技能视图建到另一个目录）。参数若带
+       默认值，任何一处漏传都会悄悄用另一个目录，而症状（文件跑到别处）与原因相距
+       极远；把「哪个根」收进一个必须显式获得的对象里，漏了就是 ``AttributeError``。
+    2. **派生逻辑只有一份**。长期记忆路径、技能来源与虚拟路径映射全都依赖根目录，
+       把它们挂在这里是唯一能保证「同一个根处处得到同一组派生结果」的形态。
+    3. **可独立测试**：它只依赖 ``AppConfig`` 的字段，不需要启动任何服务。
+
+    Attributes:
+        config: 应用配置（提供上限、显式覆盖项等与根无关的取值）。
+        root: 根目录的绝对路径。
+    """
+
+    config: AppConfig
+    root: Path
+
+    def __post_init__(self) -> None:
+        """把根归一到绝对路径。
+
+        WHY 这里**不**校验目录是否存在：会话专属目录在第一次用到它之前并不存在，而
+        「存在性」这件事对用户绑定的工作空间必须严格（拼错的路径不能静默变成一个空
+        目录）。两者放在同一个入口判定会二选一牺牲一边，因此校验落在**用户输入进
+        来的那一刻**——由应用层的解析函数负责（见 ``SessionRegistry.resolve``），
+        而本对象只需保证「拿到的是一个绝对路径」，目录按需创建（``ensure_directories``）。
+
+        Raises:
+            ValueError: ``config`` 为 ``None``。
+        """
+        if self.config is None:
+            raise ValueError("config 不能为 None")
+        object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
+
+    # ------------------------------------------------------------------ 基本属性
+
+    @property
+    def global_memory_file(self) -> Path | None:
+        """**全局**长期记忆文件的绝对路径；未配置时为 ``None``。
+
+        WHY 它不受会话根约束：这份文件按定义就是跨会话的（人工维护的偏好与约定），
+        要求它落在工作区内等于要求「每条会话各放一份」。旧实现把它当成「工作区之外 →
+        跳过」，于是配了全局记忆的实例里**所有**会话都静默少一条记忆——只有一行
+        WARNING，用户看不出自己写的东西没生效。
+
+        Returns:
+            ``MEMORY_FILE`` 的绝对路径（字段校验已展开 ``~`` 并转绝对路径）；
+            未配置时 ``None``。
+        """
+        return self.config.memory_file
+
+    @property
+    def workspace_memory_file(self) -> Path:
+        """本工作区自带的 ``AGENTS.md``（未配置全局记忆时才作为来源）。
+
+        WHY 仍然保留这份回落：工作区里的 ``AGENTS.md`` 是**项目自己的**说明（不与其它
+        工作区共享），而「没配全局记忆」的实例正是最需要它的场合。
+        """
+        return self.root / _MEMORY_FILE_NAME
+
+    @cached_property
+    def memory_plan(self) -> MemoryPlan:
+        """本会话的长期记忆方案：来源与为它们准备的只读挂载点。
+
+        WHY 缓存（``cached_property``）：它要读磁盘、还会记日志，而同一次装配里 backend
+        的路由与 ``memory`` 参数都要取它——算两遍会把同一件事记两遍，也会让「文件恰好
+        在这一刻被删」出现两种结果。``SessionRoot`` 是**按请求**构造的，所以缓存期限就是
+        一次请求，不会让人工刚改完的内容滞留。
+
+        WHY 配置了全局记忆就不再加载工作区自带的那份：一份记忆只应有一个来源，否则两处
+        说法冲突时没有任何优先级依据（deepagents 只是把它们一起塞进提示），用户很难理解
+        「我改的是全局那份，Agent 却不照做」。它若存在会记一行 INFO，免得用户以为生效了。
+
+        Returns:
+            来源列表与挂载点；两者缺一时读不到对应来源（deepagents 会静默跳过），
+            因此它们由同一个对象给出，见 :class:`MemoryPlan`。
+        """
+        global_file = self.global_memory_file
+        if global_file is None:
+            # 没配全局记忆：退回到「本工作区自带的 AGENTS.md」。
+            if not self.workspace_memory_file.is_file():
+                logger.warning("长期记忆文件不存在，跳过加载：%s", self.workspace_memory_file)
+                return MemoryPlan(in_root_sources=[], mounts=[])
+            return MemoryPlan(
+                in_root_sources=[f"/{self.workspace_memory_file.name}"], mounts=[]
+            )
+
+        if self.workspace_memory_file.is_file():
+            logger.info(
+                "已配置全局长期记忆（%s）：工作区自带的 %s 不再作为来源",
+                global_file,
+                self.workspace_memory_file,
+            )
+        if not global_file.is_file():
+            logger.warning("全局长期记忆文件不存在，跳过加载：%s", global_file)
+            return MemoryPlan(in_root_sources=[], mounts=[])
+
+        mount = VirtualMount(
+            prefix=GLOBAL_MEMORY_PREFIX, host_path=global_file, label="全局长期记忆"
+        )
+        logger.info("全局长期记忆将以只读方式挂载：%s ← %s", mount.virtual_path, global_file)
+        return MemoryPlan(in_root_sources=[], mounts=[mount])
+
+    # ------------------------------------------------------------------ 根外存储
+
+    @cached_property
+    def storage_dir(self) -> Path:
+        """本根的**根外存储目录**：技能库、技能视图与工具留存都住在这里。
+
+        WHY 把它们搬出工作区（2026-09-21 改）：工作区可能是**用户的仓库**，而这三个名字
+        是应用自己的数据——往别人的项目里写东西会污染他的版本控制，也会让「这次操作到底
+        动了什么」变得说不清。搬出来之后，工作区里只剩用户自己的文件与 Agent 的产物。
+
+        WHY 位置由**根路径**派生、而不是按会话分：同一个工作空间可能承载多条会话，而
+        「这个工作空间装了什么技能」本来就该共享（技能启停状态也是全应用一份，见
+        ``runtime.skill_store``）。按会话分会让同一工作空间的第二条会话看不到第一条装好
+        的技能——那正是「技能库」这个概念要消除的重复。
+
+        WHY 目录名 = 可读片段 + 短哈希：纯哈希在排障时无法对应回工作区（``roots/`` 下
+        十几个随机名），纯可读名会重名（两台机器上都有 ``Desktop``）。两者都要。
+
+        Note:
+            ``SessionRoot`` 是**按请求**构造的，所以这个缓存只活一次请求——换工作区
+            会换对象，不会拿到别人的存储目录。
+        """
+        digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:12]
+        return self.config.roots_store_root / f"{_readable_dir_name(self.root)}-{digest}"
+
+    @property
+    def skills_store(self) -> Path:
+        """技能库目录（用户放技能包的地方）。"""
+        return self.storage_dir / _SKILLS_STORE_DIR_NAME
+
+    @property
+    def skill_view_store(self) -> Path:
+        """技能视图目录（只把启用中的技能物化出来的派生物）。"""
+        return self.storage_dir / _SKILL_VIEW_STORE_DIR_NAME
+
+    @property
+    def tool_output_store(self) -> Path:
+        """工具输出留存目录（``<store>/<会话 ID>/NNNN-<工具>.txt``）。"""
+        return self.storage_dir / _TOOL_OUTPUTS_STORE_DIR_NAME
+
+    @cached_property
+    def read_only_mounts(self) -> list[VirtualMount]:
+        """本根要挂进虚拟文件系统的**全部**根外路径（只读）。
+
+        WHY 收成一个列表、且与「技能来源」同源：图的技能来源与文件工具看到的路径都靠
+        这些挂载才解析得到。分开给（一个给来源、一个给挂载）时，漏接一半的表现是
+        「面板里列得出来、Agent 却读不到」，而 deepagents 对读不到的技能来源只是记一条
+        警告——没有任何错误会指向装配漏了一条路由。
+
+        挂载清单：
+        - ``/skills/``：技能库（人工维护）；
+        - ``/.skills-active/``：技能视图（派生物，建图时的来源就是它）；
+        - ``/_tool_outputs/``：工具输出留存（消息里只带引用，正文在这里）；
+        - 内置技能与 ``SKILL_DIRS`` 指定的目录：它们位于应用目录或任意位置，同样必须
+          挂上——``sources_for_graph`` 的兜底（视图缺失 → 退回配置目录）正是靠它们才
+          真的读得到，否则那句「等于全部启用」是假的。
+        """
+        planned: list[VirtualMount] = [
+            VirtualMount(
+                prefix=f"{VIRTUAL_SKILL_VIEW}/",
+                host_path=self.skill_view_store,
+                label="技能视图",
+                kind="dir",
+            ),
+            VirtualMount(
+                prefix=f"{VIRTUAL_TOOL_OUTPUTS}/",
+                host_path=self.tool_output_store,
+                label="工具输出留存",
+                kind="dir",
+            ),
+        ]
+        seen = {mount.prefix for mount in planned}
+        # 技能库只在「没显式配置 SKILL_DIRS」时挂我们自己那个存储目录：显式配置时技能库
+        # **就是那些目录**（与 ``skill_dir_plan`` 同一个分支）。两个都挂同一前缀会让后来者
+        # 被静默跳过——症状是「面板里技能一个都列不出来」，而目录里明明有技能包。
+        if not self.config.skill_dirs:
+            planned.append(
+                VirtualMount(
+                    prefix=f"{VIRTUAL_SKILLS}/",
+                    host_path=self.skills_store,
+                    label="技能库",
+                    kind="dir",
+                )
+            )
+            seen.add(f"{VIRTUAL_SKILLS}/")
+        for source in self.skill_dir_plan():
+            prefix = f"{source.virtual}/"
+            if prefix in seen:
+                continue
+            planned.append(
+                VirtualMount(
+                    prefix=prefix,
+                    host_path=source.host_dir,
+                    label=f"技能来源 {source.virtual}",
+                    kind="dir",
+                )
+            )
+            seen.add(prefix)
+        return planned
+
+    @property
+    def mount_table(self) -> dict[str, Path]:
+        """``{虚拟前缀: 宿主目录}``：只含**目录**挂载，供巡检与路径解析用。"""
+        return {
+            mount.prefix: mount.host_path
+            for mount in self.read_only_mounts
+            if mount.kind == "dir"
+        }
+
+    @property
+    def skill_view_virtual(self) -> str:
+        """技能视图的虚拟路径（建图时的技能来源就是它）。
+
+        WHY 由这里给出而不是让调用方各自 import 常量：虚拟路径是**挂载约定**的一半
+        （另一半是 ``read_only_mounts`` 里的前缀），两者必须同源——分开写会在改动其一
+        之后留下「来源指向没人挂的路径」这种静默失效。
+        """
+        return VIRTUAL_SKILL_VIEW
+
+    @property
+    def tool_outputs_virtual(self) -> str:
+        """工具输出留存的虚拟路径前缀（消息与事件里的引用以它开头）。"""
+        return VIRTUAL_TOOL_OUTPUTS
+
+    def ensure_storage(self) -> None:
+        """建好根外存储目录，并把旧位置（工作区里的 ``skills/``）的技能库搬过来。
+
+        WHY 要迁移而不是「重新开始」：技能包是**用户放进来的东西**，静默丢掉等于让用户
+        的技能凭空消失——而现场表现只是「Agent 忽然不会那些套路了」，没有任何报错指向
+        这里。迁移是幂等的：新位置已有内容就不再动旧位置。
+
+        WHY 只迁技能库、不迁另外两个：技能视图是派生物（重建即可），工具留存是「最近若干
+        次工具输出」的缓存（``TOOL_OUTPUT_RETENTION_PER_THREAD`` 会自然淘汰），都不值得
+        为它们写迁移；技能包丢了却是真丢了。
+
+        Raises:
+            OSError: 目录创建失败（磁盘满、权限不足）。
+        """
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        # WHY 不预建技能视图目录：``sources_for_graph`` 用「视图目录是否存在」判断
+        # 「物化视图是否已建过」——预建一个空目录会让那个判据永远为真，于是「视图被清理 /
+        # 重建失败」与「所有技能都停用」变得无法区分（前者会让技能静默消失且没有告警）。
+        # 视图由 ``runtime.skill_view.rebuild_view`` 自己建（先建临时目录再整体替换）。
+        self.tool_output_store.mkdir(parents=True, exist_ok=True)
+        if self.config.skill_dirs:
+            # 显式配置了技能目录：技能库**就是那些目录**，我们的存储里那份不被使用。
+            # 此时既不建它、更不能把 ``<根>/skills`` 当「旧位置」搬走——那可能是用户自己
+            # 配进去的路径（搬走会让配置里的路径凭空消失，技能一个都列不出来）。
+            return
+        self.skills_store.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_skills()
+
+    def _migrate_legacy_skills(self) -> None:
+        """把工作区里的 ``skills/``（旧位置）搬进存储目录；只剩空目录时顺手清掉。"""
+        legacy = self.root / _USER_SKILLS_DIR_NAME
+        if not legacy.is_dir():
+            return
+        try:
+            children = list(legacy.iterdir())
+        except OSError as exc:
+            logger.warning("读取旧技能库失败，保持原样：%s（%s）", legacy, exc)
+            return
+
+        if not children:
+            # WHY 空目录也删：它是旧版本由应用建出来的；留着会让用户看到「说搬走了却还在」，
+            # 而那个目录对他没有任何用途。
+            try:
+                legacy.rmdir()
+            except OSError as exc:
+                logger.debug("旧技能库是空目录，删除失败（无害）：%s（%s）", legacy, exc)
+            return
+
+        if self.skills_store.is_dir() and any(self.skills_store.iterdir()):
+            logger.warning(
+                "旧技能库 %s 里还有内容，而新位置 %s 已非空：两边都保留，请自行合并",
+                legacy,
+                self.skills_store,
+            )
+            return
+
+        try:
+            for child in children:
+                shutil.move(str(child), str(self.skills_store / child.name))
+            legacy.rmdir()
+        except OSError as exc:
+            # WHY 出错就停手、且不动旧位置：搬一半会让技能分散在两处，而调用方无法判断
+            # 哪边是全的——宁可让用户看到一个完整的旧目录。
+            logger.error(
+                "迁移旧技能库失败，旧位置仍保留（请手工搬到 %s）：%s（%s）",
+                self.skills_store,
+                legacy,
+                exc,
+            )
+            return
+        logger.info("旧技能库已搬到根外存储：%s → %s", legacy, self.skills_store)
+
+    @property
+    def skill_dirs(self) -> list[Path]:
+        """本工作区生效的技能目录（宿主机路径）；技能库在根外存储里。"""
+        return [source.host_dir for source in self.skill_dir_plan()]
+
+    # ------------------------------------------------------------------ 目录准备
+
+    def ensure_directories(self) -> None:
+        """创建本工作区运行所需的目录。
+
+        WHY 在工作区**被选中的那一刻**建，而不是启动时替所有候选目录建：后者会往
+        用户还没用过的项目里写目录，而那是用户的仓库，不是我们的。
+
+        WHY 现在只建**根本身**：技能库、技能视图与工具留存都已经搬到根外存储
+        （``ensure_storage``），而长期记忆由人工维护（应用不替它建目录——那等于往工作区
+        之外悄悄写目录）。根内不再有任何「应用自己的目录」，所以这里只保证根存在。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ 技能来源
+
+    def skill_dir_plan(self) -> list[SkillSource]:
+        """技能目录 → 虚拟路径的完整规划（含根外与共享来源）。
+
+        WHY 虚拟路径不再由「是否在工作区内」推导：技能库已经搬到工作区之外，而内置技能
+        本来就在外面——两者的虚拟路径只能由**挂载表**决定（挂在哪，就按哪读）。按位置
+        推导（旧规则：工作区外取目录名）在两种来源共存时会给出与真实挂载点不一致的路径，
+        而症状是「面板里列得出来、Agent 却读不到」。
+
+        Returns:
+            来源列表，顺序即优先级（越靠后优先级越高）。
+        """
+        if self.config.skill_dirs:
+            # 显式配置优先：用户说了算，虚拟路径取目录名（与 ``read_only_mounts`` 的挂载
+            # 前缀一致，见那里的 WHY）。
+            return [
+                SkillSource(host_dir=directory, virtual=f"/{directory.name}")
+                for directory in self.config.skill_dirs
+            ]
+        return [
+            SkillSource(host_dir=BUILTIN_SKILLS_DIR, virtual=VIRTUAL_BUILTIN_SKILLS),
+            SkillSource(host_dir=self.skills_store, virtual=VIRTUAL_SKILLS),
+        ]
+
+    def skill_sources(self) -> list[SkillSource]:
+        """把**存在**的技能目录映射成「宿主机目录 + 虚拟路径」的来源列表。
+
+        WHY 必须显式映射：技能由 ``SkillsMiddleware`` 经 backend 读取，而 backend 只认
+        虚拟路径——目录挂在哪，就从哪读（见 ``read_only_mounts``）。
+
+        WHY 先 ``ensure_storage()``：技能库是我们的目录，读来源之前确保它就位（幂等），
+        否则「刷新页面直接打开一条历史会话」这条路径上（它只装配图、不装配面板服务）
+        会看到「技能库不存在」的 WARNING，而那条警告是假的。
+
+        Returns:
+            来源列表，顺序即优先级（越靠后优先级越高）。
+
+        Raises:
+            ValueError: 两个技能目录映射到同一个虚拟路径——静默的后果是其中一个
+                来源整体失效，而界面上看不出任何异常。
+        """
+        self.ensure_storage()
+        sources: list[SkillSource] = []
+        claimed: dict[str, Path] = {}
+        for source in self.skill_dir_plan():
+            if not source.host_dir.is_dir():
+                # WHY 过滤而非报错：技能库是可选能力，缺失只应降级而不是让应用无法启动。
+                logger.warning(
+                    "技能目录不存在，已跳过：%s（虚拟路径 %s）", source.host_dir, source.virtual
+                )
+                continue
+            previous = claimed.get(source.virtual)
+            if previous is not None:
+                msg = (
+                    f"技能目录 {previous} 与 {source.host_dir} 映射到同一个虚拟路径 "
+                    f"{source.virtual}；请给其中一个改名，或用 SKILL_DIRS 显式指定不同的目录"
+                )
+                logger.error("%s", msg)
+                raise ValueError(msg)
+            claimed[source.virtual] = source.host_dir
+            sources.append(source)
+        return sources
+
+    def skill_source_paths(self) -> list[str]:
+        """返回 deepagents ``skills`` 参数所需的虚拟路径列表（``/skills`` 之类）。
+
+        WHY 必须是虚拟路径而不是宿主机绝对路径：backend 只认虚拟路径，绝对路径（Windows
+        下还带盘符与反斜杠）在虚拟模式下会被当成工作区内的子路径，导致技能永远命中不了。
+        这些虚拟路径由 ``read_only_mounts`` 挂上，两者必须同源。
+        """
+        return [source.virtual for source in self.skill_sources()]
+
+    def skill_host_dir(
+        self, virtual_directory: str, *, sources: list[SkillSource] | None = None
+    ) -> Path | None:
+        """把技能（或技能目录）的虚拟路径还原成宿主机路径；无法归属时返回 ``None``。
+
+        WHY 需要反向映射：技能物化视图要从**真实目录**复制内容（见
+        ``runtime.skill_view.rebuild_view``），而巡检结果给的是虚拟路径。内置技能在
+        工作区之外，直接与工作区拼接会得到一个不存在的路径——表现为「技能在清单里、
+        却怎么也复制不进视图」，而视图为空又会让该技能静默失效。
+
+        Args:
+            virtual_directory: 技能目录的虚拟路径，如 ``/skills/code-review``。
+            sources: 已经算好的来源列表；``None`` 表示就地求一次。批量解析（视图重建）
+                必须传入，否则每个技能都要重新扫一遍技能目录。
+
+        Returns:
+            宿主机绝对路径；该路径不属于任何已知来源时为 ``None``。
+        """
+        normalized = "/" + str(virtual_directory).strip().strip("/")
+        best_length = -1
+        best: Path | None = None
+        for source in self.skill_sources() if sources is None else sources:
+            if normalized == source.virtual:
+                candidate = source.host_dir
+            elif normalized.startswith(source.virtual + "/"):
+                candidate = source.host_dir / normalized[len(source.virtual) + 1 :]
+            else:
+                continue
+            # WHY 取最长匹配：来源可以嵌套（``/skills`` 与 ``/skills/team``），取短的
+            # 那个会把团队技能映射到基础目录下，而它的源目录根本不是那里。
+            if len(source.virtual) > best_length:
+                best_length = len(source.virtual)
+                best = candidate
+        return best
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅用于日志排错
+        return f"SessionRoot(root={self.root})"
 
 
 @lru_cache(maxsize=1)

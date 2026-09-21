@@ -9,17 +9,14 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
     from agent.graph import AgentFactory
-    from application.attachment_service import AttachmentService
     from application.health import HealthService
-    from application.knowledge_service import KnowledgeService
     from application.memory_service import MemoryService
     from application.model_catalog import ModelCatalog
     from application.run_service import RunService
-    from application.skill_service import SkillService
+    from application.session_registry import SessionRegistry
     from application.thread_service import ThreadService
     from application.tool_catalog import ToolCatalog
     from application.usage_service import UsageService
-    from application.workspace_service import WorkspaceService
     from config import AppConfig
     from runtime.api_key_store import APIKeyStore
     from runtime.audit_store import AuditStore
@@ -50,10 +47,13 @@ class AppContext:
         usage: 用量统计服务。
         tools: 生效工具目录（内置 + 自定义 + MCP）。
         memories: 长期记忆管理服务（查看 / 删除）。
-        workspace: 工作区文件服务（Web 文件面板的列目录与读文件）。
-        attachments: 会话附件服务（上传 / 列举 / 删除，以及多模态消息构造）。
-        knowledge: 知识库服务（工作区文档的索引与检索）。
-        skills: 技能库服务（技能清单、启停与物化视图重建）。
+        workspaces: 会话根的解析与装配入口；文件面板、附件、技能与知识库一律经它按会话取。
+
+    Note:
+        WHY 没有 ``workspace`` / ``attachments`` / ``knowledge`` / ``skills`` 这几个
+        「已装配好」的字段：它们都是**按会话根**各有一份的，而启动时一个根都还不存在
+        （根由会话在创建或首轮交互时确定）。留一组字段在这里，等于给「顺手用全局那个」
+        留一条捷径——而它的症状是「B 会话的面板显示 A 项目的文件」，两边都不报错。
     """
 
     config: AppConfig
@@ -70,7 +70,4 @@ class AppContext:
     usage: UsageService
     tools: ToolCatalog
     memories: MemoryService
-    workspace: WorkspaceService
-    attachments: AttachmentService
-    knowledge: KnowledgeService
-    skills: SkillService
+    workspaces: SessionRegistry

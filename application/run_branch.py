@@ -26,6 +26,7 @@ from application.runnable import build_runnable_config
 
 if TYPE_CHECKING:
     from agent.graph import AgentFactory
+    from application.session_registry import SessionRegistry
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class RunBranchService:
         thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
         registry: RunRegistry,
+        workspaces: SessionRegistry,
         audit: AuditRecorder,
     ) -> None:
         """构造分叉服务。
@@ -64,6 +66,8 @@ class RunBranchService:
             thread_store: 会话元数据与分支记录存储。
             graph_factory: 图工厂；读历史与跑新分支都要取图。
             registry: 运行登记表，用于占用新分支的运行槽位。
+            workspaces: 会话级工作区的解析入口；**必填**——新分支要用**该会话**的
+                工作区跑，而分支并不携带工作区（它与会话同属一个根）。
             audit: 审计写入通道，取 ``RunService._audit``。
 
         Raises:
@@ -77,6 +81,8 @@ class RunBranchService:
             raise ValueError("graph_factory 不能为 None")
         if registry is None:
             raise ValueError("registry 不能为 None")
+        if workspaces is None:
+            raise ValueError("workspaces 不能为 None：分支必须跑在会话的工作区里")
         if audit is None:
             raise ValueError("audit 不能为 None")
 
@@ -84,6 +90,7 @@ class RunBranchService:
         self._thread_store = thread_store
         self._graph_factory = graph_factory
         self._registry = registry
+        self._workspaces = workspaces
         self._audit = audit
 
     # ------------------------------------------------------------------ 读
@@ -98,7 +105,12 @@ class RunBranchService:
             NotFoundError: 该分支既不是当前分支、也没有记录在案。
             RuntimeError: 读取失败。
         """
-        graph = self._graph_factory.get()
+        # WHY 读历史也要按会话的工作区取图：``aget_state`` 本身只看检查点，但图里
+        # 带着该工作区的 backend 与技能集；用另一张图读同一 thread，一旦上游将来在
+        # 读路径上也碰文件，就会读到另一个目录。同源比「目前恰好无影响」可靠。
+        graph = self._graph_factory.get(
+            scope=await self._workspaces.resolve(thread_id=thread_id)
+        )
         branch = await self._thread_store.current_branch(thread_id)
         checkpoint = await self._head_of(thread_id, branch)
 
@@ -266,9 +278,13 @@ class RunBranchService:
         if not isinstance(origin, str) or not origin.strip():
             raise ValueError("origin 必须是非空字符串")
 
+        # WHY 先解析工作区：分支不携带工作区，它与会话共用同一个根（``/_tool_outputs``
+        # 那类引用在切换分支后仍然要能打开）。
+        scope = await self._workspaces.resolve(thread_id=thread_id)
+
         # WHY 先取图再登记分支：解析模型别名与初始化模型可能失败，那属于「什么都没
         # 发生」；若先写了分支再失败，分支清单里会多出一条没有任何内容的分支。
-        graph = self._graph_factory.get(model_name)
+        graph = self._graph_factory.get(model_name, scope=scope)
 
         fork_checkpoint = await self._find_fork_checkpoint(
             graph, thread_id, messages, target_index
@@ -316,6 +332,7 @@ class RunBranchService:
             owner_id=owner_id,
             actor_id=actor_id,
             fork_checkpoint=fork_checkpoint,
+            workspace=str(scope.root),
         )
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}

@@ -31,7 +31,7 @@ from tests.application.test_run_service import (
     _make_service,
     _principal,
 )
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 class Snapshot:
@@ -133,6 +133,7 @@ def _thread_service(config: Any, store: Any, graph: Any) -> ThreadService:
         checkpointer=object(),
         thread_store=store,
         graph_factory=FakeGraphFactory(graph),
+        workspaces=StubSessionRegistry(config),
     )
 
 
@@ -142,6 +143,7 @@ def _usage_service(config: Any, store: Any, graph: Any, usage_store: Any) -> Run
         config,
         thread_store=store,
         graph_factory=FakeGraphFactory(graph),
+        workspaces=StubSessionRegistry(config),
         usage_store=usage_store,
     )
 

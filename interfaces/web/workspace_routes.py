@@ -18,21 +18,64 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from application.dto import WorkspaceFileContent, WorkspaceListing
+from application.dto import WorkspaceFileContent, WorkspaceInfo, WorkspaceListing
 from application.errors import NotFoundError
 from application.principal import Principal
 from application.workspace_service import WorkspaceService
 from interfaces.web.auth import require_permission
-from interfaces.web.deps import require_state
+from interfaces.web.deps import describe_session_root, resolve_scoped_services
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
 
 
-def get_workspace(request: Request) -> WorkspaceService:
-    """取出工作区文件服务单例。"""
-    return require_state(request, "workspace", "工作区文件服务")
+async def get_workspace(
+    request: Request,
+    thread_id: str | None = Query(default=None, description="会话 ID；给了就按该会话的工作区解析"),
+    workspace: str | None = Query(
+        default=None,
+        description="仅在该会话尚未绑定时生效（草稿态预览就是这种情况）",
+    ),
+) -> WorkspaceService:
+    """取出**该会话工作区**的文件面板服务。
+
+    WHY 按会话解析：工作区在会话级可选之后不再是一个进程级常量，而文件面板要展示的
+    必须正是这个会话里 Agent 读写的那片目录。用全局那一个会让面板显示另一个项目的文件
+    ——两个方向都不会报错，只是用户看到的不是自己刚让 Agent 改的东西。
+
+    WHY 还要一个 ``workspace`` 参数：草稿态（尚未发出首条消息）这条会话在库里还不存在，
+    而用户在界面上可能已经选了别的工作区。不认这个取值，面板就会显示启动默认目录的树
+    ——用户一边看着「我选的是 B」，一边在面板里看到 A 的文件，而两边都不报错。
+
+    WHY ``allow_missing``：同上，新会话在首条消息之前还没登记。
+    """
+    bundle = await resolve_scoped_services(request, thread_id=thread_id, requested=workspace)
+    return bundle.files
+
+
+@router.get("/info", response_model=WorkspaceInfo)
+async def get_workspace_info(
+    request: Request,
+    thread_id: str | None = Query(default=None, description="会话 ID；给了就按该会话的根解析"),
+    workspace: str | None = Query(
+        default=None, description="仅在该会话尚未锁定时生效（草稿态预览就是这种情况）"
+    ),
+    principal: Principal = Depends(require_permission("file:read")),
+) -> WorkspaceInfo:
+    """返回当前会话文件根的信息。
+
+    WHY 要有这个端点：根是**每条会话都可能不同**的运行时状态（用户选的项目，或应用给
+    这条会话建的专属目录）。界面上不显示它，用户在文件面板里看到的就只是「一堆文件名」，
+    无法确认那是哪个目录——而「我到底在改哪里」正是这个面板存在的意义。
+
+    比路径多出来的两个字段各有用途：``bound`` 让界面说清这是「工作空间」还是「本会话
+    专属目录」，``locked`` 让界面在首条消息之后不再提供更换入口。
+
+    权限与文件面板同口径（``file:read``）：它暴露的是文件系统的绝对路径，
+    属于文件可见性的一部分，不该另开一项权限让两套语义漂开。
+    """
+    return await describe_session_root(request, thread_id=thread_id, requested=workspace)
 
 
 @router.get("/files", response_model=WorkspaceListing)

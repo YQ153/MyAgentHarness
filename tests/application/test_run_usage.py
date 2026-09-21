@@ -17,7 +17,7 @@ from application.run_service import RunService
 from runtime.thread_store import ThreadMetaStore
 from runtime.usage_store import UsageStore
 from tests.application.test_run_service import FakeGraphFactory, _drain
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 class ScriptedGraph:
@@ -65,10 +65,12 @@ def _service(
     overrides = dict(config_overrides)
     if overrides.get("auth_mode") not in (None, "disabled"):
         overrides.setdefault("auth_session_secret", "测试用会话密钥" * 8)
+    config = make_config(tmp_path, **overrides)
     return RunService(
-        make_config(tmp_path, **overrides),
+        config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(graph),
+        workspaces=StubSessionRegistry(config),
         usage_store=usage_store,
     )
 

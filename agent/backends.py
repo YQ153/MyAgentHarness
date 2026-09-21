@@ -16,9 +16,10 @@ from deepagents.backends import (
     LocalShellBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import ExecuteResponse
+from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
 
 from agent.path_safety import ExtendedPathSafeBackendMixin
+from agent.readonly_mount import ReadOnlyDirectoryMount, ReadOnlyFileMount
 from agent.run_context import namespace_of_runtime
 from agent.sandbox_backend import SandboxedFilesystemBackend
 from runtime.host_shell import HostShellExecutor
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 
     from langgraph.store.base import BaseStore
 
-    from config import AppConfig
+    from config import AppConfig, SessionRoot
 
 logger = logging.getLogger(__name__)
 
@@ -158,20 +159,42 @@ B 用户的 Agent 能读到 A 用户写下的记忆——跨用户泄漏，而�
 传进来（见 ``agent.run_context``）。"""
 
 
-def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
-    """构造 CompositeBackend：``/memories/`` 走持久化，其余走工作区。
+def build_backend(
+    config: AppConfig, store: BaseStore, *, scope: SessionRoot
+) -> CompositeBackend:
+    """构造 CompositeBackend：``/memories/`` 走持久化、全局记忆只读挂载，其余走给定工作区。
 
     WHY 必须拆分：长期记忆要跨会话存活，工作文件要与用户磁盘一致，
     两者生命周期不同，单一 Backend 无法同时满足。
+
+    WHY 工作区由 ``scope`` 显式传入而不是从 ``config`` 取：工作区已经是会话级取值，
+    而 backend 的 ``root_dir`` 一旦定下就决定了 Agent 能读写宿主的哪片目录。沿用
+    「配置里那一个」会让某条会话的文件操作落到另一个项目的目录里，且没有任何提示。
+
+    WHY 全局记忆要单独挂载（``scope.memory_plan.mounts``）：它在任何工作区之外，而
+    backend 只认那个根。不挂载的后果不是报错，而是 deepagents 静默跳过该来源——用户
+    写下的全局约定对全部会话都不生效，且只有一行 WARNING。挂载点只暴露那一个文件，
+    见 ``agent.readonly_mount``。
+
+    Args:
+        config: 应用配置，提供执行档位与资源上限。
+        store: 长期记忆存储；``/memories/`` 路由依赖它。
+        scope: 本会话生效的**文件根**（用户选的工作空间，或应用为它建的专属目录）。
+
+    Raises:
+        ValueError: ``config`` / ``store`` / ``scope`` 为 ``None``。
+        NotADirectoryError: 文件根不是一个已存在的目录。
     """
     if config is None:
         raise ValueError("config 不能为 None")
     if store is None:
         raise ValueError("store 不能为 None，/memories/ 路由依赖它")
+    if scope is None:
+        raise ValueError("scope 不能为 None：backend 的根由它决定")
 
-    workspace: Path = config.workspace
+    workspace: Path = scope.root
     if not workspace.is_dir():
-        raise NotADirectoryError(f"工作区不是有效目录：{workspace}")
+        raise NotADirectoryError(f"文件根不是一个有效目录：{workspace}")
 
     default: BackendProtocol
     if config.execution_mode.value == "local":
@@ -191,7 +214,7 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
         # WHY 由 factory 装配 runner：档位是否可用由能力探测决定，装配失败
         # 直接抛出，绝不退化到 LocalShellBackend——静默降级会让使用者误以为
         # 命令跑在隔离环境里。
-        runner = build_sandbox_runner(config)
+        runner = build_sandbox_runner(config, workspace=workspace)
         default = SandboxedFilesystemBackend(
             root_dir=str(workspace),
             runner=runner,
@@ -214,7 +237,29 @@ def build_backend(config: AppConfig, store: BaseStore) -> CompositeBackend:
         logger.info("执行档位=disabled：execute 工具调用将返回错误")
         default = _ExtendedPathSafeFilesystemBackend(root_dir=str(workspace))
 
-    return CompositeBackend(
-        default=default,
-        routes={"/memories/": StoreBackend(namespace=_MEMORY_NAMESPACE, store=store)},
-    )
+    routes: dict[str, BackendProtocol] = {
+        "/memories/": StoreBackend(namespace=_MEMORY_NAMESPACE, store=store)
+    }
+    # 根外路径按声明挂成**只读**路由。WHY 从 scope 取而不是从 config 读：「哪些来源真的
+    # 存在」是**会话级**判定（工作区自带的 AGENTS.md 随根变化），而 memory / skills 参数
+    # 用的也是同一份数据——两处各算一次必然漂开，漂开的表现正是「来源列了、挂载没建」，
+    # 于是记忆静默少一条、技能一个都加载不到。
+    #
+    # 三类路由的来源不同：
+    # - 长期记忆（``memory_plan.mounts``，单文件）：人工维护、跨会话共享；
+    # - 根外存储（``read_only_mounts``，整棵目录）：技能库 / 技能视图 / 工具输出留存，
+    #   它们在 2026-09-21 之前住在工作区里，现在搬到了 ``<数据目录>/roots/…``；
+    # - 技能来源里的根外目录（内置技能、``SKILL_DIRS`` 指定的目录）同样由
+    #   ``read_only_mounts`` 带出来——视图缺失时的兜底路径要靠它们才真的读得到。
+    for mount in [*scope.memory_plan.mounts, *scope.read_only_mounts]:
+        if mount.kind == "dir":
+            routes[mount.prefix] = ReadOnlyDirectoryMount(mount.host_path, label=mount.label)
+        else:
+            routes[mount.prefix] = ReadOnlyFileMount(
+                mount.host_path, label=mount.label, mounted_at=mount.virtual_path
+            )
+        logger.info(
+            "只读挂载已装配：%s ← %s（%s）", mount.virtual_path, mount.host_path, mount.label
+        )
+
+    return CompositeBackend(default=default, routes=routes)

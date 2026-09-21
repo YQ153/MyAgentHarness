@@ -143,7 +143,12 @@ def test_static_scripts_are_discovered() -> None:
     """先确认 glob 命中：否则下面的断言会在「零个文件」上静默通过。"""
     names = {path.name for path in _static_scripts()}
 
-    assert {"app.js", "auth_credential.js", "markdown.js"} <= names, sorted(names)
+    assert {
+        "app.js",
+        "auth_credential.js",
+        "markdown.js",
+        "workspace_scope.js",
+    } <= names, sorted(names)
 
 
 def test_no_call_to_undeclared_identifier() -> None:

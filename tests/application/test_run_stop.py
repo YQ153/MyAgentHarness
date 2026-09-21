@@ -28,7 +28,7 @@ from tests.application.test_run_service import (
     _make_service,
     _principal,
 )
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 class ChunkedThenHangGraph:
@@ -205,6 +205,7 @@ async def test_stop_audits_run_cancelled(test_config, thread_store):
         test_config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(SlowGraph(delay=10.0)),
+        workspaces=StubSessionRegistry(test_config),
         audit_store=audit,
     )
     generator = await service.stream("t1", "audited run")

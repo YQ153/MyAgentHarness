@@ -15,14 +15,23 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 
-from application.attachment_service import AttachmentService
+from application.attachment_service import AttachmentService, attachment_limits
 from application.dto import AttachmentInfo, AttachmentLimits, AttachmentListResult
 from application.errors import NotFoundError
 from application.principal import Principal
 from interfaces.web.auth import require_permission
-from interfaces.web.deps import require_state
+from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import AttachmentDeleteResponse
 
 logger = logging.getLogger(__name__)
@@ -40,9 +49,30 @@ WHY 不用 ``await file.read()`` 一次读完：那样一个远超上限的文�
 """
 
 
-def get_attachments(request: Request) -> AttachmentService:
-    """取出附件服务单例。"""
-    return require_state(request, "attachments", "附件服务")
+async def get_attachments(
+    request: Request,
+    thread_id: str | None = None,
+    workspace: str | None = Query(
+        default=None,
+        description=(
+            "仅在该会话尚未绑定工作区时生效（新建会话上传附件就是这种情况）；"
+            "已绑定的会话以绑定值为准，给出不同取值会被拒绝（409）"
+        ),
+    ),
+) -> AttachmentService:
+    """取出**该会话工作区**的附件服务。
+
+    WHY 按会话解析：附件落在 ``<工作区>/.attachments/<thread_id>/`` 下。工作区在会话级
+    可选之后不再是一个进程级常量，用全局那份就会「上传成功、却读不到」。
+
+    WHY 单独给一个 ``workspace`` 查询参数：附件是在**首条消息之前**上传的，那一刻这条
+    会话还没绑定工作区，服务端无从知道它将被指到哪。不给这个参数，新会话的附件只能落进
+    启动默认工作区——而它运行在别的工作区里，附件当场失效。
+    """
+    bundle = await resolve_scoped_services(
+        request, thread_id=thread_id, requested=workspace
+    )
+    return bundle.attachments
 
 
 async def _read_upload(upload: UploadFile, max_bytes: int) -> bytes:
@@ -74,17 +104,20 @@ async def _read_upload(upload: UploadFile, max_bytes: int) -> bytes:
 
 
 @router.get("/api/attachments/limits", response_model=AttachmentLimits)
-async def attachment_limits(
-    service: AttachmentService = Depends(get_attachments),
+async def get_attachment_limits(
+    request: Request,
     principal: Principal = Depends(require_permission("file:read")),
 ) -> AttachmentLimits:
     """返回当前生效的附件上限。
 
-    WHY 与具体会话解耦：前端要在用户**选择文件的那一刻**就提示「太大 / 类型不支持」，
-    而那一刻草稿态会话还不存在（会话在首条消息发出时才诞生）。若只能按会话取上限，
-    这条提示就永远晚一步——用户要等到上传失败才知道。
+    WHY 与具体会话、甚至与任何文件根都解耦：上限来自进程配置，前端要在用户**选择文件的
+    那一刻**就提示「太大 / 类型不支持」。若只能按会话取，这条提示就永远晚一步——用户要
+    等到上传失败才知道；而若为此去解析一个会话根，一个纯配置查询会在「会话还没有根」
+    时变成 409（草稿态第一次打开就撞上）。
+
+    权限仍与文件面板同口径（``file:read``）：它属于「这个部署接受什么」这类信息。
     """
-    return service.limits()
+    return attachment_limits(request.app.state.config)
 
 
 @router.post("/api/threads/{thread_id}/attachments", response_model=AttachmentInfo)

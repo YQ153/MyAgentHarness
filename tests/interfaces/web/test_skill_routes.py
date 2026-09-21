@@ -21,8 +21,7 @@ from application.skill_service import SkillService
 from config import AppConfig
 from interfaces.web.skill_routes import router
 from runtime.skill_store import open_skill_store
-from runtime.skill_view import view_directory
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config, make_root
 
 _SKILL = """---
 name: {name}
@@ -31,6 +30,9 @@ description: {name} 的说明
 
 # {name}
 """
+
+#: 面板端点按**会话**解析文件根；用例统一带上一个会话 ID（与界面真实请求一致）。
+_SESSION = {"thread_id": "t1"}
 
 
 @pytest.fixture
@@ -42,7 +44,8 @@ async def api(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, AppConfi
     async with open_skill_store(tmp_path / "skills.db") as store:
         app = FastAPI()
         app.state.config = config
-        app.state.skills = SkillService(config, store=store)
+        app.state.skills = SkillService(config, scope=make_root(config), store=store)
+        app.state.workspaces = StubSessionRegistry(config, skills=app.state.skills)
         app.include_router(router)
 
         transport = httpx.ASGITransport(app=app)
@@ -52,7 +55,7 @@ async def api(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, AppConfi
 
 def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> None:
     """在用户技能目录里写一个技能包。"""
-    directory = Path(config.workspace) / "skills" / name
+    directory = Path(make_root(config).root) / "skills" / name
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "SKILL.md").write_text(
         body if body is not None else _SKILL.format(name=name), encoding="utf-8"
@@ -60,8 +63,8 @@ def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> No
 
 
 def _view_names(config: AppConfig) -> set[str]:
-    """视图目录里当前有哪些技能。"""
-    view = view_directory(Path(config.workspace))
+    """技能视图里当前有哪些技能（视图在**根外存储**里，见 ``SessionRoot.skill_view_store``）。"""
+    view = make_root(config).skill_view_store
     return {child.name for child in view.iterdir() if child.is_dir()} if view.is_dir() else set()
 
 
@@ -73,7 +76,7 @@ async def test_list_returns_skill(api: tuple[httpx.AsyncClient, AppConfig]) -> N
     http, config = api
     _write_skill(config, "code-review")
 
-    response = await http.get("/api/skills")
+    response = await http.get("/api/skills", params=_SESSION)
 
     assert response.status_code == 200
     body = response.json()
@@ -90,11 +93,11 @@ async def test_list_exposes_unloadable_reason(
     「我明明建了它，面板里却没有」，且没有任何可查的线索。
     """
     http, config = api
-    broken = Path(config.workspace) / "skills" / "no-desc"
+    broken = Path(make_root(config).root) / "skills" / "no-desc"
     broken.mkdir(parents=True, exist_ok=True)
     (broken / "SKILL.md").write_text('---\nname: "no-desc"\n---\n\n# 正文\n', encoding="utf-8")
 
-    body = (await http.get("/api/skills")).json()
+    body = (await http.get("/api/skills", params=_SESSION)).json()
 
     assert body["items"] == []
     assert [item["directory"] for item in body["unloadable"]] == ["/skills/no-desc"]
@@ -108,7 +111,7 @@ async def test_list_warns_when_view_missing(
     http, config = api
     _write_skill(config, "code-review")
 
-    body = (await http.get("/api/skills")).json()
+    body = (await http.get("/api/skills", params=_SESSION)).json()
 
     assert body["view_exists"] is False
     assert "不存在" in body["view_warning"]
@@ -122,8 +125,8 @@ async def test_list_reports_view_once_rebuilt(
     http, config = api
     _write_skill(config, "code-review")
 
-    await http.patch("/api/skills/code-review", json={"enabled": True})
-    body = (await http.get("/api/skills")).json()
+    await http.patch("/api/skills/code-review", params=_SESSION, json={"enabled": True})
+    body = (await http.get("/api/skills", params=_SESSION)).json()
 
     assert body["view_exists"] is True
     assert body["view_warning"] == ""
@@ -145,7 +148,7 @@ async def test_disable_removes_skill_from_view(
     _write_skill(config, "code-review")
     _write_skill(config, "legacy")
 
-    response = await http.patch("/api/skills/legacy", json={"enabled": False})
+    response = await http.patch("/api/skills/legacy", params=_SESSION, json={"enabled": False})
 
     assert response.status_code == 200
     assert response.json()["enabled"] is False
@@ -157,12 +160,12 @@ async def test_enable_puts_skill_back(api: tuple[httpx.AsyncClient, AppConfig]) 
     """重新启用后它回到视图里，清单状态同步。"""
     http, config = api
     _write_skill(config, "legacy")
-    await http.patch("/api/skills/legacy", json={"enabled": False})
+    await http.patch("/api/skills/legacy", params=_SESSION, json={"enabled": False})
 
-    await http.patch("/api/skills/legacy", json={"enabled": True})
+    await http.patch("/api/skills/legacy", params=_SESSION, json={"enabled": True})
 
     assert _view_names(config) == {"legacy"}
-    body = (await http.get("/api/skills")).json()
+    body = (await http.get("/api/skills", params=_SESSION)).json()
     assert body["items"][0]["enabled"] is True
 
 
@@ -170,7 +173,7 @@ async def test_unknown_skill_returns_404(api: tuple[httpx.AsyncClient, AppConfig
     """启停不存在的技能名返回 404 而不是静默成功。"""
     http, _ = api
 
-    response = await http.patch("/api/skills/不存在的技能", json={"enabled": False})
+    response = await http.patch("/api/skills/不存在的技能", params=_SESSION, json={"enabled": False})
 
     assert response.status_code == 404
 
@@ -180,7 +183,7 @@ async def test_missing_body_field_is_rejected(api: tuple[httpx.AsyncClient, AppC
     http, config = api
     _write_skill(config, "code-review")
 
-    response = await http.patch("/api/skills/code-review", json={})
+    response = await http.patch("/api/skills/code-review", params=_SESSION, json={})
 
     assert response.status_code == 422
 

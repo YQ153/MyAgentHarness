@@ -43,7 +43,7 @@ class _GraphFactory:
     def __init__(self, graph: Any) -> None:
         self._graph = graph
 
-    def get(self, name: str | None = None) -> Any:
+    def get(self, name: str | None = None, *, scope: Any = None) -> Any:
         return self._graph
 
 
@@ -62,7 +62,7 @@ def _build_graph(saver: AsyncSqliteSaver) -> Any:
 @asynccontextmanager
 async def _service(tmp_path: Any, **config_overrides: Any):
     """构造带真实检查点与会话存储的 ThreadService。"""
-    from tests.conftest import make_config
+    from tests.conftest import StubSessionRegistry, make_config
 
     overrides = dict(config_overrides)
     if overrides.get("auth_mode") not in (None, "disabled"):
@@ -79,6 +79,7 @@ async def _service(tmp_path: Any, **config_overrides: Any):
                 checkpointer=saver,
                 thread_store=store,
                 graph_factory=_GraphFactory(_build_graph(saver)),
+                workspaces=StubSessionRegistry(config),
             ),
             store,
             saver,
@@ -123,6 +124,53 @@ async def test_round_trip_preserves_messages(tmp_path):
         ]
         assert result.message_count == len(_CONVERSATION)
         assert result.skipped_messages == 0
+
+
+async def test_export_records_the_source_workspace(tmp_path):
+    """导出文件里记下来源工作区，并说明它不随迁移。
+
+    WHY 必须记：消息正文里的工具输出引用是**工作区内**的虚拟路径（``/_tool_outputs/...``）。
+    不记来源，导入方看到这些引用时无从判断它们指向哪棵树——而按默认工作区解释的结果可能是
+    「404」，也可能是「另一个项目里的同名文件」，两种都不会说明自己少了什么。
+    """
+    source_root = tmp_path / "project-a"
+    source_root.mkdir()
+    async with _service(tmp_path) as (service, store, saver):
+        await _seed(store, saver, _CONVERSATION)
+        await store.record_turn("source", workspace=str(source_root))
+
+        exported = await service.export_thread("source")
+
+        assert exported.workspace == str(source_root.resolve())
+        assert any("工作区" in note for note in exported.notes)
+
+
+async def test_import_binds_the_requested_workspace_not_the_exported_one(tmp_path):
+    """导入后的工作区由**导入方**决定；文件里那个只作线索。
+
+    WHY 不照搬文件里的取值：它是来源机器上的绝对路径，在本机通常不存在，也多半不在允许
+    清单里——照搬只会让导入失败，或者把新会话绑到一个清单之外的目录上（而那正是清单要
+    拦的那件事）。不指定时落到启动默认值。
+    """
+    source_root = tmp_path / "project-a"
+    target_root = tmp_path / "project-b"
+    source_root.mkdir()
+    target_root.mkdir()
+    async with _service(tmp_path) as (service, store, saver):
+        await _seed(store, saver, _CONVERSATION)
+        await store.record_turn("source", workspace=str(source_root))
+        exported = await service.export_thread("source")
+
+        moved = await service.import_thread(exported, workspace=str(target_root))
+        defaulted = await service.import_thread(exported)
+
+        assert exported.workspace == str(source_root.resolve())
+        assert (await store.get(moved.thread_id))["workspace"] == str(target_root.resolve())
+        # 不给工作空间 → 这条新会话落在**它自己的专属目录**里（会话目录的父目录由
+        # ``DB_PATH`` 派生，即 tmp_path/sessions）。这是新模型里「不绑定工作空间」那条路。
+        assert (await store.get(defaulted.thread_id))["workspace"] == str(
+            tmp_path / "sessions" / defaulted.thread_id
+        )
 
 
 async def test_import_creates_a_new_thread_and_keeps_source(tmp_path):

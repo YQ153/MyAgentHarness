@@ -24,7 +24,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from application.knowledge_service import KnowledgeService
 from application.principal import Principal
 from interfaces.web.auth import require_permission
-from interfaces.web.deps import require_state
+from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import (
     KnowledgeDeleteResponse,
     KnowledgeIndexItem,
@@ -41,13 +41,28 @@ _STATUS_KEYS = ("indexed", "unchanged", "empty", "skipped")
 """逐份文档的可能状态；与 ``KnowledgeService.index_workspace`` 的汇总口径一致。"""
 
 
-def get_knowledge(request: Request) -> KnowledgeService:
-    """取出知识库服务单例。
+async def get_knowledge(
+    request: Request,
+    thread_id: str | None = Query(default=None, description="会话 ID；给了就按该会话的工作区解析"),
+    workspace: str | None = Query(
+        default=None,
+        description="仅在该会话尚未绑定时生效（草稿态预览就是这种情况）",
+    ),
+) -> KnowledgeService:
+    """取出**该会话工作区**的知识库服务。
 
-    WHY 与工具取的是同一份：它由 ``knowledge_runtime`` 持有整进程唯一的一份，接口与
-    工具共用同一个连接与同一份索引视图（理由见该模块 docstring）。
+    WHY 按会话解析：知识库按工作区各存一份索引（库里以「工作区内的虚拟路径」为键去重，
+    两个项目的 ``/README.md`` 是同一个键）。用全局那一个会让界面列出别的项目的文档，
+    而 Agent 在本次会话里检索到的却是另一份——两个方向都不会报错。
+
+    WHY 还要一个 ``workspace`` 参数：草稿态下这条会话还没登记，而用户可能已经选了别的
+    工作区；不认这个取值，面板列的就是另一个项目的文档。
+
+    WHY 与工具取的是同一份：工具侧同样按「本轮运行的工作区」解析（见
+    ``knowledge_tools``），两边都落在 ``knowledge_runtime`` 的同一张句柄表上。
     """
-    return require_state(request, "knowledge", "知识库服务")
+    bundle = await resolve_scoped_services(request, thread_id=thread_id, requested=workspace)
+    return bundle.knowledge
 
 
 def _as_response(summary: dict[str, Any]) -> KnowledgeIndexResponse:

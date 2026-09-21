@@ -64,9 +64,14 @@ from application.run_registry import (
 )
 from application.runnable import build_runnable_config
 from application.usage import TokenUsage
+from application.session_registry import SessionRegistry
 from runtime.execution_registry import abort_scope, bound_scope
-from runtime.tool_outputs import prune_tool_outputs, tool_output_path, write_tool_output
-from runtime.workspace_files import to_virtual_path
+from runtime.tool_outputs import (
+    prune_tool_outputs,
+    tool_output_path,
+    tool_output_virtual_path,
+    write_tool_output,
+)
 from text_utils import build_title
 from thread_utils import normalize_thread_id
 
@@ -141,6 +146,7 @@ class RunService:
         *,
         thread_store: ThreadMetadataStore,
         graph_factory: AgentFactory,
+        workspaces: SessionRegistry,
         audit_store: AuditLog | None = None,
         usage_store: UsageLedger | None = None,
         tool_catalog: ToolCatalog | None = None,
@@ -151,6 +157,8 @@ class RunService:
             config: 应用配置。
             thread_store: 会话元数据存储，用于登记轮次与刷新活动时间。
             graph_factory: 图工厂，提供已装配的 LangGraph 图。
+            workspaces: 会话级工作区的解析与装配入口；**必填**——本轮的文件根、
+                技能来源与工具输出留存都按它解析出的工作区换算。
             audit_store: 审计日志存储，可选。
             usage_store: Token 用量存储，可选；为 ``None`` 时不记录用量。
             tool_catalog: 工具目录，用于审计时标注工具来源；``None`` 时
@@ -165,10 +173,13 @@ class RunService:
             raise ValueError("thread_store 不能为 None")
         if graph_factory is None:
             raise ValueError("graph_factory 不能为 None")
+        if workspaces is None:
+            raise ValueError("workspaces 不能为 None：本轮跑在哪个工作区由它解析")
 
         self._config = config
         self._thread_store = thread_store
         self._graph_factory = graph_factory
+        self._workspaces = workspaces
         self._audit_store = audit_store
         self._usage_store = usage_store
         self._tool_catalog = tool_catalog
@@ -184,6 +195,7 @@ class RunService:
             thread_store=thread_store,
             graph_factory=graph_factory,
             registry=self._registry,
+            workspaces=workspaces,
             audit=self._audit,
         )
 
@@ -285,6 +297,7 @@ class RunService:
         *,
         principal: Principal | None = None,
         model_name: str | None = None,
+        workspace: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """发起一轮对话。
 
@@ -301,16 +314,22 @@ class RunService:
                 含非空文本——标题、日志与「轮次是否成立」都依赖它。
             principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
+            workspace: 会话的工作空间路径；``None`` 表示**不绑定工作空间**——这条会话
+                将使用应用为它自动创建的专属目录。取值**只在首条消息上生效**：一旦会话
+                产生过交互，它的文件根就锁定了，再给出不同的取值会被拒绝
+                （见 ``SessionRootLockedError``）。
 
         Returns:
             产出统一事件的异步迭代器。
 
         Raises:
-            ValueError: ``thread_id`` 或 ``user_input`` 非法。
+            ValueError: ``thread_id``、``user_input`` 非法，或 ``workspace`` 指向的
+                目录不存在。
             KeyError: 模型别名未注册。
             PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话不存在。
             OwnershipError: 无权访问该会话。
+            SessionRootLockedError: ``workspace`` 与该会话已锁定的文件根不一致。
             RuntimeError: 模型初始化或装配失败。
         """
         self._ensure_permission(principal, "thread:create")
@@ -323,7 +342,14 @@ class RunService:
 
         # WHY 先鉴权再初始化模型：权限不足应快速失败，避免浪费模型调用。
         # 首条消息可能还未登记元数据，允许当前主体认领该会话。
-        await self._ensure_ownership(normalized, principal, allow_claim=True)
+        record = await self._ensure_ownership(normalized, principal, allow_claim=True)
+
+        # WHY 文件根必须在这里（取图之前）定下来：图的文件根、技能来源与容器挂载根
+        # 都在装配那一刻烧死，而根是会话级取值——顺序反了就会拿到「上一个根」的图，
+        # 运行过程毫无异常，文件却写进了另一个项目。
+        scope = await self._workspaces.resolve(
+            requested=workspace, thread_id=normalized, record=record
+        )
 
         # WHY 新一轮用户输入会作废此前悬着的审批请求：用户既已改口，那个
         # 审批卡就不再代表当前意图；留着它只会让「待审批数」无限增长。
@@ -331,16 +357,35 @@ class RunService:
 
         # WHY 在进入图之前取图：这一步会解析模型别名并真正初始化模型，
         # 把配置与密钥错误暴露在事件流开始之前。
-        graph = self._graph_factory.get(model_name)
+        graph = self._graph_factory.get(model_name, scope=scope)
 
         actor_id = principal.user_id if principal else "anonymous"
-        logger.info("会话 %s 发起运行（%d 字符）actor=%s", normalized, len(text), actor_id)
+        logger.info(
+            "会话 %s 发起运行（%d 字符）actor=%s workspace=%s",
+            normalized,
+            len(text),
+            actor_id,
+            scope.root,
+        )
 
         # WHY 在进入图之前登记：这一刻才是会话真正诞生的时刻。放在轮次结束后
         # 登记，会让「模型初始化失败」这类早退场景下的会话凭空消失，而用户
         # 明明已经表达过意图。标题也取自这次输入——唯一「用户明确表达意图」
         # 的文本，不需要额外调用模型。
-        recorded = await self._record_turn(normalized, title_hint=text, turn_delta=1, principal=principal)
+        #
+        # WHY 一并写入文件根：锁定必须发生在「这条会话开始跑」的那一刻，晚一步就会出现
+        # 「会话已经跑过、根还没记下」的空窗，而那个空窗里的重试会按另一条规则重算一次
+        # ——落进另一个目录。
+        # WHY 传 workspace_bound：它区分「用户选的工作空间」与「应用给的专属目录」，
+        # 界面靠它决定文案；这个事实只在锁定那一刻知道，事后再也推断不出来。
+        recorded = await self._record_turn(
+            normalized,
+            title_hint=text,
+            turn_delta=1,
+            principal=principal,
+            workspace=str(scope.root),
+            workspace_bound=bool(workspace and str(workspace).strip()),
+        )
 
         # WHY 登记后再校验一次所有权：并发首条消息场景下，UPSERT 会以首个写入者
         # 的 owner_id 为准；登记后回读可发现该会话是否已被他人抢先认领，
@@ -373,6 +418,7 @@ class RunService:
             model_name=model_name,
             owner_id=self._owner_id(principal),
             actor_id=actor_id,
+            workspace=str(scope.root),
         )
 
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": content}]}
@@ -578,9 +624,13 @@ class RunService:
         # WHY 在这里就完成审批载荷校验：非法载荷必须在事件流开始之前失败，
         # 否则只能表现为连接中断，前端拿不到任何可读的失败原因。
         command = build_resume_command(decision_payload)
-        graph = self._graph_factory.get(model_name)
 
-        await self._ensure_ownership(normalized, principal)
+        # WHY 所有权校验挪到取图之前：取图需要先知道本轮的工作区，而工作区要从会话
+        # 记录里读。顺带的好处与 ``stream`` 一致——权限与存在性问题比模型初始化便宜，
+        # 让它们先失败。
+        record = await self._ensure_ownership(normalized, principal)
+        scope = await self._workspaces.resolve(thread_id=normalized, record=record)
+        graph = self._graph_factory.get(model_name, scope=scope)
 
         # WHY 在清除登记之前先判过期：过期标记正是「这次挂起已作废」的唯一
         # 凭据，若先把登记清掉，判定就永远为假，TTL 形同虚设，而用户却拿到了
@@ -599,7 +649,11 @@ class RunService:
 
         # WHY turn_delta=0：恢复是同一轮运行的延续，重复计数会让「对话轮数」
         # 与实际用户输入次数不符；但仍然要刷新活动时间。
-        await self._record_turn(normalized, title_hint=None, turn_delta=0)
+        # WHY 同样带上工作区：未绑定过的历史会话会在这一刻被补记，此后它就有了明确
+        # 归属，不必每轮都重新按默认值推断。
+        await self._record_turn(
+            normalized, title_hint=None, turn_delta=0, workspace=str(scope.root)
+        )
 
         decisions = decision_payload.get("decisions") or []
         await self._audit(
@@ -616,6 +670,7 @@ class RunService:
             model_name=model_name,
             owner_id=self._owner_id(principal),
             actor_id=actor_id,
+            workspace=str(scope.root),
         )
         return self._consume(graph, command, handle)
 
@@ -819,6 +874,37 @@ class RunService:
                 batch[0][0].parent,
             )
 
+    def _tool_output_plan(self, handle: RunHandle) -> tuple[Path, str]:
+        """本轮的留存方案：``(宿主存储目录, 虚拟根)``。
+
+        WHY 两者一起给：落盘用宿主路径、引用（写进消息与事件）用虚拟路径，而「路径从哪来」
+        只有 ``SessionRoot`` 知道（布局是它的事）。分开算迟早漂开——表现是前端点开「完整
+        输出」时拿到 404，看起来像留存没写成功。
+
+        Raises:
+            RuntimeError: 句柄没有携带文件根（说明调用方绕过了会话解析）。
+        """
+        from config import SessionRoot
+
+        scope = SessionRoot(self._config, self._root_of(handle))
+        return scope.tool_output_store, scope.tool_outputs_virtual
+
+    def _root_of(self, handle: RunHandle) -> Path:
+        """本轮运行的文件根（用户工作空间或会话专属目录）。
+
+        WHY 没有回落：句柄不带根说明调用方绕过了会话上下文的解析，而「拿不准写进哪个
+        根」唯一安全的做法是报错——猜一个的结果是把工具输出留存写进别的项目，症状只是
+        「完整输出」指向别处，不会报任何错。
+
+        Raises:
+            RuntimeError: 句柄没有携带文件根。
+        """
+        if not handle.workspace:
+            raise RuntimeError(
+                "运行句柄没有文件根：本轮运行的根由会话解析给出，缺失说明调用方绕过了它"
+            )
+        return Path(handle.workspace)
+
     async def _iterate(
         self,
         graph: Any,
@@ -828,6 +914,13 @@ class RunService:
         """逐条翻译流增量，并负责运行期错误收敛。"""
         pending_outputs: list[tuple[Path, str]] = []
         output_sequence = itertools.count(1)
+        # WHY 在这里取一次存储目录而不是每处现算：留存落盘与「完整输出」的虚拟路径必须
+        # 来自同一个目录，两处各解析一次迟早会漂开——而漂开的表现是前端点开完整输出时
+        # 拿到 404，看起来像留存没写成功。
+        #
+        # WHY 不再是「工作区根」：留存属于应用的数据（不是用户的项目文件），2026-09-21
+        # 起落在根外存储里，由只读挂载 ``/_tool_outputs/`` 暴露给 Agent 回取。
+        store_dir, virtual_root = self._tool_output_plan(handle)
 
         def capture_full_output(tool_name: str, full_text: str) -> str:
             """算出留存引用并暂存正文，返回供事件使用的虚拟路径。
@@ -835,11 +928,9 @@ class RunService:
             WHY 只暂存不写盘：本回调由翻译器**同步**调用，而写文件是阻塞 IO——
             在事件循环里直接写会让流式输出卡顿。落盘交给下面的 ``flush_outputs``。
             """
-            path = tool_output_path(
-                self._config.workspace, handle.thread_id, next(output_sequence), tool_name
-            )
+            path = tool_output_path(store_dir, handle.thread_id, next(output_sequence), tool_name)
             pending_outputs.append((path, full_text))
-            return to_virtual_path(self._config.workspace, path)
+            return tool_output_virtual_path(virtual_root, handle.thread_id, path.name)
 
         async def flush_outputs() -> None:
             """把暂存的留存写盘。
@@ -1078,6 +1169,7 @@ class RunService:
         owner_id: str = "",
         actor_id: str = "",
         fork_checkpoint: str = "",
+        workspace: str = "",
     ) -> RunHandle:
         """占用该会话的运行槽位并登记运行句柄。
 
@@ -1087,6 +1179,7 @@ class RunService:
             owner_id: 会话所有者；认证关闭时为空串。
             actor_id: 发起本轮运行的主体标识，用于工具审计归因。
             fork_checkpoint: 分叉起点检查点 id；空串表示接着当前分支的头。
+            workspace: 本轮运行的工作区绝对路径；收尾阶段按它换算留存路径。
 
         Returns:
             本次运行的句柄；停止请求与运行指标都通过它传递。
@@ -1102,6 +1195,7 @@ class RunService:
             owner_id=owner_id,
             actor_id=actor_id,
             fork_checkpoint=fork_checkpoint,
+            workspace=workspace,
         )
 
     def release_run_slot(self, thread_id: str) -> None:
@@ -1224,6 +1318,8 @@ class RunService:
         title_hint: str | None,
         turn_delta: int,
         principal: Principal | None = None,
+        workspace: str = "",
+        workspace_bound: bool = False,
     ) -> dict[str, Any] | None:
         """把本轮对话登记到元数据表，并返回登记后的元数据。
 
@@ -1242,6 +1338,12 @@ class RunService:
                 title_hint=self._build_title(title_hint),
                 turn_delta=turn_delta,
                 owner_id=self._owner_id(principal),
+                # WHY 在这条 UPSERT 里顺带写文件根：它只在会话还没有根时生效
+                # （见 ``ThreadMetaStore.record_turn`` 的 CASE 分支），因此不会把已锁定的
+                # 会话改到别处；而对还没有根的会话，这正是「根在第一次真正跑起来的那一刻
+                # 锁定」的落点。
+                workspace=workspace,
+                workspace_bound=workspace_bound,
             )
         except Exception:
             logger.exception("会话活动记录失败：thread=%s", thread_id)

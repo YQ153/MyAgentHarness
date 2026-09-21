@@ -23,7 +23,7 @@ from llm.registry import build_default_registry
 from runtime.attachments import attachment_dir
 from runtime.thread_store import ThreadMetaStore, open_thread_store
 from interfaces.web.attachment_routes import router
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config, make_root
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 _THREAD = "a" * 32
@@ -44,6 +44,7 @@ async def client(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, Threa
         config.ensure_directories()
         service = AttachmentService(
             config,
+            scope=make_root(config),
             registry=build_default_registry(config),
             thread_store=store,
             audit_store=_StubAudit(),
@@ -51,11 +52,12 @@ async def client(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, Threa
         app = FastAPI()
         app.state.config = config
         app.state.attachments = service
+        app.state.workspaces = StubSessionRegistry(config, attachments=service)
         app.include_router(router)
 
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-            yield http, store, Path(config.workspace)
+            yield http, store, Path(make_root(config).root)
 
 
 def _upload_url(thread_id: str = _THREAD) -> str:
@@ -92,6 +94,7 @@ async def test_upload_rejects_oversized_file(tmp_path: Path):
         config.ensure_directories()
         service = AttachmentService(
             config,
+            scope=make_root(config),
             registry=build_default_registry(config),
             thread_store=store,
             audit_store=_StubAudit(),
@@ -99,6 +102,7 @@ async def test_upload_rejects_oversized_file(tmp_path: Path):
         app = FastAPI()
         app.state.config = config
         app.state.attachments = service
+        app.state.workspaces = StubSessionRegistry(config, attachments=service)
         app.include_router(router)
 
         transport = httpx.ASGITransport(app=app)

@@ -106,14 +106,13 @@ class _Result:
 
 
 def _config(workdir: pathlib.Path, **overrides: Any) -> AppConfig:
-    """构造落在临时目录里的配置，避免冒烟污染真实工作区与数据库。"""
+    """构造落在临时目录里的配置，避免冒烟污染真实数据目录。"""
     params: dict[str, Any] = {
         "_env_file": workdir / "none.env",
         "auth_mode": "disabled",
-        "workspace": workdir / "workspace",
-        "memory_file": workdir / "workspace" / "AGENTS.md",
+        "memory_file": workdir / "AGENTS.md",
         "db_path": workdir / "agent.db",
-        "skill_dirs": [workdir / "workspace" / "skills"],
+        "skill_dirs": [workdir / "skills"],
     }
     params.update(overrides)
     config = AppConfig(**params)
@@ -184,7 +183,9 @@ async def _check_executable(name: str, workdir: pathlib.Path, **overrides: Any) 
 
 def _check_build_agent(workdir: pathlib.Path) -> _Result:
     """生产入口 ``build_agent`` 在 ``local`` 档位下的装配（需真实模型密钥）。"""
-    base = AppConfig(_env_file=str(ROOT / ".env") if (ROOT / ".env").exists() else None)
+    # WHY 走 ``load()``：工作区必填，直接构造在未配置时只会抛 pydantic 原文；
+    # ``load()`` 给出可照做的提示，并顺带把目录建好。
+    base = AppConfig.load(_env_file=str(ROOT / ".env") if (ROOT / ".env").exists() else None)
     if not base.deepseek_api_key or base.deepseek_api_key.startswith("your"):
         return _Result("build_agent 装配", True, "SKIP 未配置真实模型密钥（不影响本地能力结论）")
 

@@ -21,8 +21,7 @@ from application.errors import NotFoundError
 from application.skill_service import SkillService
 from config import AppConfig
 from runtime.skill_store import open_skill_store
-from runtime.skill_view import view_directory
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 _SKILL = """---
 name: {name}
@@ -40,12 +39,12 @@ async def service(tmp_path: Path) -> AsyncIterator[tuple[SkillService, AppConfig
     (workspace / "skills").mkdir(parents=True, exist_ok=True)
     config = make_config(tmp_path, workspace=workspace, skill_dirs=[workspace / "skills"])
     async with open_skill_store(tmp_path / "skills-state.db") as store:
-        yield SkillService(config, store=store), config
+        yield SkillService(config, scope=make_root(config), store=store), config
 
 
 def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> None:
     """在用户技能目录里写一个技能包。"""
-    directory = Path(config.workspace) / "skills" / name
+    directory = Path(make_root(config).root) / "skills" / name
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "SKILL.md").write_text(
         body if body is not None else _SKILL.format(name=name), encoding="utf-8"
@@ -53,8 +52,8 @@ def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> No
 
 
 def _view_names(config: AppConfig) -> set[str]:
-    """视图目录里当前有哪些技能。"""
-    view = view_directory(Path(config.workspace))
+    """技能视图里当前有哪些技能（视图在**根外存储**里，见 ``SessionRoot.skill_view_store``）。"""
+    view = make_root(config).skill_view_store
     return {child.name for child in view.iterdir() if child.is_dir()} if view.is_dir() else set()
 
 
@@ -91,7 +90,7 @@ async def test_list_reports_unloadable_candidates_with_reason(
     的就是「我明明建了它，面板里却没有」，且没有任何可查的线索。
     """
     skills, config = service
-    broken = Path(config.workspace) / "skills" / "no-desc"
+    broken = Path(make_root(config).root) / "skills" / "no-desc"
     broken.mkdir(parents=True, exist_ok=True)
     (broken / "SKILL.md").write_text('---\nname: "no-desc"\n---\n\n# 正文\n', encoding="utf-8")
 
@@ -144,12 +143,12 @@ async def test_view_copies_helper_files(service: tuple[SkillService, AppConfig])
     """
     skills, config = service
     _write_skill(config, "with-helper")
-    helper = Path(config.workspace) / "skills" / "with-helper" / "helper.py"
+    helper = Path(make_root(config).root) / "skills" / "with-helper" / "helper.py"
     helper.write_text("print('辅助')\n", encoding="utf-8")
 
     await skills.refresh_view()
 
-    assert (view_directory(Path(config.workspace)) / "with-helper" / "helper.py").is_file()
+    assert (make_root(config).skill_view_store / "with-helper" / "helper.py").is_file()
 
 
 async def test_graph_sources_use_the_view_once_it_exists(
@@ -227,7 +226,7 @@ async def test_disabling_all_yields_empty_view(
 
     await skills.set_enabled("legacy", False)
 
-    assert view_directory(Path(config.workspace)).is_dir()
+    assert make_root(config).skill_view_store.is_dir()
     assert _view_names(config) == set()
 
 
@@ -252,7 +251,33 @@ async def test_state_survives_new_service_instance(
     await skills.set_enabled("legacy", False)
 
     async with open_skill_store(tmp_path / "skills-state.db") as store:
-        reopened = SkillService(config, store=store)
+        reopened = SkillService(config, scope=make_root(config), store=store)
         listed = await reopened.list_skills()
 
     assert listed["items"][0]["enabled"] is False
+
+
+async def test_builtin_skills_land_in_a_fresh_workspace_view(tmp_path: Path) -> None:
+    """默认技能目录下，随应用交付的内置技能必须真的进入新工作区的视图。
+
+    WHY 端到端跑一遍：内置技能在工作区**之外**，它的加载链有四段——挂虚拟路径 →
+    巡检读到 → 反解回宿主机目录 → 复制进视图。任一段断了都只留一行 WARNING，
+    而 Agent 会静默地少掉那几个套路（它照样能回答，只是不再会那些本事）。
+    """
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # 显式传空列表 = 用默认派生规则：随应用交付的内置目录 + 工作区内的 skills/
+    config = make_config(tmp_path, workspace=workspace, skill_dirs=[])
+
+    async with open_skill_store(tmp_path / "skills-state.db") as store:
+        skills = SkillService(config, scope=make_root(config), store=store)
+        result = await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    expected = {"code-review", "doc-to-markdown", "project-scaffold"}
+    assert set(result.copied) == expected
+    assert set(result.skipped) == set()
+    assert _view_names(config) == expected
+    # 来源注明在视图之外的内置目录，用户据此能解释「这个技能是随产品来的」
+    assert {item["source"] for item in listed["items"]} == {"/skills-builtin"}
+    assert all(item["enabled"] for item in listed["items"])

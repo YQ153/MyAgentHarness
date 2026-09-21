@@ -145,7 +145,9 @@ def test_run_cli_warns_for_exposed_config(
     """CLI 不监听端口，但同一份 .env 通常也用于 Web 形态，操作者应能提前看见。"""
     import main as main_module
 
-    async def _fake_run_cli(config: AppConfig, model_name: str | None = None) -> int:
+    async def _fake_run_cli(
+        config: AppConfig, model_name: str | None = None, workspace: str | None = None
+    ) -> int:
         return 0
 
     monkeypatch.setattr("interfaces.cli.run_cli", _fake_run_cli)
@@ -153,7 +155,7 @@ def test_run_cli_warns_for_exposed_config(
     caplog.clear()
 
     with caplog.at_level(logging.ERROR):
-        exit_code = main_module._run_cli(config, None)
+        exit_code = main_module._run_cli(config, None, None)
 
     assert exit_code == 0
     assert any(r.levelno == logging.ERROR for r in caplog.records)

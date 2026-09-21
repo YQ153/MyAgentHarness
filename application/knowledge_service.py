@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from application.principal import Principal
-    from config import AppConfig
+    from config import AppConfig, SessionRoot
     from llm.embeddings import EmbeddingBackend
 
 logger = logging.getLogger(__name__)
@@ -166,14 +166,18 @@ class KnowledgeService:
         self,
         config: AppConfig,
         *,
+        scope: SessionRoot,
         store: KnowledgeIndex,
         embeddings: EmbeddingBackend | None = None,
     ) -> None:
         """构造服务。
 
         Args:
-            config: 应用配置，提供工作区根目录、切分参数与检索条数上限。
-            store: 知识库存储。
+            config: 应用配置，提供切分参数、检索条数上限与字节上限。
+            scope: 本实例服务的工作区；**必填**。它同时是「索引哪片文档」与「这份索引
+                属于谁」的判据——知识库按工作区各存一份，两个工作区里同名的
+                ``/src/index.ts`` 不是同一份文档。
+            store: 该工作区对应的知识库存储。
             embeddings: 嵌入后端；``None`` 表示只做关键词检索。
 
         Raises:
@@ -181,13 +185,15 @@ class KnowledgeService:
         """
         if config is None:
             raise ValueError("config 不能为 None")
+        if scope is None:
+            raise ValueError("scope 不能为 None：索引的扫描根由它决定")
         if store is None:
             raise ValueError("store 不能为 None")
 
         self._config = config
         self._store = store
         self._embeddings = embeddings
-        self._root = Path(config.workspace)
+        self._root = scope.root
         logger.info(
             "KnowledgeService 就绪：workspace=%s 向量=%s 嵌入=%s",
             self._root,

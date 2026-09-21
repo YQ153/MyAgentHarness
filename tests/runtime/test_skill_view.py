@@ -17,16 +17,18 @@ from pathlib import Path
 import pytest
 
 from runtime import skill_view
+from config import VIRTUAL_SKILL_VIEW
 from runtime.skill_view import (
-    VIEW_DIR_NAME,
     ViewEntry,
     discard_view,
     rebuild_view,
     sources_for_graph,
     validate_entry_name,
-    view_directory,
-    view_source_path,
 )
+
+VIEW_SOURCE = "/.skills-active"
+"""视图的虚拟路径；与 ``config.VIRTUAL_SKILL_VIEW`` 同值。"""
+
 
 _SKILL = """---
 name: {name}
@@ -52,18 +54,43 @@ def _entry(workspace: Path, name: str) -> ViewEntry:
     return ViewEntry(name=name, source_dir=workspace / "skills" / name)
 
 
+def _view(workspace: Path) -> Path:
+    """本次用例使用的视图目录。
+
+    WHY 由用例自己给：视图已搬到**根外存储**（真实位置是
+    ``<数据目录>/roots/<根标识>/skills-active``），布局由 ``config`` 决定，本模块只接收
+    「那个目录」——因此用例传什么就是什么，不再有「工作区里的 .skills-active」这回事。
+    """
+    return workspace / "store" / "skills-active"
+
+
 # --------------------------------------------------------------- 路径约定
 
 
-def test_view_paths_are_stable_and_dot_prefixed(tmp_path: Path) -> None:
-    """视图路径固定且以点开头。
+def test_view_virtual_path_is_stable_and_dot_prefixed() -> None:
+    """视图的**虚拟路径**固定且以点开头。
 
-    WHY 固定：缓存的图持有来源路径，路径一变就会指向旧位置（表现为「改了启停却不生效」）。
-    WHY 点开头：它是程序生成的产物，必须被工作区面板与知识库遍历跳过。
+    WHY 固定：缓存的图持有的是来源**虚拟路径**，位置一变就会指向旧位置（表现为「改了
+    启停却不生效」）。
+    WHY 点开头：它是程序生成的产物；虽然已经不在工作区里（面板不会再遍历到），日志与
+    虚拟路径仍要能一眼区分「技能包本体」与「它的派生物」。
     """
-    assert view_directory(tmp_path) == tmp_path / VIEW_DIR_NAME
-    assert view_source_path() == "/" + VIEW_DIR_NAME
-    assert VIEW_DIR_NAME.startswith(".")
+    assert VIRTUAL_SKILL_VIEW.startswith("/.")
+    assert VIRTUAL_SKILL_VIEW.rstrip("/").endswith("skills-active")
+
+
+def test_temp_directory_sits_next_to_the_view(tmp_path: Path) -> None:
+    """构建中的临时目录与视图同处一层（跨层 ``rename`` 会失败）。
+
+    WHY 单列：换层之后「替换视图」就不是原子操作了，失败时可能留下半个视图——而症状是
+    部分技能静默消失。
+    """
+    view = _view(tmp_path)
+
+    temp = skill_view.temp_directory(view)
+
+    assert temp.parent == view.parent
+    assert temp.name.startswith(view.name)
 
 
 # --------------------------------------------------------------- 全量替换
@@ -91,9 +118,9 @@ def test_rebuild_is_a_full_replacement(tmp_path: Path) -> None:
     """
     _skill(tmp_path, "code-review")
     _skill(tmp_path, "legacy")
-    rebuild_view(tmp_path, [_entry(tmp_path, "code-review"), _entry(tmp_path, "legacy")])
+    rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review"), _entry(tmp_path, "legacy")])
 
-    result = rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
+    result = rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
 
     assert result.removed == ("legacy",)
     assert not (result.view_path / "legacy").exists()
@@ -107,9 +134,9 @@ def test_rebuild_with_empty_set_yields_empty_view(tmp_path: Path) -> None:
     （见 ``sources_for_graph``）；删掉它会让全停用被误判成「视图丢了」。
     """
     _skill(tmp_path, "code-review")
-    rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
+    rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
 
-    result = rebuild_view(tmp_path, [])
+    result = rebuild_view(_view(tmp_path), [])
 
     assert result.view_path.is_dir()
     assert list(result.view_path.iterdir()) == []
@@ -134,11 +161,11 @@ def test_rebuild_skips_invalid_skill_but_keeps_others(tmp_path: Path) -> None:
 def test_stale_building_directory_is_cleaned(tmp_path: Path) -> None:
     """上次崩溃留下的构建目录不会污染本次结果。"""
     _skill(tmp_path, "code-review")
-    stale = tmp_path / (VIEW_DIR_NAME + skill_view.VIEW_TEMP_SUFFIX)
+    stale = skill_view.temp_directory(_view(tmp_path))
     stale.mkdir(parents=True, exist_ok=True)
     (stale / "half-copied").mkdir()
 
-    result = rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
+    result = rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
 
     assert result.copied == ("code-review",)
     assert not (result.view_path / "half-copied").exists()
@@ -155,18 +182,18 @@ def test_failed_copy_keeps_the_previous_view_intact(tmp_path: Path, monkeypatch)
     """
     _skill(tmp_path, "code-review")
     _skill(tmp_path, "legacy")
-    rebuild_view(tmp_path, [_entry(tmp_path, "code-review"), _entry(tmp_path, "legacy")])
+    rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review"), _entry(tmp_path, "legacy")])
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError("模拟复制失败")
 
     monkeypatch.setattr(skill_view, "_copy_skill", _boom)
     with pytest.raises(OSError):
-        rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
+        rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
 
     # 旧视图完好：两个技能都还在
-    assert (view_directory(tmp_path) / "code-review").is_dir()
-    assert (view_directory(tmp_path) / "legacy").is_dir()
+    assert (_view(tmp_path) / "code-review").is_dir()
+    assert (_view(tmp_path) / "legacy").is_dir()
 
 
 # --------------------------------------------------------------- 名字即目录名（安全）
@@ -177,7 +204,7 @@ def test_duplicate_names_are_rejected(tmp_path: Path) -> None:
     _skill(tmp_path, "code-review")
 
     with pytest.raises(ValueError, match="重复"):
-        rebuild_view(tmp_path, [_entry(tmp_path, "code-review"), _entry(tmp_path, "code-review")])
+        rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review"), _entry(tmp_path, "code-review")])
 
 
 @pytest.mark.parametrize("bad", ["", "   ", ".", "..", "a/b", "a\\b"])
@@ -215,11 +242,11 @@ def test_valid_entry_name_is_passed_through() -> None:
 def test_sources_use_the_view_when_it_exists(tmp_path: Path) -> None:
     """视图存在时，建图来源就是视图。"""
     _skill(tmp_path, "code-review")
-    rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
+    rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
 
-    sources, warning = sources_for_graph(tmp_path, ["/skills"])
+    sources, warning = sources_for_graph(_view(tmp_path), ["/skills"], VIEW_SOURCE)
 
-    assert sources == [view_source_path()]
+    assert sources == [VIEW_SOURCE]
     assert warning == ""
 
 
@@ -229,7 +256,7 @@ def test_missing_view_falls_back_loudly(tmp_path: Path) -> None:
     WHY 这是 fail-loud 的核心：把「视图不存在」当成「没有技能」，会让全部技能静默消失，
     用户只看到 Agent 突然不会那些套路了。
     """
-    sources, warning = sources_for_graph(tmp_path, ["/skills"])
+    sources, warning = sources_for_graph(_view(tmp_path), ["/skills"], VIEW_SOURCE)
 
     assert sources == ["/skills"]
     assert "不存在" in warning
@@ -237,7 +264,7 @@ def test_missing_view_falls_back_loudly(tmp_path: Path) -> None:
 
 def test_missing_view_without_configured_sources_is_quiet(tmp_path: Path) -> None:
     """既没有视图也没有配置来源时返回空，且不算异常。"""
-    sources, warning = sources_for_graph(tmp_path, [])
+    sources, warning = sources_for_graph(_view(tmp_path), [], VIEW_SOURCE)
 
     assert sources == []
     assert warning == ""
@@ -245,7 +272,7 @@ def test_missing_view_without_configured_sources_is_quiet(tmp_path: Path) -> Non
 
 def test_blank_configured_sources_are_ignored(tmp_path: Path) -> None:
     """配置里的空白来源被忽略（尾部分隔符很常见）。"""
-    sources, _ = sources_for_graph(tmp_path, ["/skills", "  "])
+    sources, _ = sources_for_graph(_view(tmp_path), ["/skills", "  "], VIEW_SOURCE)
 
     assert sources == ["/skills"]
 
@@ -253,9 +280,9 @@ def test_blank_configured_sources_are_ignored(tmp_path: Path) -> None:
 def test_discard_view_removes_view_and_build_directory(tmp_path: Path) -> None:
     """``discard_view`` 把视图与构建目录一起清掉。"""
     _skill(tmp_path, "code-review")
-    rebuild_view(tmp_path, [_entry(tmp_path, "code-review")])
-    (tmp_path / (VIEW_DIR_NAME + skill_view.VIEW_TEMP_SUFFIX)).mkdir()
+    rebuild_view(_view(tmp_path), [_entry(tmp_path, "code-review")])
+    (skill_view.temp_directory(_view(tmp_path))).mkdir()
 
-    discard_view(tmp_path)
+    discard_view(_view(tmp_path))
 
-    assert not view_directory(tmp_path).exists()
+    assert not _view(tmp_path).exists()

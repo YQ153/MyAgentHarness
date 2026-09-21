@@ -53,6 +53,20 @@ _ALLOWED_RUNTIME_IMPORTS: dict[str, frozenset[str]] = {
     ),
     # 执行作用域：协作者之间传递的上下文管理器
     "runtime.execution_registry": frozenset({"abort_scope", "bound_scope"}),
+    # 系统文件夹选择弹窗：无状态函数 + 三个异常。
+    # WHY 不是可替换的实现：它没有「另一种实现」的诉求——平台差异（Windows / POSIX、
+    # 有无桌面）在模块内部按分支处理，测试则通过函数的 ``runner`` 参数注入替身，而不是
+    # 替换模块。为它引入协议只会得到一个「协议 + 唯一实现」的空壳。
+    # WHY 异常必须能直接拿到类：路由要把「环境不支持 / 已有弹窗 / 超时」映射成三个不同
+    # 的状态码（501 / 409 / 504），而这三者的下一步动作完全不同。
+    "runtime.folder_picker": frozenset(
+        {
+            "FolderPickerBusyError",
+            "FolderPickerTimeoutError",
+            "FolderPickerUnavailableError",
+            "pick_folder",
+        }
+    ),
     # 知识库的数据载体（KnowledgeStore 本身已端口化为 KnowledgeIndex）
     "runtime.knowledge_store": frozenset({"ChunkInput", "KnowledgeHit"}),
     # 运行限流器：由 RunRegistry 自建，理由见 run_registry.py 的构造注释
@@ -61,7 +75,7 @@ _ALLOWED_RUNTIME_IMPORTS: dict[str, frozenset[str]] = {
     "runtime.skill_store": frozenset({"DEFAULT_ENABLED", "GLOBAL_SCOPE"}),
     # 技能视图：只读的派生产物读写
     "runtime.skill_view": frozenset(
-        {"ViewEntry", "ViewResult", "rebuild_view", "sources_for_graph", "view_directory"}
+        {"ViewEntry", "ViewResult", "rebuild_view", "sources_for_graph"}
     ),
     # 技能包解析
     "runtime.skills": frozenset({"inspect_skills"}),
@@ -69,7 +83,9 @@ _ALLOWED_RUNTIME_IMPORTS: dict[str, frozenset[str]] = {
     "runtime.thread_store": frozenset({"normalize_search_query"}),
     # 工具输出的落盘与回收
     "runtime.tool_outputs": frozenset(
-        {"prune_tool_outputs", "tool_output_path", "write_tool_output"}
+        # tool_output_virtual_path 是纯字符串拼接（服务端要给出「消息里那个引用」）；
+        # 用宿主路径落盘与用虚拟路径引用是同一件事的两半，拆成协议只会让两半各自漂开。
+        {"prune_tool_outputs", "tool_output_path", "tool_output_virtual_path", "write_tool_output"}
     ),
     # 用量时间窗换算（UsageStore 本身已端口化为 UsageLedger）
     "runtime.usage_store": frozenset({"window_start"}),
@@ -82,7 +98,6 @@ _ALLOWED_RUNTIME_IMPORTS: dict[str, frozenset[str]] = {
             "looks_binary",
             "read_bytes_capped",
             "resolve_in_workspace",
-            "to_virtual_path",
         }
     ),
 }

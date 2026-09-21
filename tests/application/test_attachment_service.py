@@ -22,7 +22,7 @@ from application.thread_service import ThreadService
 from llm.registry import build_default_registry
 from runtime.attachments import AttachmentRecord, index_by_sha256, save_attachment
 from runtime.thread_store import ThreadMetaStore, open_thread_store
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config, make_root
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 _THREAD = "a" * 32
@@ -50,7 +50,8 @@ def _service(tmp_path: Path, thread_store: ThreadMetaStore, **overrides: Any):
     audit = _StubAudit()
     registry = build_default_registry(config)
     service = AttachmentService(
-        config, registry=registry, thread_store=thread_store, audit_store=audit
+        config,
+        scope=make_root(config), registry=registry, thread_store=thread_store, audit_store=audit
     )
     return service, config, audit, registry
 
@@ -271,7 +272,7 @@ def _record(tmp_path: Path, thread_id: str = _THREAD) -> AttachmentRecord:
     config = make_config(tmp_path)
     config.ensure_directories()
     return save_attachment(
-        Path(config.workspace), thread_id, filename="shot.png", mime_type="image/png", data=_PNG
+        Path(make_root(config).root), thread_id, filename="shot.png", mime_type="image/png", data=_PNG
     )
 
 
@@ -340,4 +341,4 @@ def test_index_by_sha256_finds_saved_attachment(tmp_path: Path):
     record = _record(tmp_path)
     config = make_config(tmp_path)
 
-    assert index_by_sha256(Path(config.workspace), _THREAD)[record.sha256].id == record.id
+    assert index_by_sha256(Path(make_root(config).root), _THREAD)[record.sha256].id == record.id

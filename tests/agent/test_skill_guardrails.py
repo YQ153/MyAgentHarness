@@ -23,7 +23,7 @@ import pytest
 from langgraph.store.memory import InMemoryStore
 
 from config import AppConfig
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 _SKILL_BODY = """---
 name: {name}
@@ -92,7 +92,7 @@ def _snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, with_skill: bo
         lambda **kwargs: captured.update(kwargs) or object(),
     )
 
-    build_agent(config, store=InMemoryStore())
+    build_agent(config, scope=make_root(config), store=InMemoryStore())
     return captured
 
 

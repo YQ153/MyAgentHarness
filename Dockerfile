@@ -39,9 +39,9 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app /app
 
 # WHY 先建目录并把属主交给卷：命名卷首次挂载会**继承镜像里该目录的属主**。
-# 不建的话它们属于 root，非 root 进程写 `.data`（SQLite）与 `workspace` 会当场失败。
-RUN mkdir -p /app/.data /app/workspace \
-    && chown -R app:app /app/.data /app/workspace
+# 不建的话它们属于 root，非 root 进程写 `.data`（SQLite、会话专属目录）会当场失败。
+RUN mkdir -p /app/.data \
+    && chown -R app:app /app/.data
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1

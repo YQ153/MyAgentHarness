@@ -5,12 +5,14 @@ WHY 需要它（探针实测，``scripts/probe_skills.py``）：``SkillsMiddlewa
 会**一个都加载不到，且没有任何告警**。所以「按启用状态决定加载哪些技能」不能靠来源列表
 过滤，只能派生出这样一份目录——库里是真相，视图是产物，技能包本体永远不动。
 
-WHY 视图用**固定路径**：图的装配会缓存，而缓存下来的图持有的是来源路径。若视图路径随
-每次重建而变化，缓存的图就会一直指向旧路径（表现为「改了启停却不生效」）。路径固定后，
-内容变化会在**新会话**读取技能时自然生效——技能索引本就每会话加载一次。
+WHY 视图用**固定位置**：图的装配会缓存，而缓存下来的图持有的是来源**虚拟路径**
+（``/.skills-active``，一个常量）。若视图换个地方重建，缓存的图就会一直指向旧位置
+（表现为「改了启停却不生效」）。位置固定后，内容变化会在**新会话**读取技能时自然生效
+——技能索引本就每会话加载一次。
 
-WHY 目录名以点开头：它是程序生成的产物、不是用户的资料，必须被工作区文件面板与知识库的
-目录遍历跳过；否则用户会看到一份自己没建过、改了也不生效的「技能副本」。
+WHY 本模块不知道视图放在哪：它只接收「那个目录」（``view_dir``），由 ``config`` 决定
+布局（当前是 ``<数据目录>/roots/<根标识>/skills-active``）。WHY 这么分：视图以前住在
+工作区里，于是「布局」这件事同时写在三个模块里，改一处必漏两处；现在布局只有一个出处。
 
 WHY 先建到临时目录再替换：重建中途失败若留下**半个视图**，后果是部分技能静默消失。
 先建全再换，失败时旧视图仍然完整。
@@ -28,9 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
-
-VIEW_DIR_NAME = ".skills-active"
-"""视图目录名（工作区内的一级目录）；建图时作为唯一来源。"""
 
 VIEW_TEMP_SUFFIX = ".building"
 """构建中的临时目录后缀；与视图目录同处一层，保证替换是同卷 rename。"""
@@ -69,14 +68,9 @@ class ViewResult:
     skipped: tuple[str, ...]
 
 
-def view_directory(workspace_root: Path) -> Path:
-    """返回视图目录的绝对路径（不保证存在）。"""
-    return Path(workspace_root) / VIEW_DIR_NAME
-
-
-def view_source_path() -> str:
-    """返回视图目录作为**后端虚拟路径**的写法（``sources`` 用的就是它）。"""
-    return "/" + VIEW_DIR_NAME
+def temp_directory(view_dir: Path) -> Path:
+    """返回构建中的临时视图目录（与视图同处一层，保证替换是同卷 ``rename``）。"""
+    return Path(view_dir).with_name(Path(view_dir).name + VIEW_TEMP_SUFFIX)
 
 
 def validate_entry_name(name: str) -> str:
@@ -109,14 +103,14 @@ def _copy_skill(source_dir: Path, target_dir: Path) -> None:
     shutil.copytree(source_dir, target_dir)
 
 
-def rebuild_view(workspace_root: Path, entries: Sequence[ViewEntry]) -> ViewResult:
+def rebuild_view(view_dir: Path, entries: Sequence[ViewEntry]) -> ViewResult:
     """按给定技能集重建视图，并返回本次变化。
 
     这是一个**全量替换**：视图最终等同于 ``entries`` 描述的那一份技能集。增量更新需要
     判断「哪些旧目录还在新集合里」，而那个判断一旦出错留下的就是永不消失的幽灵技能。
 
     Args:
-        workspace_root: 工作区根目录。
+        view_dir: 视图目录（由 ``config`` 决定它在哪，见模块 docstring）。
         entries: 应出现在视图里的技能。**名字必须唯一**——重名会让一个技能覆盖另一个，
             而覆盖是静默的。
 
@@ -128,9 +122,9 @@ def rebuild_view(workspace_root: Path, entries: Sequence[ViewEntry]) -> ViewResu
         OSError: 复制或替换失败（此时旧视图仍然完整，见模块 docstring）。
         RuntimeError: 替换阶段的不变量被破坏。
     """
-    root = Path(workspace_root)
-    view = view_directory(root)
-    temp = root / (VIEW_DIR_NAME + VIEW_TEMP_SUFFIX)
+    view = Path(view_dir)
+    temp = temp_directory(view)
+    temp.parent.mkdir(parents=True, exist_ok=True)
 
     seen: set[str] = set()
     for entry in entries:
@@ -194,37 +188,39 @@ def _existing_skill_names(view: Path) -> set[str]:
         return set()
 
 
-def discard_view(workspace_root: Path) -> None:
+def discard_view(view_dir: Path) -> None:
     """删除视图（含构建中的临时目录）；不存在时静默通过。"""
-    root = Path(workspace_root)
-    for target in (view_directory(root), root / (VIEW_DIR_NAME + VIEW_TEMP_SUFFIX)):
+    view = Path(view_dir)
+    for target in (view, temp_directory(view)):
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
 
 
 def sources_for_graph(
-    workspace_root: Path, configured_sources: Sequence[str]
+    view_dir: Path, configured_sources: Sequence[str], view_source: str
 ) -> tuple[list[str], str]:
     """决定建图时该用哪份技能来源。
 
     WHY 需要这个判定（fail-loud）：视图是派生产物，它可能因为程序升级、磁盘被清理、
     或重建失败而不存在。此时若把「视图不存在」当成「没有技能」，全部技能会**静默消失**
-    ——用户只会看到 Agent 突然不会那些套路了。因此这里退回**用户配置的真实目录**（等于
-    全部启用），并把原因回给调用方去告警。
+    ——用户只会看到 Agent 突然不会那些套路了。因此这里退回**用户配置的技能目录**（等于
+    全部启用），并把原因回给调用方去告警。退回的清单必须都能挂到虚拟路径上，否则那句
+    「等于全部启用」是假的（``read_only_mounts`` 为此把内置技能目录也挂上了）。
 
     Args:
-        workspace_root: 工作区根目录。
-        configured_sources: 用户配置的技能来源（虚拟路径）。
+        view_dir: 视图目录（宿主路径）。
+        configured_sources: 技能来源的虚拟路径（``SessionRoot.skill_source_paths()``）。
+        view_source: 视图的虚拟路径（``SessionRoot.skill_view_virtual``）。
 
     Returns:
         ``(建图应使用的来源列表, 需要告警的原因)``；原因为空串表示一切正常。
     """
     configured = [source for source in configured_sources if str(source).strip()]
-    if view_directory(workspace_root).is_dir():
-        return [view_source_path()], ""
+    if Path(view_dir).is_dir():
+        return [view_source], ""
     if not configured:
         return [], ""
     return configured, (
-        f"技能视图 {view_directory(workspace_root)} 不存在，已退回配置的技能目录"
+        f"技能视图 {view_dir} 不存在，已退回配置的技能目录"
         "（此时所有技能都处于启用状态）；请检查启停视图是否被清理或重建失败"
     )

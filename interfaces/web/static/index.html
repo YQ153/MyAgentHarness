@@ -41,6 +41,48 @@
           <span class="sidebar-title">会话</span>
           <button id="new-thread" type="button">新会话</button>
         </div>
+        <!--
+          工作空间选择器：只在**新建会话**（草稿态）出现。会话一旦产生第一条交互，它的
+          文件根就永久锁定（换项目请新建会话）。
+
+          两种结果都允许，且必须让用户看得见自己选的是哪一种：
+          - 选了工作空间 → Agent 的文件、附件与索引都落在那个项目目录里；
+          - 不选 → 应用为这条会话在 SESSIONS_ROOT 下建一个专属目录，只有它自己用。
+
+          任意目录都可选（产品规则），因此这里没有「可选清单」：要么用系统弹窗挑，
+          要么在网页里逐级浏览/直接粘贴路径。
+        -->
+        <div id="workspace-picker" class="workspace-picker" hidden>
+          <span class="workspace-picker-label">本次会话工作空间</span>
+          <span id="workspace-choice" class="workspace-choice"></span>
+          <div class="workspace-choice-actions">
+            <!--
+              系统文件夹选择弹窗：窗口出现在**运行服务端的那台机器**上（浏览器拿不到宿主的
+              绝对路径，只能由服务端进程自己弹）。容器 / 无桌面部署会返回 501，那时用
+              「浏览…」在网页里逐级挑。
+            -->
+            <button
+              id="workspace-pick"
+              type="button"
+              class="workspace-browse-btn"
+              title="打开系统文件夹选择对话框；窗口出现在运行服务端的那台机器上"
+            >选择文件夹…</button>
+            <button
+              id="workspace-browse"
+              type="button"
+              class="workspace-browse-btn"
+              title="在网页里逐级挑选或粘贴路径（服务端没有桌面时用这个）"
+            >浏览…</button>
+            <button
+              id="workspace-clear"
+              type="button"
+              class="workspace-browse-btn"
+              title="不绑定工作空间：这条会话使用应用为它创建的专属目录"
+            >不绑定</button>
+          </div>
+        </div>
+        <!-- 系统弹窗的进行中提示与失败原因（例如「这个部署没有图形环境」） -->
+        <p id="workspace-pick-status" class="workspace-picker-hint" hidden></p>
         <div class="thread-toolbar">
           <input
             id="thread-search"
@@ -151,6 +193,44 @@
     </div>
   </div>
 
+  <!--
+    工作区浏览：数据来自 GET /api/workspaces/browse（只列目录、每次一层）。
+    只在**新建会话**时用到——会话一旦发出首条消息，工作区就绑定且不可变更。
+  -->
+  <div id="workspace-browse-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>选择工作区</h3>
+        <button id="workspace-browse-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="workspace-hint">
+        任意目录都可以选。选中的目录会成为这条会话的文件根——此后不再改变，换项目请新建会话。
+        也可以直接粘贴路径，或什么都不选（那条会话将使用应用为它创建的专属目录）。
+      </p>
+      <!-- 直接粘贴路径：逐级点进去在一个深目录上很啰嗦，而路径本来就常在手边 -->
+      <div class="workspace-browse-bar">
+        <input
+          id="workspace-browse-input"
+          type="text"
+          class="workspace-browse-input"
+          placeholder="也可以直接粘贴路径，回车前往"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="workspace-browse-go" type="button">前往</button>
+      </div>
+      <div class="workspace-browse-bar">
+        <button id="workspace-browse-up" type="button">↑ 上一级</button>
+        <code id="workspace-browse-path"></code>
+      </div>
+      <div id="workspace-browse-list" class="workspace-browse-list"></div>
+      <div class="workspace-browse-actions">
+        <button id="workspace-browse-use" type="button">使用此目录</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 工作区文件面板：数据来自 GET /api/workspace/files 与 /file，只读 -->
   <div id="workspace-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
@@ -159,6 +239,12 @@
         <h3>工作区</h3>
         <button id="workspace-close" type="button" class="icon-btn">&times;</button>
       </div>
+      <!--
+        工作区路径由 GET /api/workspace/info 填充（按当前会话解析，草稿态按当前选择）。
+        工作区是会话级取值，每条会话可能不同——不显示它，用户在下面这棵树里看到的就只是
+        「一堆文件名」，无法确认那是哪个项目。
+      -->
+      <p id="workspace-path" class="workspace-path"></p>
       <p class="workspace-hint">
         Agent 的文件读写、命令产物都落在这个目录里。面板<b>只读</b>——要改动请通过对话让 Agent 做，
         这样才会经过权限与审批链。
@@ -273,6 +359,9 @@
   <script src="/auth_credential.js"></script>
   <!-- 必须在 app.js 之前：助手消息的渲染依赖它的全局 Markdown -->
   <script src="/markdown.js"></script>
+  <!-- 必须在 app.js 之前：工作区面板的状态由它的全局 WorkspaceScope 构造（错序时
+       会话切换不会清掉上一条会话的目录缓存，且不报错） -->
+  <script src="/workspace_scope.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

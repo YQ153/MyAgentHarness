@@ -7,6 +7,11 @@ WHY 单独成模块：接口层需要按异常类型映射 HTTP 状态码。异�
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 class ThreadBusyError(RuntimeError):
     """目标会话已有运行中的轮次，本次请求被拒绝。
@@ -130,6 +135,79 @@ class UnsupportedDocumentError(ValueError):
     def __init__(self, path: str, reason: str) -> None:
         super().__init__(f"{path} 无法作为文本文档索引：{reason}")
         self.path = path
+        self.reason = reason
+
+
+class SessionRootLockedError(RuntimeError):
+    """会话的文件根已经锁定，本次请求给出的工作空间与它不一致。
+
+    WHY 必须拒绝而不是「以请求为准」：根一旦锁定，这条会话的文件、技能视图、附件目录与
+    索引都锚在它上面；中途换根等于把半条会话留在旧目录、半条写到新目录，而两侧都不会
+    报错。要换工作空间就新建会话——那是唯一能把「什么时候换的根」讲清楚的形态。
+
+    WHY 锁定时刻是「产生第一条交互」而不是「创建会话」：创建会话时用户还在选，允许他
+    改主意；而一旦 Agent 已经在那个根里读过或写过文件，再换就会让此前的产物失联。
+
+    WHY 不继承 ``ValueError``：这不是「输入格式不对」，而是「操作与既有状态冲突」——
+    路由按 409 映射（与 ``ThreadBusyError`` 同码）：重试本请求无用，客户端应改参数或
+    新建会话。
+
+    对应 HTTP 409 Conflict。
+    """
+
+    def __init__(self, thread_id: str, current: str, requested: str) -> None:
+        super().__init__(
+            f"会话 {thread_id} 的文件根已锁定为 {current}，本次请求给的却是 {requested}；"
+            "它不支持中途更换，请新建一个会话"
+        )
+        self.thread_id = thread_id
+        self.current = current
+        self.requested = requested
+
+
+class SessionRootNotReadyError(RuntimeError):
+    """这次请求给不出文件根：**既没有会话 ID，也没有工作空间**。
+
+    WHY 会出现：草稿态（连会话 ID 都还没申请）下的面板请求就是这样——没有 ID 就没有可
+    派生的专属目录，没有工作空间就没有用户指定的根。
+
+    WHY 「未绑定工作空间的**新**会话」**不在**这一种：它的 ID 在首次发送前已经发出，专属
+    目录由该 ID 派生得出（见 ``SessionRegistry.resolve``），所以为它报这个错等于把「不选
+    工作空间」这条**正常路径**变成「发不出第一条消息」——而提示里的下一步（「请先发出
+    第一条消息」）照着做也出不去。这条错误因此只覆盖「连 ID 都没有」的情形。
+
+    WHY 不偷偷退到某个默认目录：那会让用户在「以为在看自己的项目」的面板里看到应用自己的
+    目录，而两者都不会报错。如实说「还没有根、先选工作空间或先发第一条消息」，用户下一步
+    该做什么是明确的。
+
+    对应 HTTP 409 Conflict（状态尚未就绪，稍后或换个操作即可）。
+    """
+
+
+class SessionRootUnavailableError(RuntimeError):
+    """这条会话的文件根**已经确定**，但它当前不可用（用户选定的目录不见了）。
+
+    WHY 与 ``SessionRootNotReadyError`` 分开：两者的下一步动作完全不同——「还没确定」等
+    第一条消息就有了；「已确定但目录没了」只能把目录恢复回来（或删掉这条会话），等多久都
+    不会自己好。混成一句话会让用户去等一件永远不会发生的事。
+
+    WHY 不替用户把这个目录重建出来：那是他**选定**的项目目录，重建只会得到一个同名的空
+    目录——Agent 会在里面「找不到文件」并写下新文件，而用户看到的现象是「我的项目被清空
+    了」。应用自己建的专属目录是另一回事（那是我们的目录，按需创建由
+    ``SessionRegistry.resolve`` 负责），所以这条异常只覆盖用户目录的情形。
+
+    WHY 不能是 500：调用方（用户）没有任何办法通过重试或改参数让它通过吗？不是——把目录
+    恢复回来就可以。所以这是个「当前状态不允许」的 409，而不是服务端故障。
+
+    对应 HTTP 409 Conflict。
+    """
+
+    def __init__(self, path: str | Path, reason: str = "目录不存在或不是目录") -> None:
+        super().__init__(
+            f"这条会话的文件根当前不可用：{path}（{reason}）。"
+            "它由你选定，应用不会替它重建；请恢复该目录后重试，或删除这条会话"
+        )
+        self.path = str(path)
         self.reason = reason
 
 

@@ -25,7 +25,7 @@ from langgraph.store.base import BaseStore
 from agent.backends import build_backend
 from agent.run_context import AgentRunContext, memory_namespace
 from runtime.store import open_store
-from tests.conftest import make_config
+from tests.conftest import make_config, make_root
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -93,7 +93,7 @@ async def _run_agent(
     """装配并运行一次图，返回全部流分片。"""
     agent = create_deep_agent(
         model=ScriptedChatModel(replies=replies),
-        backend=build_backend(config, store),
+        backend=build_backend(config, store, scope=make_root(config)),
         store=store,
         context_schema=AgentRunContext,
         name="memory-e2e",

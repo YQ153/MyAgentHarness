@@ -246,7 +246,7 @@ def test_skills_from_multiple_sources_are_all_listed(tmp_path: Path) -> None:
 def test_unknown_source_directory_yields_no_skills(tmp_path: Path) -> None:
     """来源目录不存在时返回空结果而不是抛异常。
 
-    WHY：技能库是可选能力，目录缺失只应降级——与 ``config.existing_skill_dirs``
+    WHY：技能库是可选能力，目录缺失只应降级——与 ``SessionRoot.skill_sources``
     的既有口径一致。
     """
     inventory = inspect_skills(tmp_path, ["/nope"])
@@ -306,9 +306,14 @@ def test_shipped_builtin_skills_parse_without_problems() -> None:
     WHY 同时断言名字与 ``problems``：只断言「能加载」会漏掉命名不规范这类上游只给告警的
     情况；而内置技能是我们自己写的，没有任何理由不规范。
     """
-    workspace = _REPO_ROOT / "workspace"
-
-    inventory = inspect_skills(workspace, ["/skills-builtin"])
+    # WHY 用挂载而不是把来源放到工作区里：内置技能随应用交付（仓库根的
+    # ``skills-builtin/``），不在用户工作区之内——backend 的根是工作区，不挂一个虚拟
+    # 路径它一个都读不到。这条用例顺带钉住「挂载表确实能让区外目录被读到」。
+    inventory = inspect_skills(
+        _REPO_ROOT / "workspace",
+        ["/skills-builtin"],
+        mounts={"/skills-builtin/": _REPO_ROOT / "skills-builtin"},
+    )
 
     assert inventory.names == ["code-review", "doc-to-markdown", "project-scaffold"]
     assert inventory.unloadable == ()
@@ -322,9 +327,12 @@ def test_builtin_skills_have_unique_names_against_user_directory() -> None:
     WHY：这条钉住的是「内置技能可以被用户按名覆盖」这个设计承诺。若哪天把两个目录的
     顺序调反，内置的那份会永远赢，而用户「改了却不生效」不会有任何报错。
     """
-    workspace = _REPO_ROOT / "workspace"
-    # 顺序即优先级：内置在前（低），用户在后（高）
-    inventory = inspect_skills(workspace, ["/skills-builtin", "/skills"])
+    # 顺序即优先级：内置在前（低），用户在后（高）。内置来源在工作区之外，故挂载。
+    inventory = inspect_skills(
+        _REPO_ROOT / "workspace",
+        ["/skills-builtin", "/skills"],
+        mounts={"/skills-builtin/": _REPO_ROOT / "skills-builtin"},
+    )
 
     sources = {package.name: package.source for package in inventory.packages}
     # 用户目录当前没有同名技能，故内置技能仍来自内置目录——这条断言保证顺序写对了

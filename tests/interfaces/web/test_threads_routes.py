@@ -18,10 +18,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from application.errors import SessionRootNotReadyError, SessionRootUnavailableError
 from application.thread_service import ThreadService
 from interfaces.web.routes import router
 from tests.application.test_audit_enrichment import FakeCheckpointer, FakeGraphFactory
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 def _record(thread_id: str, title: str, *, archived: bool = False, owner_id: str = "") -> dict[str, Any]:
@@ -96,8 +97,16 @@ class FailingRenameStore(StubThreadStore):
         raise aiosqlite.OperationalError("database disk image is malformed")
 
 
-def _build_client(tmp_path, store: StubThreadStore | None) -> TestClient:
-    """构造只挂载业务路由的测试客户端。"""
+def _build_client(
+    tmp_path, store: StubThreadStore | None, *, workspaces: Any = None
+) -> TestClient:
+    """构造只挂载业务路由的测试客户端。
+
+    Args:
+        tmp_path: 临时目录（配置的数据目录）。
+        store: 会话存储替身；``None`` 表示让 ``app.state.threads`` 缺失（验 503）。
+        workspaces: 会话根注册表替身；``None`` 表示用标准的那个。
+    """
     app = FastAPI()
     config = make_config(tmp_path)
     app.state.config = config
@@ -109,6 +118,7 @@ def _build_client(tmp_path, store: StubThreadStore | None) -> TestClient:
             checkpointer=FakeCheckpointer(),
             thread_store=store,
             graph_factory=FakeGraphFactory(),
+            workspaces=workspaces if workspaces is not None else StubSessionRegistry(config),
         )
     )
     app.include_router(router)
@@ -311,3 +321,46 @@ def test_patch_storage_failure_returns_500(tmp_path):
 
     assert response.status_code == 500
     assert "重命名会话失败" in response.json()["detail"]
+
+
+# ------------------------------------------------------------------ 会话根
+
+
+class _BrokenRootRegistry(StubSessionRegistry):
+    """解析必定失败的注册表替身：按 ``error`` 抛指定的那一种。"""
+
+    def __init__(self, config: Any, error: Exception) -> None:
+        super().__init__(config)
+        self._error = error
+
+    async def resolve(self, **kwargs: Any) -> Any:
+        del kwargs
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # 根还没确定：这条会话尚未发出第一条消息（且没选工作空间）。
+        SessionRootNotReadyError("这条会话还没有专属目录：请先选择工作空间，或先发出第一条消息"),
+        # 根已确定但目录不见了：用户选定的项目目录被删掉/移动了。
+        SessionRootUnavailableError("/gone/project"),
+    ],
+    ids=["not-ready", "unavailable"],
+)
+def test_history_maps_root_failures_to_409(tmp_path, error):
+    """读历史时根不可用必须是 409（带可照做的文案），而不是 500。
+
+    WHY 单列（回归）：这两个失败以前都会掉进 ``except RuntimeError`` 那条兜底分支——
+    ``SessionRootUnavailableError`` 甚至是更糟的一种（``NotADirectoryError`` 是
+    ``OSError`` 而**不是** ``RuntimeError``，连兜底都接不住，直接冒到 ASGI 层）。用户点开
+    侧栏里自己的会话，看到的是一个与他操作毫无关系的 500，而他该做的是「先发一条消息」
+    或「把那个目录恢复回来」。
+    """
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store, workspaces=_BrokenRootRegistry(make_config(tmp_path), error))
+
+    response = client.get("/api/threads/t1")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == str(error)
