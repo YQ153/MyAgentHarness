@@ -36,19 +36,17 @@ def make_config(tmp_path: Path, **overrides: Any) -> AppConfig:
 
     WHY ``_env_file`` 指向不存在的文件而不是 ``None``：pydantic-settings
     中 ``None`` 的语义是「不覆盖 model_config 里的 env_file」，.env 仍会被
-    加载——本机 ``AUTH_MODE=apikey`` 会静默改变测试的权限语义。
+    加载——本机 ``.env`` 的取值会静默改变测试的装配结果。
 
     Args:
         tmp_path: pytest 提供的临时目录。
-        **overrides: 需要覆盖的字段（如 ``auth_mode``、``sessions_root``）。
+        **overrides: 需要覆盖的字段（如 ``execution_mode``、``sessions_root``）。
 
     Returns:
-        路径全部指向 ``tmp_path``、认证默认关闭的 ``AppConfig``。
+        路径全部指向 ``tmp_path`` 的 ``AppConfig``。
     """
     params: dict[str, Any] = {
         "_env_file": tmp_path / "does-not-exist.env",
-        # 显式默认值抵御真实环境变量的泄漏（如 shell 里导出过 AUTH_MODE）
-        "auth_mode": "disabled",
         "db_path": tmp_path / "agent.db",
         # WHY 不显式给 sessions_root：它默认派生自 ``db_path`` 的父目录，于是测试里
         # 每个用例的会话专属目录都落在自己的 ``tmp_path`` 下，天然隔离。
@@ -94,7 +92,7 @@ def make_workspace_root(config: AppConfig, path: Path) -> SessionRoot:
 
 @pytest.fixture
 def test_config(tmp_path: Path) -> AppConfig:
-    """默认档位的隔离配置（disabled 认证、disabled 执行）。"""
+    """默认档位的隔离配置（执行档位为 disabled）。"""
     return make_config(tmp_path)
 
 

@@ -72,35 +72,12 @@ class NotFoundError(RuntimeError):
         self.identifier = identifier
 
 
-class OwnershipError(RuntimeError):
-    """目标资源存在但当前主体无权访问。
-
-    对应 HTTP 403 Forbidden。
-    """
-
-    def __init__(self, resource: str, identifier: str) -> None:
-        super().__init__(f"无权访问 {resource}：{identifier}")
-        self.resource = resource
-        self.identifier = identifier
-
-
-class PermissionDeniedError(RuntimeError):
-    """当前主体缺少某项权限。
-
-    对应 HTTP 403 Forbidden。
-    """
-
-    def __init__(self, permission: str) -> None:
-        super().__init__(f"缺少权限：{permission}")
-        self.permission = permission
-
-
 class VisionUnsupportedError(ValueError):
     """当前模型不接受图片输入，带附件的请求被拒绝。
 
     WHY 必须显式拒绝而不是把图片丢掉继续跑：静默丢弃会让用户以为「模型看到了图」，
     从而按「它看过这张图」去解读回答——错误结论比一次明确的失败危险得多。这条与
-    计划里「不静默退化」的要求一一对应。
+    本层「不静默退化」的取舍一一对应。
 
     继承 ``ValueError`` 是因为它本质上是「这次请求的输入不被接受」；路由会先按本
     类型映射，以便给出可操作的提示（换哪个模型）。

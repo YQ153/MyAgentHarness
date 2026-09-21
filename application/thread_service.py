@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from application.attachment_service import attachment_info
-from application.audit_context import audit_client_info, audit_trace_id
+from application.audit_context import LOCAL_ACTOR_ID, audit_client_info, audit_trace_id
 from application.dto import (
     EXPORT_VERSION,
     AttachmentInfo,
@@ -36,10 +36,8 @@ from application.dto import (
     ThreadListResult,
     ThreadSummary,
 )
-from application.errors import NotFoundError, OwnershipError
-from application.ownership import effective_owner_id, ensure_thread_access
+from application.errors import NotFoundError
 from application.ports import AuditLog, ThreadMetadataStore
-from application.principal import Principal
 from application.runnable import build_runnable_config
 from runtime.attachments import (
     AttachmentRecord,
@@ -132,7 +130,7 @@ class ThreadService:
             graph_factory: 图工厂，用于读取会话历史。
             workspaces: 会话级工作区的解析入口；**必填**——附件索引与清理都要按
                 **该会话**的工作区来做，沿用进程默认值会去扫别人的目录。
-            audit_store: 审计日志存储，可选；认证关闭时可为 ``None``。
+            audit_store: 审计日志存储，可选；``None`` 时不记录审计。
 
         Raises:
             ValueError: 任一必需依赖为 ``None``。
@@ -157,40 +155,22 @@ class ThreadService:
         self._workspaces = workspaces
         self._audit_store = audit_store
 
-        logger.info(
-            "ThreadService 就绪：sessions_root=%s auth_mode=%s",
-            config.resolved_sessions_root,
-            config.auth_mode,
-        )
+        logger.info("ThreadService 就绪：sessions_root=%s", config.resolved_sessions_root)
 
-    def _effective_owner_id(self, principal: Principal | None) -> str | None:
-        """根据认证模式返回查询时使用的 owner_id。
+    async def _require_record(self, thread_id: str) -> dict[str, Any]:
+        """读取会话元数据；会话不存在时抛 ``NotFoundError``。
 
-        判定规则见 ``application.ownership.effective_owner_id``——此处只做
-        转发，保证本服务与运行服务、用量服务的口径完全一致。
-        """
-        return effective_owner_id(self._config, principal)
-
-    def _ensure_ownership(
-        self,
-        record: dict[str, Any] | None,
-        thread_id: str,
-        principal: Principal | None,
-        require_admin: bool = False,
-    ) -> None:
-        """校验主体是否拥有该会话的访问权。
+        WHY 统一收在这里：所有面向单条会话的读写都要先确认它存在，各方法各写一次
+        必然出现「有的操作报 404、有的静默返回空结果」的漂移——而后者会让调用方
+        把「会话不存在」当成「这条会话什么都没有」。
 
         Raises:
-            NotFoundError: 会话不存在。
-            OwnershipError: 会话存在但当前主体无权访问。
+            NotFoundError: 该会话在元数据表里不存在。
         """
-        ensure_thread_access(
-            record,
-            thread_id,
-            self._config,
-            principal,
-            require_admin=require_admin,
-        )
+        record = await self._thread_store.get(thread_id)
+        if record is None:
+            raise NotFoundError("会话", thread_id)
+        return record
 
     async def _audit(
         self,
@@ -239,8 +219,8 @@ class ThreadService:
         没有任何信息价值，却会永久占据会话清单。
 
         WHY 仍由服务端发号而不交给前端生成：会话 ID 是写入检查点的键，
-        而端点当前没有鉴权，客户端可自选 ID 意味着任何人都能覆盖他人会话。
-        ``uuid4`` 不可预测，这个属性必须保留。
+        由服务端统一生成才能保证格式与唯一性口径只有一处；``uuid4`` 不可预测，
+        客户端也无法据此猜测其它会话的 ID。
 
         Returns:
             新会话的 ID；此刻数据库中尚未产生任何记录。
@@ -249,7 +229,6 @@ class ThreadService:
 
     async def list_threads(
         self,
-        principal: Principal | None = None,
         *,
         limit: int = 50,
         offset: int = 0,
@@ -263,11 +242,10 @@ class ThreadService:
         一次 ``aget_state``，成本随会话数线性增长；而列表页只需要标题与时间。
 
         Args:
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
             limit: 返回条数，1..200。
             offset: 跳过的条数，用于分页。
             query: 标题关键字；``None`` 表示不过滤。搜索只覆盖标题——正文检索
-                需要反序列化检查点，属另一个量级的工作（见项目文档已知限制）。
+                需要反序列化检查点，属另一个量级的工作，本层不承担。
             include_archived: 是否连同已归档的会话一起返回。
 
         Returns:
@@ -280,12 +258,10 @@ class ThreadService:
         # WHY 在服务层也校验一次关键字：依赖「存储实现恰好会校验」是不可靠的——
         # 换一个存储实现，非法关键字就会从 400 变成 500 或静默全表匹配。
         normalized_query = normalize_search_query(query)
-        owner_id = self._effective_owner_id(principal)
         try:
             # WHY 两个查询传完全相同的过滤条件：总数与实际返回条数必须对得上，
             # 否则前端会显示「还有下一页」但翻过去是空的。
             items = await self._thread_store.list_threads(
-                owner_id=owner_id,
                 limit=limit,
                 offset=offset,
                 query=normalized_query,
@@ -293,7 +269,6 @@ class ThreadService:
                 include_archived=include_archived,
             )
             total = await self._thread_store.count(
-                owner_id=owner_id,
                 query=normalized_query,
                 tag=tag,
                 include_archived=include_archived,
@@ -314,7 +289,6 @@ class ThreadService:
     async def history(
         self,
         thread_id: str,
-        principal: Principal | None = None,
         *,
         branch_id: str | None = None,
     ) -> list[HistoryMessage]:
@@ -334,7 +308,6 @@ class ThreadService:
 
         Args:
             thread_id: 会话 ID。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
             branch_id: 要读取的分支；``None`` 表示当前分支。
 
         Returns:
@@ -343,12 +316,10 @@ class ThreadService:
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话元数据或指定分支不存在。
-            OwnershipError: 无权访问该会话。
             RuntimeError: 读取失败。
         """
         normalized = normalize_thread_id(thread_id)
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         # WHY 按会话的工作区取图与建附件索引：历史消息里的附件引用是「相对本会话工作区」
         # 的相对路径，拿另一个根去索引只会得到一份空映射——表现为「历史里的图全丢了」，
@@ -379,7 +350,6 @@ class ThreadService:
     async def list_branches(
         self,
         thread_id: str,
-        principal: Principal | None = None,
     ) -> BranchListResult:
         """列出会话的全部分支，并标出当前分支。
 
@@ -389,11 +359,9 @@ class ThreadService:
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话元数据不存在。
-            OwnershipError: 无权访问该会话。
         """
         normalized = normalize_thread_id(thread_id)
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         current = await self._thread_store.current_branch(normalized)
         rows = await self._thread_store.list_branches(normalized)
@@ -421,7 +389,6 @@ class ThreadService:
         self,
         thread_id: str,
         branch_id: str,
-        principal: Principal | None = None,
     ) -> BranchListResult:
         """把某条分支设为当前分支。
 
@@ -432,11 +399,9 @@ class ThreadService:
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话或指定分支不存在。
-            OwnershipError: 无权访问该会话。
         """
         normalized = normalize_thread_id(thread_id)
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         if branch_id != "":
             target = await self._thread_store.get_branch(normalized, branch_id)
@@ -447,7 +412,7 @@ class ThreadService:
         if current != branch_id:
             # WHY 不无条件冻结原分支：此刻会话头属于**最新**那条分支，未必是正要离开
             # 的这一条。只在它「从未被离开过」时补记一次——那种情况下会话头正是它自己
-            # 的头（详见 ``RunService._freeze_unrecorded`` 的归纳）。
+            # 的头（详见 ``RunBranchService._freeze_unrecorded`` 的归纳）。
             existing = await self._thread_store.get_branch(normalized, current)
             if not (existing or {}).get("head_checkpoint"):
                 head = await self._live_head(normalized)
@@ -456,10 +421,7 @@ class ThreadService:
             await self._thread_store.set_current_branch(normalized, branch_id)
             await self._audit(
                 event_type="thread_branch",
-                # WHY 与 RunService 同一口径：审计主体是「谁做的」，不是查询过滤值——
-                # effective_owner_id 在认证关闭时返回 None、未认证时返回占位常量，
-                # 拿它当主体会让审计里出现一个不是任何人的标识。
-                actor_id=principal.user_id if principal else "anonymous",
+                actor_id=LOCAL_ACTOR_ID,
                 target_id=normalized,
                 action="activate",
                 outcome="success",
@@ -469,7 +431,7 @@ class ThreadService:
                 "会话切换分支：thread=%s from=%s to=%s", normalized, current, branch_id
             )
 
-        return await self.list_branches(normalized, principal)
+        return await self.list_branches(normalized)
 
     async def _resolve_branch(self, thread_id: str, branch_id: str | None) -> str | None:
         """把分支标识解析成要读的检查点 id。
@@ -534,22 +496,15 @@ class ThreadService:
         self,
         thread_id: str,
         tags: list[str] | None,
-        principal: Principal | None = None,
     ) -> ThreadSummary:
         """整体替换会话标签。
-
-        WHY 用 ``thread:update`` 而不是新开权限：打标签与改名、归档同属「所有者
-        整理自己的清单」，风险量级一致；新开一个权限只会让只想授予整理能力的角色
-        拿不到标签功能。
 
         Raises:
             ValueError: ``thread_id`` 非法或标签不合法。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
         """
         normalized = normalize_thread_id(thread_id)
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         updated = await self._thread_store.set_tags(normalized, tags)
         if updated is None:
@@ -557,7 +512,7 @@ class ThreadService:
 
         await self._audit(
             event_type="thread_tags",
-            actor_id=principal.user_id if principal else "anonymous",
+            actor_id=LOCAL_ACTOR_ID,
             target_id=normalized,
             action="update",
             outcome="success",
@@ -566,30 +521,24 @@ class ThreadService:
         logger.info("会话标签已更新：thread=%s tags=%s", normalized, updated.get("tags"))
         return ThreadSummary(**updated)
 
-    # ------------------------------------------------------------ 导出与导入
+    # ------------------------------------------------------------------ 导出与导入
 
     async def export_thread(
         self,
         thread_id: str,
-        principal: Principal | None = None,
         *,
         branch_id: str | None = None,
     ) -> ThreadExport:
         """把一个会话导出成可移植快照。
 
-        WHY 导出也要走归属校验：导出文件里是完整对话正文，比列表页的标题敏感得多，
-        「只是读」不构成放宽的理由。
-
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话或指定分支不存在。
-            OwnershipError: 无权访问该会话。
         """
         normalized = normalize_thread_id(thread_id)
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
-        messages = await self.history(normalized, principal, branch_id=branch_id)
+        messages = await self.history(normalized, branch_id=branch_id)
         current = await self._thread_store.current_branch(normalized)
 
         return ThreadExport(
@@ -621,7 +570,6 @@ class ThreadService:
     async def import_thread(
         self,
         payload: ThreadExport,
-        principal: Principal | None = None,
         *,
         title: str | None = None,
         workspace: str | None = None,
@@ -631,17 +579,9 @@ class ThreadService:
         WHY 永远新建、不提供覆盖：导出文件可能来自别人，覆盖语义意味着一个文件就能
         改写本机已有会话。新建让导入成为纯增量动作——失败也不会破坏任何现有数据。
 
-        WHY 归属记在导入者名下而不是照搬文件里的 owner：文件里的标识来自另一个库，
-        在本机没有意义；照搬会让「谁导入的」这件事消失，而导入者才是本机唯一能对它
-        负责的主体。
-
         Raises:
             ValueError: 导入内容为空、版本不支持。
             RuntimeError: 写入检查点失败。
-
-        WHY 本方法不做权限校验：``ThreadService`` 的权限一律由接口层的
-        ``require_permission`` 在进入前判定，服务层只负责归属（``_ensure_ownership``）。
-        在这里另写一次会引入一处「服务自认为检查过、实际用的是另一套口径」的假守卫。
         """
         if payload is None:
             raise ValueError("导入内容不能为空")
@@ -685,7 +625,6 @@ class ThreadService:
             new_id,
             title_hint=resolved_title,
             turn_delta=sum(1 for message in messages if isinstance(message, HumanMessage)),
-            owner_id=self._effective_owner_id(principal) or "",
             workspace=str(scope.root),
             workspace_bound=bool(workspace and str(workspace).strip()),
         )
@@ -693,7 +632,7 @@ class ThreadService:
             await self._thread_store.set_tags(new_id, payload.tags)
         await self._audit(
             event_type="thread_import",
-            actor_id=principal.user_id if principal else "anonymous",
+            actor_id=LOCAL_ACTOR_ID,
             target_id=new_id,
             action="import",
             outcome="success",
@@ -716,7 +655,6 @@ class ThreadService:
     async def delete_thread(
         self,
         thread_id: str,
-        principal: Principal | None = None,
     ) -> DeleteResult:
         """删除会话：检查点与元数据一并清理。
 
@@ -729,7 +667,6 @@ class ThreadService:
 
         Args:
             thread_id: 会话 ID。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             删除结果，含结果分类、检查点是否清理与失败摘要。
@@ -737,13 +674,10 @@ class ThreadService:
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权删除该会话。
         """
         normalized = normalize_thread_id(thread_id)
 
-        # WHY 先查再删：避免在无权访问时通过「删除不存在」的响应泄露会话存在性。
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         # WHY 在删元数据之前解析工作区：附件目录要按本会话绑定的根去找，而元数据
         # 一旦删掉，那个绑定就没了——之后再解析只能回落到默认工作区，于是「删了会话
@@ -752,7 +686,7 @@ class ThreadService:
             await self._workspaces.resolve(thread_id=normalized, record=record)
         ).root
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         meta_error = ""
         try:
             meta_deleted = await self._thread_store.delete(normalized)
@@ -865,7 +799,6 @@ class ThreadService:
         self,
         thread_id: str,
         title: str,
-        principal: Principal | None = None,
     ) -> ThreadSummary:
         """重命名会话。
 
@@ -875,7 +808,6 @@ class ThreadService:
         Args:
             thread_id: 会话 ID。
             title: 新标题；内部空白会被折叠为单个空格。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             更新后的会话摘要。
@@ -883,15 +815,12 @@ class ThreadService:
         Raises:
             ValueError: 标题非字符串、为空或超出 ``thread_rename_max_chars``。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权修改该会话。
             RuntimeError: 写入失败。
         """
         normalized = normalize_thread_id(thread_id)
         normalized_title = self._normalize_rename_title(title)
 
-        # WHY 先查再改：与删除同源——无权访问时不能通过响应差异泄露会话是否存在。
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         try:
             updated = await self._thread_store.rename(normalized, normalized_title)
@@ -906,7 +835,7 @@ class ThreadService:
             # 校验通过后被并发删除：按「不存在」处理，而不是返回一份空摘要
             raise NotFoundError("会话", normalized)
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         await self._audit(
             event_type="thread_rename",
             actor_id=actor_id,
@@ -922,7 +851,6 @@ class ThreadService:
         self,
         thread_id: str,
         archived: bool,
-        principal: Principal | None = None,
     ) -> ThreadSummary:
         """归档或恢复会话（软删除）。
 
@@ -933,7 +861,6 @@ class ThreadService:
         Args:
             thread_id: 会话 ID。
             archived: ``True`` 归档，``False`` 恢复。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             更新后的会话摘要。
@@ -941,15 +868,13 @@ class ThreadService:
         Raises:
             ValueError: ``thread_id`` 非法或 ``archived`` 不是布尔值。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权修改该会话。
             RuntimeError: 写入失败。
         """
         normalized = normalize_thread_id(thread_id)
         if not isinstance(archived, bool):
             raise ValueError(f"archived 必须是布尔值，实际：{type(archived).__name__}")
 
-        record = await self._thread_store.get(normalized)
-        self._ensure_ownership(record, normalized, principal)
+        record = await self._require_record(normalized)
 
         try:
             updated = await self._thread_store.set_archived(normalized, archived)
@@ -962,7 +887,7 @@ class ThreadService:
         if updated is None:
             raise NotFoundError("会话", normalized)
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         await self._audit(
             event_type="thread_archive",
             actor_id=actor_id,
@@ -1047,6 +972,12 @@ _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[^;,]+)(?P<params>[^,]*);base64,(?P<payload>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+"""匹配图片块的 data URL，并拆出 MIME、参数与 base64 载荷。
+
+WHY 必须拆出载荷而不是只做前缀判断：附件是按内容摘要（sha256）匹配回来的，只有拿到
+base64 载荷并解码才能算出摘要、与附件目录对上号；只判断「它是不是 data URL」拿不到
+这个对应关系，历史里的图就会全部显示不出来。
+"""
 
 
 def _content_text(content: Any) -> str:

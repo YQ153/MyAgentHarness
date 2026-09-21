@@ -131,8 +131,8 @@ allow_indirect_imports = True
 ; Two guards cover that gap, in the same CI job:
 ;
 ;   tests/application/test_layer_purity_contract.py
-;       contract modules (dto / errors / events / ports / principal /
-;       audit_recorder / ownership) must not import service modules -- the
+;       contract modules (dto / errors / events / ports /
+;       audit_recorder) must not import service modules -- the
 ;       reverse direction would mean the contract layer absorbed business flow.
 ;
 ;   tests/application/test_runtime_port_contract.py

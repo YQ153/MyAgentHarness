@@ -1,6 +1,6 @@
 """应用层对外暴露的基础设施端口。
 
-WHY 需要端口：``interfaces`` 层需要操作审计日志、API Key 与 device flow 状态，
+WHY 需要端口：``interfaces`` 层需要操作审计日志与运行状态，
 但不应依赖 ``runtime`` 的具体实现类——那会让「更换存储实现」波及接口层，
 也破坏 ``interfaces → application`` 的单向依赖。
 
@@ -13,18 +13,18 @@ WHY 需要端口：``interfaces`` 层需要操作审计日志、API Key 与 devi
 第二类端口（2026-09-20 追加）服务的是**应用层自身**：``ThreadMetadata*`` /
 ``AuditLog`` / ``UsageLedger`` / ``KnowledgeIndex`` / ``SkillState``。
 理由与上面完全相同，只是此前只想到了接口层那一侧——应用层的服务同样直接
-依赖 ``runtime`` 的实现类，于是"更换存储实现"仍然会波及应用层自己。
+依赖 ``runtime`` 的实现类，于是「更换存储实现」仍然会波及应用层自己。
 
-WHY 只端口化"有状态、变更理由随存储技术走"的实现类：无状态的函数模块
+WHY 只端口化「有状态、变更理由随存储技术走」的实现类：无状态的函数模块
 （``workspace_files`` 的路径校验、``tool_outputs`` 的路径换算、``attachments``
-的读写函数）不在其列——它们没有"另一种实现"的诉求；而 ``workspace_files``
+的读写函数）不在其列——它们没有「另一种实现」的诉求；而 ``workspace_files``
 是路径校验这一安全边界的唯一实现，为它引入协议只会诱发第二份实现。
 数据载体（``ChunkInput`` / ``KnowledgeHit``）同理保留直接依赖：它们的形状由
 两侧共同理解，与存储技术无关。
 
 > 单元测试可用任意替身满足这些协议（结构化子类型，无需继承）；
-> ``tests/application/test_runtime_port_contract.py`` 守住"哪些直接依赖是
-> 有意保留的"。
+> ``tests/application/test_runtime_port_contract.py`` 守住「哪些直接依赖是
+> 有意保留的」。
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from typing import Any, Protocol
 
 # 数据载体：端口签名里必须出现它们（KnowledgeStore 的产出与入参），
 # 而它们由 runtime 定义——契约 3 禁止 runtime 反向依赖 application，
-# 因此这两者只能来自 runtime。它们不是"可替换的实现"，见模块 docstring。
+# 因此这两者只能来自 runtime。它们不是「可替换的实现」，见模块 docstring。
 from runtime.knowledge_store import ChunkInput, KnowledgeHit
 
 
@@ -68,53 +68,14 @@ class AuditSink(Protocol):
         ...
 
 
-class APIKeyRepository(Protocol):
-    """API Key 的创建、校验、列举与吊销能力。"""
-
-    async def create(
-        self,
-        *,
-        role: str = "member",
-        scopes: list[str] | None = None,
-        description: str = "",
-        expires_at: str | None = None,
-    ) -> dict[str, Any]:
-        """创建一条 API Key。
-
-        Returns:
-            含 ``key_id`` 与一次性明文 ``key`` 的字典。
-        """
-        ...
-
-    async def validate(self, key: str) -> dict[str, Any] | None:
-        """校验 API Key；有效时返回记录，否则返回 ``None``。"""
-        ...
-
-    async def list(self, *, include_revoked: bool = False) -> list[dict[str, Any]]:
-        """列出 API Key。"""
-        ...
-
-    async def revoke(self, key_id: str) -> bool:
-        """吊销指定 API Key，返回是否实际发生变更。"""
-        ...
-
-
-class RateLimiterPort(Protocol):
-    """按 key 的请求限流能力。"""
-
-    def is_allowed(self, key: str) -> bool:
-        """判断某 key 在当前窗口内是否仍可发起请求。"""
-        ...
-
-
-# --------------------------------------------------------------------- 会话元数据
+# ---------------------------------------------------------------------- 会话元数据
 #
 # 拆成读 / 写 / 分支三个窄协议，而不是照抄 ThreadMetaStore：
 # 对象只用到其中一部分能力时，注解应当如实反映这一点——AttachmentService 与
 # HealthService 只读会话元数据，让它们被迫接受写入能力就是在放宽依赖。
 #
 # 方法签名逐条照抄 ``runtime/thread_store.py`` 的实现（不臆造）。这是有意为之：
-# 协议与实现的签名一旦分叉，类型检查器会指向一个"合法的"错误位置，
+# 协议与实现的签名一旦分叉，类型检查器会指向一个「合法的」错误位置，
 # 而真正的修法在实现里。
 
 
@@ -239,12 +200,12 @@ class ThreadMetadataStore(
 
     WHY 组合而不是让服务标注三个协议：构造参数只能有一个类型注解，
     而 ``ThreadService`` / ``RunService`` 确实同时用到三类能力。
-    组合协议让它们保持"会话元数据存储"这一个概念，
+    组合协议让它们保持「会话元数据存储」这一个概念，
     同时不影响只用其中一部分的服务标注更窄的协议。
     """
 
 
-# ----------------------------------------------------------------------- 审计
+# ---------------------------------------------------------------------- 审计
 
 
 class AuditLog(Protocol):
@@ -275,7 +236,7 @@ class AuditLog(Protocol):
         ...
 
 
-# ----------------------------------------------------------------------- 用量
+# ---------------------------------------------------------------------- 用量
 
 
 class UsageLedger(Protocol):
@@ -308,7 +269,7 @@ class UsageLedger(Protocol):
         ...
 
 
-# --------------------------------------------------------------------- 知识库
+# ---------------------------------------------------------------------- 知识库
 
 
 class KnowledgeIndex(Protocol):
@@ -368,7 +329,7 @@ class KnowledgeIndex(Protocol):
         ...
 
 
-# ----------------------------------------------------------------------- 技能
+# ---------------------------------------------------------------------- 技能
 
 
 class SkillState(Protocol):
@@ -388,11 +349,9 @@ class SkillState(Protocol):
 
 
 __all__ = [
-    "APIKeyRepository",
     "AuditLog",
     "AuditSink",
     "KnowledgeIndex",
-    "RateLimiterPort",
     "SkillState",
     "ThreadBranchStore",
     "ThreadMetadataReader",

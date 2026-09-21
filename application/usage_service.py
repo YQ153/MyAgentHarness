@@ -14,13 +14,11 @@ import logging
 from typing import TYPE_CHECKING
 
 from application.dto import UsageGroup, UsageSummary
-from application.errors import NotFoundError, OwnershipError
-from application.ownership import effective_owner_id, ensure_thread_access
+from application.errors import NotFoundError
 from runtime.usage_store import window_start
 
 if TYPE_CHECKING:
     from application.ports import ThreadMetadataReader, UsageLedger
-    from application.principal import Principal
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -68,7 +66,6 @@ class UsageService:
 
     async def summarize(
         self,
-        principal: Principal | None = None,
         *,
         thread_id: str | None = None,
         days: int | None = None,
@@ -77,7 +74,6 @@ class UsageService:
         """汇总指定范围内的用量。
 
         Args:
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
             thread_id: 只统计该会话；``None`` 表示不限会话。
             days: 统计窗口天数；``None`` 表示取配置默认值。
             group_by: 聚合维度，``model`` / ``thread`` / ``day``。
@@ -88,7 +84,6 @@ class UsageService:
         Raises:
             ValueError: ``days`` 或 ``group_by`` 非法（调用方应映射为 400）。
             NotFoundError: ``thread_id`` 指向的会话不存在。
-            OwnershipError: 无权查看该会话的用量。
             RuntimeError: 查询失败（调用方应映射为 500）。
         """
         window_days = self._resolve_days(days)
@@ -97,22 +92,21 @@ class UsageService:
 
         normalized_thread: str | None = None
         if thread_id is not None:
-            normalized_thread = await self._ensure_thread_access(thread_id, principal)
+            normalized_thread = await self._normalize_thread(thread_id)
 
-        owner_id = self._owner_filter(principal)
         since = window_start(window_days)
 
         try:
             result = await self._usage_store.summarize(
-                owner_id=owner_id,
+                owner_id=None,
                 thread_id=normalized_thread,
                 since=since,
                 group_by=group_by,
             )
-        except (ValueError, NotFoundError, OwnershipError):
-            # WHY 让参数错误与归属错误原样透出：路由层靠类型把它们分别映射为
-            # 400 / 404 / 403。若在这里包成 RuntimeError，前端就会把「会话不
-            # 存在」或「无权查看」当成一次服务故障。
+        except (ValueError, NotFoundError):
+            # WHY 让参数错误与会话不存在原样透出：路由层靠类型把它们分别映射为
+            # 400 / 404。若在这里包成 RuntimeError，前端就会把「会话不存在」
+            # 当成一次服务故障。
             raise
         except Exception as exc:
             logger.exception(
@@ -156,24 +150,12 @@ class UsageService:
             )
         return resolved
 
-    def _owner_filter(self, principal: Principal | None) -> str | None:
-        """返回按所有者过滤用的 ``owner_id``；管理员与认证关闭时不过滤。"""
-        if self._config.auth_mode == "disabled":
-            return None
-        if principal is not None and principal.is_admin():
-            return None
-        return effective_owner_id(self._config, principal)
-
-    async def _ensure_thread_access(
-        self,
-        thread_id: str,
-        principal: Principal | None,
-    ) -> str:
-        """校验主体能否查看该会话的用量，并返回规范化后的会话 ID。
+    async def _normalize_thread(self, thread_id: str) -> str:
+        """校验会话 ID 并确认该会话存在，返回规范化后的取值。
 
         WHY 必须回读会话元数据：用量表里既有 ``owner_id`` 也有 ``thread_id``，
-        只按 owner 过滤挡不住「猜别人 thread_id 直接查」；以会话的归属为准
-        才与会话读权限保持一致。
+        只按会话 ID 过滤会接受一个不存在的 ID 并返回空汇总——那与「这条会话确实
+        没有用量」在响应上完全一样，而前者其实是调用方写错了 ID。
         """
         if not isinstance(thread_id, str):
             raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
@@ -187,7 +169,8 @@ class UsageService:
             logger.exception("读取会话元数据失败：thread=%s", normalized)
             raise RuntimeError("读取会话元数据失败") from exc
 
-        ensure_thread_access(record, normalized, self._config, principal)
+        if record is None:
+            raise NotFoundError("会话", normalized)
         return normalized
 
     def __repr__(self) -> str:  # pragma: no cover - 仅用于日志排错

@@ -13,11 +13,8 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessageChunk
 
-from application.errors import (
-    NotFoundError,
-    OwnershipError,
-    PermissionDeniedError,
-)
+from application.audit_context import LOCAL_ACTOR_ID
+from application.errors import NotFoundError
 from application.events import AgentEventType
 from application.run_service import RunService
 from runtime import execution_registry as registry_module
@@ -26,7 +23,6 @@ from tests.application.test_run_service import (
     SlowGraph,
     _drain,
     _make_service,
-    _principal,
 )
 from tests.conftest import StubSessionRegistry, make_config
 
@@ -175,25 +171,18 @@ async def test_stop_is_idempotent_while_stopping(test_config, thread_store):
     assert service.is_running("t1") is False
 
 
-# ------------------------------------------------------------------ 权限与所有权
+# ------------------------------------------------------------------ 会话校验
 
 
-async def test_stop_requires_permission_and_ownership(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-    alice = _principal("alice")
-    await _drain(await service.stream("t1", "alice's run", principal=alice))
+async def test_stop_is_idempotent_for_idle_thread(test_config, thread_store):
+    """停止空闲会话是幂等成功；停止不存在的会话必须报「会话不存在」。"""
+    service = _make_service(test_config, thread_store)
+    await _drain(await service.stream("t1", "hello"))
 
-    # viewer 缺少 thread:create 权限
-    with pytest.raises(PermissionDeniedError):
-        await service.stop("t1", principal=_principal("v", role="viewer"))
+    assert (await service.stop("t1"))["stopped"] is False
 
-    # 其他成员无权停止他人的会话
-    with pytest.raises(OwnershipError):
-        await service.stop("t1", principal=_principal("bob"))
-
-    # 所有者本人停止空闲会话：幂等成功
-    assert (await service.stop("t1", principal=alice))["stopped"] is False
+    with pytest.raises(NotFoundError):
+        await service.stop("missing")
 
 
 # ------------------------------------------------------------------ 审计
@@ -217,7 +206,7 @@ async def test_stop_audits_run_cancelled(test_config, thread_store):
     assert run_cancelled[0]["action"] == "stop"
     assert run_cancelled[0]["outcome"] == "success"
     assert run_cancelled[0]["target_id"] == "t1"
-    assert run_cancelled[0]["actor_id"] == "anonymous"
+    assert run_cancelled[0]["actor_id"] == LOCAL_ACTOR_ID
 
     await _drain(generator)
 

@@ -67,9 +67,9 @@ class RunHandle:
     model_name: str | None = None
     """本轮使用的模型别名；``None`` 表示默认模型（落用量时按配置解析）。"""
     owner_id: str = ""
-    """会话所有者；用量记录按它聚合，认证关闭时为空串。"""
+    """会话所有者；本应用不区分用户，固定为空串。"""
     actor_id: str = ""
-    """发起本轮运行的主体标识；工具审计按它归因，认证关闭时为 ``anonymous``。"""
+    """发起本轮运行的主体标识；工具审计按它归因，固定为 ``LOCAL_ACTOR_ID``。"""
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
     """本轮发生的工具调用记录。
 
@@ -107,10 +107,9 @@ class RunHandle:
     def memory_owner(self) -> str:
         """本轮运行长期记忆的归属主体。
 
-        WHY 直接复用 ``owner_id``：记忆是「这个用户的偏好」，与会话归属同源，
-        另存一份必然出现两者漂移。认证关闭时 ``owner_id`` 为空串，这里统一
-        落到匿名标识——否则空串会被当成一个独立命名空间，让同一台机器上
-        「CLI 写的记忆 Web 读不到」。
+        WHY 直接复用 ``owner_id``：记忆与会话归属同源，另存一份必然出现两者漂移。
+        ``owner_id`` 为空串时统一落到匿名标识——否则空串会被当成一个独立命名空间，
+        让同一台机器上「CLI 写的记忆 Web 读不到」。
         """
         return self.owner_id or ANONYMOUS_USER_ID
 
@@ -204,9 +203,9 @@ class RunRegistry:
         self._rejected_runs = 0
         """进程启动以来因超出并发上限或被限流而拒绝的运行数。"""
 
-        # WHY 限流器由登记表自己持有而不是放进装配层：它的键是「发起本轮的主体」，
-        # 而主体（owner_id）是运行期才算出来的——放进装配层就要把同一份配置再读一遍，
-        # 两处配置迟早分叉，表现为「改了配置但限流阈值没变」。
+        # WHY 限流器由登记表自己持有而不是放进装配层：它需要与准入判定、运行登记
+        # 共享同一份状态；放进装配层就要把同一份配置再读一遍，两处配置迟早分叉，
+        # 表现为「改了配置但限流阈值没变」。
         self._run_limiter = RateLimiter(
             window_seconds=config.run_rate_limit_window_seconds,
             max_attempts=config.run_rate_limit_max_attempts,
@@ -233,23 +232,22 @@ class RunRegistry:
     def check_limits(self, owner_key: str) -> None:
         """在真正触碰会话之前判定并发与限流。
 
-        WHY 必须排在所有权校验之前：若排在之后，被限流的调用方可以从「404 还是
-        429」推断出某个会话在不在——限流不该成为一把探测他人会话的尺子。权限校验
-        仍在最前面，未授权的调用方连这一层都到不了。
+        WHY 必须排在读会话之前：若排在之后，被限流的调用方可以从「404 还是
+        429」推断出某个会话在不在——限流不该成为一把探测会话是否存在的尺子。
 
         WHY 并发数直接数运行登记表而不另设计数器：既有语义里「删除 / 归档会话不会
         中断正在进行的运行」，运行因此可能比会话本身活得更久；另立的计数迟早与登记表
         漂移，而漂移的方向恰恰是「指标说还有空位，实际已经排不动」。
 
         Args:
-            owner_key: 发起本轮的主体标识；空串表示认证关闭，落到匿名主体。
+            owner_key: 发起本轮的主体标识；空串落到匿名主体。
 
         Raises:
             RunRejectedError: 超出并发上限或被限流。
         """
         retry_after = self._config.run_rejected_retry_after_seconds
-        # WHY 认证关闭时落到匿名主体：单用户场景下所有请求本就属于同一个人，
-        # 按空串计数会让「限流」在该场景下等于关闭。
+        # WHY 空串落到匿名主体：所有请求本就属于同一个人，按空串计数会让「限流」
+        # 等于关闭。
         key = owner_key or ANONYMOUS_USER_ID
 
         if not self._run_limiter.is_allowed(key):
@@ -286,7 +284,7 @@ class RunRegistry:
         Args:
             thread_id: 已规范化的会话 ID。
             model_name: 本轮使用的模型别名；``None`` 表示默认模型。
-            owner_id: 会话所有者；认证关闭时为空串。
+            owner_id: 会话所有者；本应用不区分用户，固定为空串。
             actor_id: 发起本轮运行的主体标识，用于工具审计归因。
             fork_checkpoint: 分叉起点检查点 id；空串表示接着当前分支的头。
             workspace: 本轮运行的工作区绝对路径；空串表示未声明。

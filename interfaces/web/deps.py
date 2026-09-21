@@ -1,7 +1,10 @@
-"""Web 层共享的依赖项。
+"""Web 层共享的依赖项与请求元数据工具。
 
 WHY 从 ``routes`` 中分出来：业务路由与运维路由都需要「从应用状态取服务」，
 各自留一份私有实现会让两处的缺失判定（状态码与文案）逐渐漂移。
+
+请求元数据（``client_ip`` / ``user_agent``）也放在这里：它们被审计上下文中间件
+与审计写入路径共用，放在任一调用方里都会让另一侧去导入一个与它无关的模块。
 """
 
 from __future__ import annotations
@@ -30,6 +33,35 @@ _ROOT_CONFLICT_ERRORS = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def client_ip(request: Request) -> str:
+    """获取客户端 IP，优先读取反向代理透传头。
+
+    WHY 优先读 ``X-Forwarded-For``：应用部署在反向代理后方时，
+    ``request.client.host`` 只会是代理自身地址，无法用于审计定位。
+    注意该头可被客户端伪造，因此只用于「审计与排查」这类可容忍偏差的场景。
+
+    Args:
+        request: 当前请求。
+
+    Returns:
+        客户端 IP；无法确定时返回 ``"unknown"``。
+    """
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-Ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def user_agent(request: Request) -> str:
+    """提取 User-Agent，缺失时返回空串。"""
+    return request.headers.get("user-agent", "") or ""
 
 
 def require_state(request: Request, attr: str, label: str) -> Any:
@@ -151,8 +183,10 @@ async def describe_session_root(
 
 
 __all__ = [
+    "client_ip",
     "describe_session_root",
     "get_session_registry",
     "require_state",
     "resolve_scoped_services",
+    "user_agent",
 ]

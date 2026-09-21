@@ -75,7 +75,7 @@ class LangGraphEventTranslator:
         self._last_node: str | None = None
         self._usage = UsageAccumulator()
 
-    # ---------------------------------------------------------------- 输入
+    # ------------------------------------------------------------------ 输入
 
     @property
     def usage(self) -> TokenUsage:
@@ -144,7 +144,7 @@ class LangGraphEventTranslator:
         self._pending_tool_calls.clear()
         return events
 
-    # ---------------------------------------------------------------- 内部
+    # ------------------------------------------------------------------ 内部
 
     def _on_messages(self, chunk: Any) -> list[AgentEvent]:
         """处理 messages 流：文本增量、工具调用分片、工具结果。"""

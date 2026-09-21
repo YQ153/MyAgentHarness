@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 
+from application.audit_context import LOCAL_ACTOR_ID
 from application.errors import NotFoundError
-from application.principal import Principal
 from application.workspace_service import (
     KIND_BINARY,
     KIND_IMAGE,
@@ -72,7 +72,7 @@ def test_rejects_none_config():
 async def test_list_dir_reports_entries_and_skips_audit(tmp_path: Path):
     service, audit = _service(tmp_path)
 
-    listing = await service.list_dir("/", Principal(user_id="u1"))
+    listing = await service.list_dir("/")
 
     assert listing.path == "/"
     assert listing.parent is None
@@ -112,7 +112,7 @@ async def test_list_dir_rejects_escaping_path(tmp_path: Path):
 async def test_read_text_file(tmp_path: Path):
     service, audit = _service(tmp_path)
 
-    content = await service.read_file("/src/app.py", Principal(user_id="u1"))
+    content = await service.read_file("/src/app.py")
 
     assert content.kind == KIND_TEXT
     assert "print('hi')" in content.text
@@ -124,7 +124,7 @@ async def test_read_text_file(tmp_path: Path):
     # 「谁读了哪个文件」正是审计要回答的问题——读取必须留痕
     assert audit.target_ids() == ["/src/app.py"]
     assert audit.calls[0]["event_type"] == "file_read"
-    assert audit.calls[0]["actor_id"] == "u1"
+    assert audit.calls[0]["actor_id"] == LOCAL_ACTOR_ID
     # 正文绝不进审计：审计表不是内容仓库
     assert "print" not in str(audit.calls[0])
 
@@ -247,7 +247,7 @@ async def test_reads_a_file_that_lives_in_a_mount(tmp_path: Path):
     write_tool_output(target, "完整输出正文\n", max_chars=1000)
     service = WorkspaceService(config, scope=scope, audit_store=audit)
 
-    content = await service.read_file("/_tool_outputs/t1/0001-execute.txt", Principal(user_id="u1"))
+    content = await service.read_file("/_tool_outputs/t1/0001-execute.txt")
 
     assert content.kind == KIND_TEXT
     assert "完整输出正文" in (content.text or "")
@@ -261,7 +261,7 @@ async def test_list_dir_never_exposes_the_internal_stores(tmp_path: Path):
     """
     service, _ = _service(tmp_path)
 
-    listing = await service.list_dir("/", Principal(user_id="u1"))
+    listing = await service.list_dir("/")
 
     assert {item.name for item in listing.entries}.isdisjoint(
         {"skills", ".skills-active", "_tool_outputs"}

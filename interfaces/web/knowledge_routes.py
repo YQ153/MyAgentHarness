@@ -2,10 +2,8 @@
 
 约定：
 
-- **归属校验在服务层**（``application.ownership.effective_owner_id``）：路由只把失败
-  映射成状态码，不在这一层再判一次「谁的数据」。
-- **索引是写操作**，用 ``knowledge:write``；查看清单沿用 ``file:read``（与文件面板、
-  会话附件同一口径——知识库的来源就是工作区里的文件）。
+- **索引与检索都在服务层**（``KnowledgeService``）：路由只把失败映射成状态码，
+  不在这一层再实现一次切分、嵌入或去重口径。
 - **切分与嵌入都不在这里**：本模块只把参数交给 ``KnowledgeService``。索引是一项耗时
   操作（要调用嵌入），把它写在路由里会让「HTTP 层管了业务」这件事从第一天就成立。
 
@@ -22,8 +20,6 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 
 from application.knowledge_service import KnowledgeService
-from application.principal import Principal
-from interfaces.web.auth import require_permission
 from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import (
     KnowledgeDeleteResponse,
@@ -95,20 +91,15 @@ def _single_summary(result: dict[str, Any]) -> dict[str, Any]:
 @router.get("/api/knowledge", response_model=KnowledgeListResponse)
 async def list_knowledge(
     service: KnowledgeService = Depends(get_knowledge),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> KnowledgeListResponse:
-    """返回当前主体已索引的文档、索引规模与知识库能力。
-
-    只包含本主体的文档；认证关闭时全部归属同一个空 ``owner_id``。
-    """
-    return KnowledgeListResponse.model_validate(await service.list_documents(principal=principal))
+    """返回已索引的文档、索引规模与知识库能力。"""
+    return KnowledgeListResponse.model_validate(await service.list_documents())
 
 
 @router.post("/api/knowledge", response_model=KnowledgeIndexResponse)
 async def index_knowledge(
     payload: KnowledgeIndexRequest | None = Body(default=None),
     service: KnowledgeService = Depends(get_knowledge),
-    principal: Principal = Depends(require_permission("knowledge:write")),
 ) -> KnowledgeIndexResponse:
     """索引工作区中的文本文档；给出 ``path`` 时只索引那一份。
 
@@ -123,13 +114,11 @@ async def index_knowledge(
         if request_body.path:
             summary = _single_summary(
                 await service.index_document(
-                    request_body.path, principal=principal, force=request_body.force
+                    request_body.path, force=request_body.force
                 )
             )
         else:
-            summary = await service.index_workspace(
-                principal=principal, force=request_body.force
-            )
+            summary = await service.index_workspace(force=request_body.force)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -144,7 +133,6 @@ async def index_knowledge(
 async def delete_knowledge(
     source_path: str = Query(alias="path", description="要移除的源文件虚拟路径"),
     service: KnowledgeService = Depends(get_knowledge),
-    principal: Principal = Depends(require_permission("knowledge:write")),
 ) -> KnowledgeDeleteResponse:
     """从知识库移除一份文档；**不影响工作区里的源文件**。
 
@@ -155,7 +143,7 @@ async def delete_knowledge(
         HTTPException: 400 路径非法。
     """
     try:
-        deleted = await service.remove_document(source_path, principal=principal)
+        deleted = await service.remove_document(source_path)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

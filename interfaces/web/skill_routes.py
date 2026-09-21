@@ -3,9 +3,8 @@
 约定：
 
 - **技能集是全应用共享的一份**（物化视图在工作区里只有一个，作用域固定 global），
-  因此停用是管理员操作：查看清单用 ``skill:read``（member 已持有，与 ``tool:read``
-  同一理由——「这个助手会加载哪些技能」是使用者的基本知情项），启停用 ``skill:write``
-  且**只有 admin 持有**。理由见 ``application.principal`` 里的权限注释。
+  启停影响所有会话——因此响应里会带上重建结果，让「我停用了但没生效」这类疑问
+  有据可查。
 - **启停只对之后新建的会话生效**：技能索引由上游在每个会话的第一次运行时加载一次并
   写进该会话的状态。这不是本模块能改变的（属上游设计），但必须在接口上写清楚，
   否则用户会以为「停用了但没生效」是缺陷。响应里带 ``rebuild`` 说明，文档字符串也写明。
@@ -22,9 +21,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from application.errors import NotFoundError
-from application.principal import Principal
 from application.skill_service import SkillService
-from interfaces.web.auth import require_permission
 from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import (
     SkillListResponse,
@@ -63,7 +60,6 @@ async def get_skills(
 @router.get("/api/skills", response_model=SkillListResponse)
 async def list_skills(
     service: SkillService = Depends(get_skills),
-    principal: Principal = Depends(require_permission("skill:read")),
 ) -> SkillListResponse:
     """返回技能清单、启用状态与加载诊断。
 
@@ -82,7 +78,6 @@ async def toggle_skill(
     name: str,
     payload: SkillToggleRequest,
     service: SkillService = Depends(get_skills),
-    principal: Principal = Depends(require_permission("skill:write")),
 ) -> SkillToggleResponse:
     """启用或停用一个技能，并立即重建物化视图。
 

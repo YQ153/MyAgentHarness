@@ -1,8 +1,7 @@
 """会话导出 / 导入的回归测试。
 
 覆盖面：导出-导入往返内容一致、导入永远新建会话、不支持的版本被拒、工具消息靠
-``tool_call_id`` 还原、缺 id 的工具消息被计数而不是静默丢弃、Markdown 可读、
-导出走归属校验。
+``tool_call_id`` 还原、缺 id 的工具消息被计数而不是静默丢弃、Markdown 可读。
 
 WHY 用真实检查点：导入的核心动作是「把消息写进一个新会话的检查点」，替身图证明不了
 这件事——而它恰恰是这一步唯一可能真出错的地方。图本身用最小图，因为这里验的是状态
@@ -25,12 +24,11 @@ from application.dto import (
     HistoryMessage,
     ThreadExport,
 )
-from application.errors import NotFoundError, OwnershipError
+from application.errors import NotFoundError
 from application.thread_export import render_markdown
 from application.thread_service import ThreadService
 from runtime.checkpointer import checkpointer_context
 from runtime.thread_store import open_thread_store
-from tests.application.test_run_service import _principal
 
 
 class _GraphState(TypedDict):
@@ -64,10 +62,7 @@ async def _service(tmp_path: Any, **config_overrides: Any):
     """构造带真实检查点与会话存储的 ThreadService。"""
     from tests.conftest import StubSessionRegistry, make_config
 
-    overrides = dict(config_overrides)
-    if overrides.get("auth_mode") not in (None, "disabled"):
-        overrides.setdefault("auth_session_secret", "测试用会话密钥" * 8)
-    config = make_config(tmp_path, **overrides)
+    config = make_config(tmp_path, **config_overrides)
 
     async with (
         checkpointer_context(tmp_path / "cp.db") as saver,
@@ -258,17 +253,6 @@ async def test_markdown_has_roles_and_content(tmp_path):
         assert "帮我看看这个文件" in text
         assert "`read_file`" in text
         assert "- 标签：工作" in text
-
-
-async def test_export_requires_ownership(tmp_path):
-    """别人的会话不能被导出——导出文件里是完整正文。"""
-    async with _service(tmp_path, auth_mode="apikey") as (service, store, saver):
-        await store.create("source", title="来源会话", owner_id="alice")
-        await store.set_tags("source", ["工作"])
-        await _seed(store, saver, _CONVERSATION)
-
-        with pytest.raises(OwnershipError):
-            await service.export_thread("source", _principal("bob"))
 
 
 async def test_export_unknown_thread_is_not_found(tmp_path):

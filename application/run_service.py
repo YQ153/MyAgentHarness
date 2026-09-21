@@ -29,13 +29,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.run_context import AgentRunContext
-from application.audit_context import audit_client_info, audit_trace_id
+from application.audit_context import LOCAL_ACTOR_ID, audit_client_info, audit_trace_id
 from application.dto import GovernanceReport
 from application.errors import (
     InterruptExpiredError,
     NotFoundError,
-    OwnershipError,
-    PermissionDeniedError,
     ThreadBusyError,
 )
 from application.event_translator import LangGraphEventTranslator
@@ -47,9 +45,7 @@ from application.message_utils import (
     role_of,
     user_turn_number,
 )
-from application.ownership import ensure_thread_access
 from application.ports import AuditLog, ThreadMetadataStore, UsageLedger
-from application.principal import Principal
 from application.run_branch import RunBranchService
 from application.run_governance import RunGovernor
 # RunHandle / ToolCallRecord / STOP_REASON_* 在此一并再导出：句柄是 ``run_handle``
@@ -95,6 +91,11 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _STREAM_MODES = ["messages", "updates"]
+"""本轮运行订阅的两种 ``stream_mode``，缺一不可。
+
+WHY 两种都要：``messages`` 出文本与工具调用的分片，``updates`` 出中断、节点进度与
+待办快照；只订一种会让另一类事件彻底不再浮现，而事件流的消费方无从察觉。
+"""
 
 _TOOL_ARGS_PREVIEW_CHARS = 500
 """工具参数写入审计时的字符上限。
@@ -205,50 +206,28 @@ class RunService:
             config.recursion_limit,
         )
 
-    def _owner_id(self, principal: Principal | None) -> str:
-        """返回写入 thread_meta 的 owner_id。"""
-        if self._config.auth_mode == "disabled" or principal is None:
-            return ""
-        return principal.user_id
-
-    def _ensure_permission(
-        self,
-        principal: Principal | None,
-        permission: str,
-    ) -> None:
-        """校验主体是否拥有某权限。"""
-        if self._config.auth_mode == "disabled":
-            return
-        if principal is None or not principal.has_permission(permission):
-            raise PermissionDeniedError(permission)
-
-    async def _ensure_ownership(
-        self,
-        thread_id: str,
-        principal: Principal | None,
-        *,
-        allow_claim: bool = False,
+    async def _load_record(
+        self, thread_id: str, *, allow_claim: bool = False
     ) -> dict[str, Any]:
-        """校验主体是否拥有该会话，并返回元数据记录。
-
-        判定规则统一在 ``application.ownership.ensure_thread_access``，
-        与会话服务、用量服务共用同一份语义。
+        """读取会话元数据，并按需要放宽「会话必须已登记」这一条。
 
         Args:
-            allow_claim: 允许在未登记时「认领」该会话（用于 ``stream`` 首条消息场景）。
+            thread_id: 已规范化的会话 ID。
+            allow_claim: 允许会话尚未登记——``stream`` 的首条消息就发生在登记之前，
+                此时返回空字典；``False`` 时会话不存在即报错。
+
+        Returns:
+            会话元数据；``allow_claim`` 且会话未登记时返回空字典。
 
         Raises:
             NotFoundError: 会话不存在且 ``allow_claim=False``。
-            OwnershipError: 无权访问。
         """
         record = await self._thread_store.get(thread_id)
-        return ensure_thread_access(
-            record,
-            thread_id,
-            self._config,
-            principal,
-            allow_claim=allow_claim,
-        )
+        if record is None:
+            if allow_claim:
+                return {}
+            raise NotFoundError("会话", thread_id)
+        return record
 
     async def _audit(
         self,
@@ -295,7 +274,6 @@ class RunService:
         thread_id: str,
         user_input: str | list[dict[str, Any]],
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
         workspace: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
@@ -312,7 +290,6 @@ class RunService:
             user_input: 用户本轮输入。纯文本时为字符串；带附件时是多模态内容块列表
                 （由 ``AttachmentService.build_user_content`` 构造）。两种形态都必须
                 含非空文本——标题、日志与「轮次是否成立」都依赖它。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
             workspace: 会话的工作空间路径；``None`` 表示**不绑定工作空间**——这条会话
                 将使用应用为它自动创建的专属目录。取值**只在首条消息上生效**：一旦会话
@@ -326,23 +303,19 @@ class RunService:
             ValueError: ``thread_id``、``user_input`` 非法，或 ``workspace`` 指向的
                 目录不存在。
             KeyError: 模型别名未注册。
-            PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
             SessionRootLockedError: ``workspace`` 与该会话已锁定的文件根不一致。
             RuntimeError: 模型初始化或装配失败。
         """
-        self._ensure_permission(principal, "thread:create")
-        # WHY 限流紧跟权限：它必须排在任何「查这个会话存不存在」的动作之前，
-        # 否则被限流的一方能从 404 与 429 的差别里推断出他人会话是否存在。
-        self._check_run_limits(principal)
+        # WHY 限流排在任何「查这个会话存不存在」的动作之前：否则被限流的一方能从
+        # 404 与 429 的差别里推断出会话是否存在。
+        self._check_run_limits()
 
         normalized = normalize_thread_id(thread_id)
         text, content = _split_user_input(user_input)
 
-        # WHY 先鉴权再初始化模型：权限不足应快速失败，避免浪费模型调用。
-        # 首条消息可能还未登记元数据，允许当前主体认领该会话。
-        record = await self._ensure_ownership(normalized, principal, allow_claim=True)
+        # 首条消息可能还未登记元数据，因此允许会话此刻尚不存在。
+        record = await self._load_record(normalized, allow_claim=True)
 
         # WHY 文件根必须在这里（取图之前）定下来：图的文件根、技能来源与容器挂载根
         # 都在装配那一刻烧死，而根是会话级取值——顺序反了就会拿到「上一个根」的图，
@@ -359,7 +332,7 @@ class RunService:
         # 把配置与密钥错误暴露在事件流开始之前。
         graph = self._graph_factory.get(model_name, scope=scope)
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         logger.info(
             "会话 %s 发起运行（%d 字符）actor=%s workspace=%s",
             normalized,
@@ -378,28 +351,13 @@ class RunService:
         # ——落进另一个目录。
         # WHY 传 workspace_bound：它区分「用户选的工作空间」与「应用给的专属目录」，
         # 界面靠它决定文案；这个事实只在锁定那一刻知道，事后再也推断不出来。
-        recorded = await self._record_turn(
+        await self._record_turn(
             normalized,
             title_hint=text,
             turn_delta=1,
-            principal=principal,
             workspace=str(scope.root),
             workspace_bound=bool(workspace and str(workspace).strip()),
         )
-
-        # WHY 登记后再校验一次所有权：并发首条消息场景下，UPSERT 会以首个写入者
-        # 的 owner_id 为准；登记后回读可发现该会话是否已被他人抢先认领，
-        # 避免后续运行写入错误的 owner 上下文。
-        if recorded is not None and self._config.auth_mode != "disabled":
-            recorded_owner = recorded.get("owner_id") or ""
-            expected_owner = self._owner_id(principal)
-            is_admin = principal is not None and principal.is_admin()
-            if recorded_owner and recorded_owner != expected_owner and not is_admin:
-                logger.warning(
-                    "会话认领冲突：thread=%s expected_owner=%s actual_owner=%s",
-                    normalized, expected_owner, recorded_owner,
-                )
-                raise OwnershipError("会话", normalized)
 
         await self._audit(
             event_type="thread_run",
@@ -416,7 +374,7 @@ class RunService:
         handle = self._acquire_run_slot(
             normalized,
             model_name=model_name,
-            owner_id=self._owner_id(principal),
+            owner_id="",
             actor_id=actor_id,
             workspace=str(scope.root),
         )
@@ -424,19 +382,18 @@ class RunService:
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": content}]}
         return self._consume(graph, payload, handle)
 
-    # ------------------------------------------------------------ 编辑与分叉
+    # ------------------------------------------------------------------ 编辑与分叉
 
     async def regenerate(
         self,
         thread_id: str,
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """重新生成最后一轮助手回复。
 
         WHY 与编辑共用同一条机制：两者都是「从某个历史检查点分叉，再用一段文本跑一次」，
-        差别只在分叉点与新文本从哪来。分成两套实现会让权限、并发、分支登记、用量归属
+        差别只在分叉点与新文本从哪来。分成两套实现会让并发、分支登记、用量归属
         各写一遍，而它们迟早分叉；合成一条路径则这些语义只存在一处。
 
         WHY 是分叉而不是原地重跑：旧回复所在的路径原样保留，用户不满意时还能切回去
@@ -447,18 +404,15 @@ class RunService:
 
         Raises:
             ValueError: ``thread_id`` 非法，或该会话还没有可用的用户消息。
-            PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话或分支不存在。
-            OwnershipError: 无权访问该会话。
             ThreadBusyError: 该会话已有运行中的轮次。
         """
         normalized = normalize_thread_id(thread_id)
-        # WHY 权限与限流都排在 _branch_messages 之前：后者会读会话（含所有权校验），
-        # 而这两个判定必须先于「会话是否存在」的结论给出，否则状态码本身成了探测手段。
-        self._ensure_permission(principal, "thread:create")
-        self._check_run_limits(principal)
+        # WHY 限流排在 _branch_messages 之前：后者会读会话，而限流判定必须先于
+        # 「会话是否存在」的结论给出，否则状态码本身成了探测手段。
+        self._check_run_limits()
 
-        messages = await self._branch_messages(normalized, principal)
+        messages = await self._branch_messages(normalized)
 
         last_user = last_user_index(messages)
         if last_user is None:
@@ -474,7 +428,6 @@ class RunService:
             target_index=last_user,
             origin="regenerate",
             label="重新生成",
-            principal=principal,
             model_name=model_name,
         )
 
@@ -484,7 +437,6 @@ class RunService:
         message_index: int,
         content: str,
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """改写指定下标的用户消息，并从该点分叉重跑。
@@ -495,9 +447,7 @@ class RunService:
 
         Raises:
             ValueError: ``thread_id`` 非法、下标越界、目标不是用户消息、或新文本为空。
-            PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话或分支不存在。
-            OwnershipError: 无权访问该会话。
             ThreadBusyError: 该会话已有运行中的轮次。
         """
         normalized = normalize_thread_id(thread_id)
@@ -507,11 +457,10 @@ class RunService:
             raise ValueError("content 必须是非空字符串")
         text = content.strip()
 
-        # WHY 与 regenerate 同一顺序：先权限、再限流，最后才读会话。
-        self._ensure_permission(principal, "thread:create")
-        self._check_run_limits(principal)
+        # WHY 与 regenerate 同一顺序：先限流，最后才读会话。
+        self._check_run_limits()
 
-        messages = await self._branch_messages(normalized, principal)
+        messages = await self._branch_messages(normalized)
         if message_index >= len(messages):
             raise ValueError(f"message_index 越界（{message_index} >= {len(messages)}）")
         if role_of(messages[message_index]) != "user":
@@ -525,7 +474,6 @@ class RunService:
             target_index=message_index,
             origin="edit",
             label=f"编辑第 {turn} 轮",
-            principal=principal,
             model_name=model_name,
         )
 
@@ -538,7 +486,6 @@ class RunService:
         target_index: int,
         origin: str,
         label: str,
-        principal: Principal | None,
         model_name: str | None,
     ) -> AsyncIterator[AgentEvent]:
         """从「目标消息出现之前」的检查点分叉，并用 ``text`` 跑一轮。
@@ -559,28 +506,23 @@ class RunService:
             origin=origin,
             label=label,
             model_name=model_name,
-            owner_id=self._owner_id(principal),
-            actor_id=principal.user_id if principal else "anonymous",
+            owner_id="",
+            actor_id=LOCAL_ACTOR_ID,
         )
         return self._consume(plan.graph, plan.payload, plan.handle)
 
-    async def _branch_messages(
-        self, thread_id: str, principal: Principal | None
-    ) -> list[Any]:
-        """读当前分支的消息列表，并顺带完成权限与会话校验。
+    async def _branch_messages(self, thread_id: str) -> list[Any]:
+        """读当前分支的消息列表，并顺带完成会话校验。
 
-        WHY 权限与所有权留在这一层而不是下沉到分叉服务：这两个判定的结论必须先于
+        WHY 会话存在性校验留在这一层而不是下沉到分叉服务：它的结论必须先于
         「会话是否存在」给出（否则状态码本身成了探测手段），属于入口契约；分叉服务
         只管历史与分支记录。
 
         Raises:
-            PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话或分支不存在。
-            OwnershipError: 无权访问该会话。
             RuntimeError: 读取失败。
         """
-        self._ensure_permission(principal, "thread:create")
-        await self._ensure_ownership(thread_id, principal)
+        await self._load_record(thread_id)
 
         return await self._branches.messages_of(thread_id)
 
@@ -589,7 +531,6 @@ class RunService:
         thread_id: str,
         decision_payload: Any,
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """人工审批后恢复被中断的执行。
@@ -600,7 +541,6 @@ class RunService:
         Args:
             thread_id: 会话 ID。
             decision_payload: 审批结果，形如 ``{"decisions": [{"type": "approve"}]}``。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
             model_name: 模型别名；``None`` 表示使用默认模型。
 
         Returns:
@@ -609,26 +549,21 @@ class RunService:
         Raises:
             ValueError: ``thread_id`` 非法，或审批载荷格式非法。
             KeyError: 模型别名未注册。
-            PermissionDeniedError: 缺少 hitl:approve 权限。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
             InterruptExpiredError: 该会话的审批挂起已超过 TTL，本次恢复被拒绝。
             RuntimeError: 模型初始化或装配失败。
         """
-        # WHY 审批需要独立权限：这一调用会让此前被拦下的高危工具真正执行，
-        # 风险量级高于「发起对话」，不能复用 thread:create。
-        self._ensure_permission(principal, "hitl:approve")
-        self._check_run_limits(principal)
+        self._check_run_limits()
 
         normalized = normalize_thread_id(thread_id)
         # WHY 在这里就完成审批载荷校验：非法载荷必须在事件流开始之前失败，
         # 否则只能表现为连接中断，前端拿不到任何可读的失败原因。
         command = build_resume_command(decision_payload)
 
-        # WHY 所有权校验挪到取图之前：取图需要先知道本轮的工作区，而工作区要从会话
-        # 记录里读。顺带的好处与 ``stream`` 一致——权限与存在性问题比模型初始化便宜，
-        # 让它们先失败。
-        record = await self._ensure_ownership(normalized, principal)
+        # WHY 会话记录在取图之前读：取图需要先知道本轮的工作区，而工作区要从会话
+        # 记录里读。顺带的好处与 ``stream`` 一致——存在性问题比模型初始化便宜，
+        # 让它先失败。
+        record = await self._load_record(normalized)
         scope = await self._workspaces.resolve(thread_id=normalized, record=record)
         graph = self._graph_factory.get(model_name, scope=scope)
 
@@ -644,7 +579,7 @@ class RunService:
         # 否则「待审批数」只会单调递增，失去作为运行治理指标的意义。
         self.clear_hitl_pending(normalized)
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         logger.info("会话 %s 恢复执行 actor=%s", normalized, actor_id)
 
         # WHY turn_delta=0：恢复是同一轮运行的延续，重复计数会让「对话轮数」
@@ -668,7 +603,7 @@ class RunService:
         handle = self._acquire_run_slot(
             normalized,
             model_name=model_name,
-            owner_id=self._owner_id(principal),
+            owner_id="",
             actor_id=actor_id,
             workspace=str(scope.root),
         )
@@ -677,8 +612,6 @@ class RunService:
     async def stop(
         self,
         thread_id: str,
-        *,
-        principal: Principal | None = None,
     ) -> dict[str, Any]:
         """请求停止指定会话的当前运行。
 
@@ -691,7 +624,6 @@ class RunService:
 
         Args:
             thread_id: 会话 ID。
-            principal: 当前主体；``None`` 仅在认证关闭时使用。
 
         Returns:
             ``{"thread_id": str, "stopped": bool, "reason": str}``，其中
@@ -700,16 +632,10 @@ class RunService:
 
         Raises:
             ValueError: ``thread_id`` 非法。
-            PermissionDeniedError: 缺少 thread:create 权限。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
         """
-        self._ensure_permission(principal, "thread:create")
         normalized = normalize_thread_id(thread_id)
-
-        # WHY 所有权校验不可省：停止是「终止他人计算」的操作，若弱化为
-        # 「会话在跑就能停」，任何登录用户都能打断别人的长任务。
-        await self._ensure_ownership(normalized, principal)
+        await self._load_record(normalized)
 
         handle = self.run_handle(normalized)
         if handle is None:
@@ -720,7 +646,7 @@ class RunService:
             logger.info("会话 %s 收到重复停止请求：忽略", normalized)
             return {"thread_id": normalized, "stopped": True, "reason": "already_stopping"}
 
-        actor_id = principal.user_id if principal else "anonymous"
+        actor_id = LOCAL_ACTOR_ID
         # WHY 同步置位后再做任何 await：判重与置位之间不插入等待，
         # 单事件循环内天然原子，并发重复请求只有一次会生效并落审计。
         handle.request_stop()
@@ -846,10 +772,10 @@ class RunService:
         # 前端就不需要在两处分别处理结束条件。
         done_payload: dict[str, Any] = {"thread_id": thread_id}
         if handle.stop_requested:
-            # WHY 用句柄上记录的原因而不是写死 "stopped"：超时由后台协程置位，
+            # WHY 用句柄上记录的原因而不是写死 ``"stopped"``：超时由后台协程置位，
             # 用户停止由 stop() 置位，两者都必须让前端看到「不是正常收尾」，
             # 但提示语不同（「已停止」vs「已超时终止」）。取不到原因时
-            # 退化为 "stopped"，避免出现没有 reason 的半截语义。
+            # 退化为 ``"stopped"``，避免出现没有 reason 的半截语义。
             done_payload["reason"] = handle.stop_reason or STOP_REASON_STOPPED
         logger.info("会话 %s 本轮结束", thread_id)
         yield AgentEvent(AgentEventType.DONE, done_payload)
@@ -1059,7 +985,7 @@ class RunService:
         if self._audit_store is None or not handle.tool_calls:
             return
 
-        actor_id = handle.actor_id or "anonymous"
+        actor_id = handle.actor_id or LOCAL_ACTOR_ID
         for record in handle.tool_calls:
             source = self._tool_catalog.source_of(record.name) if self._tool_catalog else "unknown"
             if source == "builtin" and not self._config.tool_audit_builtin:
@@ -1104,8 +1030,9 @@ class RunService:
                 self._config, handle.thread_id, handle.fork_checkpoint or None
             ),
             stream_mode=_STREAM_MODES,
-            # WHY 必须显式传 context：长期记忆的命名空间在图内按主体计算，
-            # 缺了它记忆会落进匿名池——多用户部署下等于跨用户串味。
+            # WHY 必须显式传 context：长期记忆的命名空间在图内按主体计算，缺了它
+            # 记忆会落进一个与面板读取时不同的命名空间——表现为「面板说没记住、Agent
+            # 却照着做」，两边都不报错。
             context=AgentRunContext(user_id=handle.memory_owner),
         )
         stop_task: asyncio.Task[bool] = asyncio.ensure_future(handle.cancel_event.wait())
@@ -1130,7 +1057,7 @@ class RunService:
         finally:
             # WHY 必须清理两个任务：无论正常结束、停止还是客户端断开触发的
             # 取消，都不能留下悬挂任务，否则事件循环关闭时会报
-            # "Task was destroyed but it is pending"。先 cancel 再逐一 await
+            # ``Task was destroyed but it is pending``。先 cancel 再逐一 await
             # 吸收结果，避免「异常从未被取回」的告警。
             for task in (chunk_task, stop_task):
                 if task is not None and not task.done():
@@ -1140,26 +1067,23 @@ class RunService:
                     with suppress(BaseException):
                         await task
 
-    # -------------------------------------------------------------- 并发控制
+    # ------------------------------------------------------------------ 并发控制
     # 以下方法全部委托给 ``RunRegistry``：运行槽位、累计计数与审批挂起状态的唯一
     # 所有者在那边（锁与状态字段一并搬走）。这里保留同名方法，是为了让「谁能读、
     # 谁能改哪份状态」对调用方完全不变——指标端点、治理巡检与测试都按这些名字读。
 
-    def _check_run_limits(self, principal: Principal | None) -> None:
+    def _check_run_limits(self) -> None:
         """在真正触碰会话之前判定并发与限流。
 
-        WHY 保留这一层而不是让调用方直接去问登记表：调用顺序（权限 → 限流 →
-        所有权）本身是入口契约——限流必须早于「会话是否存在」的判断，否则被限流
-        的一方能从 404 与 429 的差别里推断出他人会话是否存在。这条约束写在调用
-        顺序唯一确定的地方，最不容易被后来的改动破坏。
-
-        Args:
-            principal: 当前主体；``None`` 表示认证关闭，落到匿名主体。
+        WHY 保留这一层而不是让调用方直接去问登记表：调用顺序（限流 → 读会话）
+        本身是入口契约——限流必须早于「会话是否存在」的判断，否则被限流的一方能从
+        404 与 429 的差别里推断出会话是否存在。这条约束写在调用顺序唯一确定的地方，
+        最不容易被后来的改动破坏。
 
         Raises:
             RunRejectedError: 超出并发上限或被限流。
         """
-        self._registry.check_limits(self._owner_id(principal))
+        self._registry.check_limits("")
 
     def _acquire_run_slot(
         self,
@@ -1176,7 +1100,7 @@ class RunService:
         Args:
             thread_id: 已规范化的会话 ID。
             model_name: 本轮使用的模型别名；``None`` 表示默认模型。
-            owner_id: 会话所有者；认证关闭时为空串。
+            owner_id: 会话所有者；本应用不区分用户，固定为空串。
             actor_id: 发起本轮运行的主体标识，用于工具审计归因。
             fork_checkpoint: 分叉起点检查点 id；空串表示接着当前分支的头。
             workspace: 本轮运行的工作区绝对路径；收尾阶段按它换算留存路径。
@@ -1317,27 +1241,20 @@ class RunService:
         *,
         title_hint: str | None,
         turn_delta: int,
-        principal: Principal | None = None,
         workspace: str = "",
         workspace_bound: bool = False,
     ) -> dict[str, Any] | None:
         """把本轮对话登记到元数据表，并返回登记后的元数据。
 
-        WHY 返回记录而不是 ``None``：``stream`` 依赖登记后的 ``owner_id``
-        做「并发首条消息认领冲突」复查；此前本方法不返回值，该复查成为
-        死代码，并发认领冲突会被静默漏检（Bob 可在 Alice 抢先认领的会话上
-        继续运行）。
-
         WHY 吞掉异常：对话本身已经完成，元数据只是列表展示用的旁路信息，
         让它把一次成功的交互变成错误响应是本末倒置；失败会留下完整日志供
-        排查，返回 ``None`` 让调用方跳过复查（登记失败时无从复查）。
+        排查，返回 ``None`` 让调用方知道登记没成功。
         """
         try:
             return await self._thread_store.record_turn(
                 thread_id,
                 title_hint=self._build_title(title_hint),
                 turn_delta=turn_delta,
-                owner_id=self._owner_id(principal),
                 # WHY 在这条 UPSERT 里顺带写文件根：它只在会话还没有根时生效
                 # （见 ``ThreadMetaStore.record_turn`` 的 CASE 分支），因此不会把已锁定的
                 # 会话改到别处；而对还没有根的会话，这正是「根在第一次真正跑起来的那一刻

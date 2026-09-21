@@ -166,7 +166,6 @@ def main(argv: list[str]) -> int:
             memory_file=root / "AGENTS.md",
             db_path=root / "data" / "agent.db",
             skill_dirs=[root / "skills"],
-            auth_mode="disabled",
             embedding_backend=args.backend,
             embedding_python=python,
             # WHY 只用真实启用路径来注册工具：直接调 register_tools 会绕开

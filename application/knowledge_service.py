@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from application.errors import UnsupportedDocumentError
-from application.ownership import effective_owner_id
 from application.ports import KnowledgeIndex
 from llm.embeddings import EmbeddingError
 from runtime.knowledge_store import ChunkInput, KnowledgeHit
@@ -38,11 +37,18 @@ from text_utils import collapse_whitespace
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from application.principal import Principal
     from config import AppConfig, SessionRoot
     from llm.embeddings import EmbeddingBackend
 
 logger = logging.getLogger(__name__)
+
+_OWNER_ID = ""
+"""知识库记录的统一 ``owner_id``。
+
+WHY 仍然带这一列：存储层按 ``owner_id`` 建索引与去重，把它从表结构里删掉是一次
+破坏性的迁移；而本应用不区分用户，所有索引都属于同一个人，因此固定为空串——
+与 ``thread_store`` 里「会话的 ``owner_id`` 为空串」保持同一表示。
+"""
 
 _MARKDOWN_HEADERS: list[tuple[str, str]] = [("#", "h1"), ("##", "h2"), ("###", "h3")]
 """识别为标题的 Markdown 层级；只到三级——更深的层级在检索结果里做出处标注反而啰嗦。"""
@@ -91,7 +97,7 @@ def split_document(text: str, *, chunk_chars: int, overlap_chars: int) -> list[C
         chunk_size=chunk_chars,
         chunk_overlap=overlap_chars,
         separators=_CHUNK_SEPARATORS,
-        # WHY 用 "end" 而不是 True：后者会把分隔符挂到**下一块的开头**，于是每块都以
+        # WHY 用 ``"end"`` 而不是 ``True``：后者会把分隔符挂到**下一块的开头**，于是每块都以
         # 一个孤立的「。」起头——那个字符既是给模型看的噪音，也参与嵌入计算；而结尾
         # 对齐让每块恰好收在句末，正文是完整的。
         keep_separator="end",
@@ -215,26 +221,15 @@ class KnowledgeService:
             "top_k": self._config.knowledge_search_top_k,
         }
 
-    def _owner(self, principal: Principal | None) -> str:
-        """把当前主体换算成存储层的 ``owner_id``。
-
-        WHY 走 ``effective_owner_id`` 而不自己判 ``auth_mode``：它是全项目唯一的口径
-        （见 ``application/ownership.py``），再判一次就会在规则调整时漂移。认证关闭时
-        它返回 ``None``，此处归一为空串——与 ``thread_store`` 中「未认证场景创建的记录
-        ``owner_id=''``」保持同一表示。
-        """
-        return effective_owner_id(self._config, principal) or ""
-
     # ------------------------------------------------------------------ 索引
 
     async def index_document(
-        self, source_path: str, *, principal: Principal | None = None, force: bool = False
+        self, source_path: str, *, force: bool = False
     ) -> dict[str, Any]:
         """索引（或重新索引）工作区内的一份文档。
 
         Args:
             source_path: 工作区虚拟路径，如 ``/notes/login.md``。
-            principal: 当前主体，决定索引归属。
             force: 为 ``True`` 时忽略内容指纹，强制重建索引。
 
         Returns:
@@ -247,7 +242,7 @@ class KnowledgeService:
             UnsupportedDocumentError: 二进制内容、非 UTF-8 或超过字节上限。
             ValueError: ``source_path`` 非法。
         """
-        owner = self._owner(principal)
+        owner = _OWNER_ID
         virtual = _normalize_virtual(source_path)
         absolute = resolve_in_workspace(self._root, virtual)
         if not absolute.is_file():
@@ -306,9 +301,7 @@ class KnowledgeService:
             "vector_status": vector_status,
         }
 
-    async def index_workspace(
-        self, *, principal: Principal | None = None, force: bool = False
-    ) -> dict[str, Any]:
+    async def index_workspace(self, *, force: bool = False) -> dict[str, Any]:
         """扫描工作区并索引其中全部文本文档。
 
         WHY 逐个文件吞掉可预期的失败：一份二进制或非 UTF-8 的文件不该让整次索引中断
@@ -323,7 +316,7 @@ class KnowledgeService:
 
         for virtual in candidates:
             try:
-                results.append(await self.index_document(virtual, principal=principal, force=force))
+                results.append(await self.index_document(virtual, force=force))
             except (UnsupportedDocumentError, WorkspacePathError, OSError) as exc:
                 logger.warning("跳过无法索引的文件：%s（%s）", virtual, exc)
                 results.append({"source_path": virtual, "status": "skipped", "detail": str(exc)})
@@ -421,9 +414,7 @@ class KnowledgeService:
 
     # ------------------------------------------------------------------ 删除与列举
 
-    async def remove_document(
-        self, source_path: str, *, principal: Principal | None = None
-    ) -> bool:
+    async def remove_document(self, source_path: str) -> bool:
         """从知识库移除一份文档（不影响工作区里的源文件）。
 
         Returns:
@@ -432,13 +423,13 @@ class KnowledgeService:
         Raises:
             WorkspacePathError: 路径非法。
         """
-        owner = self._owner(principal)
+        owner = _OWNER_ID
         virtual = _normalize_virtual(source_path)
         return await self._store.delete_document(owner_id=owner, source_path=virtual)
 
-    async def list_documents(self, *, principal: Principal | None = None) -> dict[str, Any]:
-        """列出当前主体已索引的文档与规模。"""
-        owner = self._owner(principal)
+    async def list_documents(self) -> dict[str, Any]:
+        """列出已索引的文档与规模。"""
+        owner = _OWNER_ID
         documents = await self._store.list_documents(owner_id=owner)
         return {
             "owner_id": owner,
@@ -460,14 +451,12 @@ class KnowledgeService:
         self,
         query: str,
         *,
-        principal: Principal | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         """检索知识库，返回融合后的片段。
 
         Args:
             query: 检索词。
-            principal: 当前主体，决定可见范围。
             limit: 返回条数；``None`` 表示取配置的 ``KNOWLEDGE_SEARCH_TOP_K``。
 
         Returns:
@@ -476,7 +465,7 @@ class KnowledgeService:
         Raises:
             ValueError: ``query`` 为空或超长、``limit`` 越界。
         """
-        owner = self._owner(principal)
+        owner = _OWNER_ID
         top_k = self._config.knowledge_search_top_k if limit is None else limit
         normalized = collapse_whitespace(query)
         if not normalized:

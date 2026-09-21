@@ -7,7 +7,7 @@
 三条断言分别守三件事：
 
 1. **层内纯度**：对外契约组（``dto`` / ``errors`` / ``events`` / ``ports`` /
-   ``principal`` / ``audit_recorder`` / ``ownership``）不得依赖服务组模块。
+   ``audit_recorder``）不得依赖服务组模块。
    契约组的变更理由是"对外契约变化"，服务组的是"业务流程变化"；后者依赖前者是
    正常的，**前者依赖后者**说明契约层被业务流程污染——那正是服务之间互相 import、
    最终形成包内环的开端。
@@ -47,9 +47,7 @@ _CONTRACT_MODULES: frozenset[str] = frozenset(
         "errors",
         "events",
         "ports",
-        "principal",
         "audit_recorder",
-        "ownership",
     }
 )
 
@@ -81,7 +79,6 @@ _SERVICE_MODULES: frozenset[str] = frozenset(
         "thread_export",
         "message_utils",
         "audit_context",
-        "api_key_auth",
     }
 )
 
@@ -169,7 +166,7 @@ def test_contract_modules_do_not_depend_on_service_modules() -> None:
     assert not offenders, (
         "以下契约组模块依赖了服务组模块：\n  "
         + "\n  ".join(offenders)
-        + "\n契约组（dto / errors / events / ports / principal / audit_recorder / ownership）"
+        + "\n契约组（dto / errors / events / ports / audit_recorder）"
         "描述的是对外契约，它对服务一无所知；反过来依赖服务，说明契约里混进了业务流程。\n"
         "正确方向是「服务依赖契约」。若确实需要共享某段判定，"
         "把它下沉到契约组模块或根级中立模块（见 README 的分层约定）。"
@@ -203,7 +200,7 @@ def test_role_table_covers_every_application_module() -> None:
 def test_module_docstring_names_every_module() -> None:
     """``application/__init__.py`` 的 docstring 必须点名每一个模块。
 
-    WHY 值得钉：这一层有 29 个模块，而 ``__all__`` 只导出 12 个符号。旧版 docstring
+    WHY 值得钉：这一层有二十余个模块，而 ``__all__`` 只导出 12 个符号。旧版 docstring
     写着"对外提供三件事"，新读者按它理解会漏掉二十余个模块。声明与事实不一致时，
     失败的表现是"找不到东西"，而不是任何一处报错。
     """

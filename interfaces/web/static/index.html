@@ -15,22 +15,15 @@
       </div>
       <div class="controls">
         <select id="model-select" title="切换模型"></select>
-        <!-- 记忆入口对所有人可见：记忆按主体收敛，认证关闭时是本地那一份 -->
         <button id="memory-open" type="button">记忆</button>
         <!-- 工作区面板：Agent 产出的文件都在这里，只读 -->
         <button id="workspace-open" type="button">工作区</button>
-        <!--
-          知识库面板：索引工作区文档供 Agent 检索。
-          与记忆入口同理对所有人可见——索引按主体收敛（knowledge:write 是 member 的默认权限），
-          放进「仅管理员可见」的管理面板会让普通成员管不了自己那份索引。
-        -->
+        <!-- 知识库面板：索引工作区文档供 Agent 检索 -->
         <button id="knowledge-open" type="button">知识库</button>
-        <!--
-          技能库面板：技能集是**全应用共享**的一份，因此入口对所有人可见（成员有 skill:read），
-          但「启用 / 停用」只有管理员能点（skill:write 仅 admin）——停掉一个技能会影响所有人。
-        -->
+        <!-- 技能库面板：启停会影响之后新建的会话，具体见面板内说明 -->
         <button id="skills-open" type="button">技能</button>
-        <div id="auth-status" class="auth-status"></div>
+        <!-- 审计日志：业务动作的留痕（工具调用 / 会话增删 / 记忆删除 / 审批决策），只读 -->
+        <button id="audit-open" type="button">审计</button>
       </div>
     </header>
 
@@ -126,53 +119,31 @@
       </div>
     </footer>
   </div>
-  <!-- 管理面板：仅管理员可见 -->
-  <div id="admin-modal" class="modal" style="display:none;">
+  <!--
+    审计日志：业务动作的留痕。只读——写入由服务端在业务动作里完成，这里没有写入入口。
+  -->
+  <div id="audit-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
-    <div class="modal-content">
+    <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>管理面板</h3>
-        <button id="admin-close" type="button" class="icon-btn">&times;</button>
+        <h3>审计日志</h3>
+        <button id="audit-close" type="button" class="icon-btn">&times;</button>
       </div>
-      <div class="modal-tabs">
-        <button type="button" class="tab active" data-tab="apikeys">API Keys</button>
-        <button type="button" class="tab" data-tab="audit">审计日志</button>
+      <div class="audit-toolbar">
+        <button id="audit-refresh" type="button">刷新</button>
       </div>
-      <div id="tab-apikeys" class="tab-panel active">
-        <form id="apikey-form" class="apikey-form">
-          <label>角色</label>
-          <select id="apikey-role" required>
-            <option value="member" selected>member</option>
-            <option value="admin">admin</option>
-            <option value="viewer">viewer</option>
-          </select>
-          <label>作用域（空格分隔）</label>
-          <input id="apikey-scopes" type="text" placeholder="例如：thread:list thread:read" />
-          <label>描述</label>
-          <input id="apikey-desc" type="text" placeholder="CLI 用" />
-          <label>过期时间（可选，ISO8601）</label>
-          <input id="apikey-expires" type="text" placeholder="2026-12-31T23:59:59" />
-          <button type="submit" class="primary">创建 API Key</button>
-        </form>
-        <div id="apikey-list" class="apikey-list"></div>
-      </div>
-      <div id="tab-audit" class="tab-panel">
-        <div class="audit-toolbar">
-          <button id="audit-refresh" type="button">刷新</button>
-        </div>
-        <div class="audit-table-wrap">
-          <table id="audit-table" class="audit-table">
-            <thead>
-              <tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+      <div class="audit-table-wrap">
+        <table id="audit-table" class="audit-table">
+          <thead>
+            <tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </div>
   </div>
 
-  <!-- 长期记忆面板：数据来自 GET /api/memories，按主体收敛 -->
+  <!-- 长期记忆面板：数据来自 GET /api/memories -->
   <div id="memory-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
     <div class="modal-content">
@@ -247,7 +218,7 @@
       <p id="workspace-path" class="workspace-path"></p>
       <p class="workspace-hint">
         Agent 的文件读写、命令产物都落在这个目录里。面板<b>只读</b>——要改动请通过对话让 Agent 做，
-        这样才会经过权限与审批链。
+        这样才会经过人工审批。
       </p>
       <div class="workspace-body">
         <div class="workspace-tree" id="workspace-tree"></div>
@@ -256,7 +227,7 @@
     </div>
   </div>
 
-  <!-- 知识库面板：数据来自 GET /api/knowledge，按主体收敛 -->
+  <!-- 知识库面板：数据来自 GET /api/knowledge -->
   <div id="knowledge-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
     <div class="modal-content modal-wide">
@@ -292,7 +263,7 @@
       <p class="knowledge-hint">
         技能是 Agent 会加载的指令包，放在工作区的 <code>skills/</code> 目录里。
         启停<b>只对之后新建的会话生效</b>——已在进行的会话沿用它们启动时加载的那一份。
-        技能包本身的新增与修改请直接改文件系统：那条路径同样受权限与审批链约束。
+        技能包本身的新增与修改请直接改文件系统：那条路径同样受人工审批约束。
       </p>
       <div class="knowledge-toolbar">
         <button id="skills-refresh" type="button">刷新</button>
@@ -302,61 +273,6 @@
     </div>
   </div>
 
-  <!-- API Key 复制弹窗 -->
-  <div id="apikey-popup" class="modal" style="display:none;">
-    <div class="modal-backdrop"></div>
-    <div class="modal-content modal-small">
-      <div class="modal-header">
-        <h3>API Key 已创建</h3>
-        <button id="popup-close" type="button" class="icon-btn">&times;</button>
-      </div>
-      <p class="hint">请立即复制，明文 key 只显示一次。</p>
-      <div class="apikey-value-wrap">
-        <input id="apikey-value" type="text" readonly />
-        <button id="apikey-copy" type="button">复制</button>
-      </div>
-      <p id="copy-msg" class="copy-msg"></p>
-    </div>
-  </div>
-
-  <!--
-    API Key 凭据对话框：apikey 模式下浏览器唯一的凭据入口。
-    服务端没有登录页（凭据不在服务端），因此这里要的不是「登录」，而是「把调用方
-    手里的 key 交给这个页面」——它只写进本机浏览器的 localStorage。
-  -->
-  <div id="auth-modal" class="modal" style="display:none;">
-    <div class="modal-backdrop"></div>
-    <div class="modal-content modal-small">
-      <div class="modal-header">
-        <h3>设置 API Key</h3>
-        <button id="auth-close" type="button" class="icon-btn">&times;</button>
-      </div>
-      <p class="hint">
-        这里要的是<strong>本服务的访问凭据</strong>，<strong>不是</strong>模型供应商
-        （DeepSeek / OpenAI）的 API Key：填 <code>.env</code> 里
-        <code>AUTH_API_KEY_DEV</code> 的值，或在「管理」面板创建一条
-        （形如 <code>harness_…</code>，明文只显示一次）。凭据只保存在本机浏览器的
-        localStorage，不会发给其它站点。
-      </p>
-      <form id="auth-form" class="auth-form">
-        <label for="auth-key">请求头 <code id="auth-header-name">X-API-Key</code></label>
-        <input
-          id="auth-key"
-          type="password"
-          autocomplete="off"
-          placeholder="粘贴 AUTH_API_KEY_DEV 的值，或 harness_…"
-        />
-        <div class="auth-actions">
-          <button id="auth-clear" type="button">清除凭据</button>
-          <button type="submit" class="primary">保存</button>
-        </div>
-      </form>
-      <p id="auth-msg" class="auth-msg"></p>
-    </div>
-  </div>
-
-  <!-- 必须在 app.js 之前：请求头注入依赖它的全局 AuthCredential -->
-  <script src="/auth_credential.js"></script>
   <!-- 必须在 app.js 之前：助手消息的渲染依赖它的全局 Markdown -->
   <script src="/markdown.js"></script>
   <!-- 必须在 app.js 之前：工作区面板的状态由它的全局 WorkspaceScope 构造（错序时

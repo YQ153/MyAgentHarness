@@ -12,7 +12,6 @@ from typing import Any
 from langchain_core.messages import AIMessageChunk
 
 from application.events import AgentEventType
-from application.principal import Principal
 from application.run_service import RunService
 from runtime.thread_store import ThreadMetaStore
 from runtime.usage_store import UsageStore
@@ -62,10 +61,7 @@ def _service(
     usage_store: UsageStore | None,
     **config_overrides: Any,
 ) -> RunService:
-    overrides = dict(config_overrides)
-    if overrides.get("auth_mode") not in (None, "disabled"):
-        overrides.setdefault("auth_session_secret", "测试用会话密钥" * 8)
-    config = make_config(tmp_path, **overrides)
+    config = make_config(tmp_path, **config_overrides)
     return RunService(
         config,
         thread_store=thread_store,
@@ -116,15 +112,20 @@ async def test_run_records_usage_once_with_cumulative_totals(
     assert summary["groups"][0]["key"] == "deepseek-flash"
 
 
-async def test_run_records_owner(tmp_path, thread_store: ThreadMetaStore, usage_store: UsageStore):
+async def test_run_records_usage_without_owner(
+    tmp_path, thread_store: ThreadMetaStore, usage_store: UsageStore
+):
+    """用量必须落库，且不属于任何主体（应用不区分调用方）。
+
+    WHY 仍然断言归属列：存储层按 ``owner_id`` 聚合，留空是「本机全部运行」这一口径的
+    唯一表示；写进一个别的值会让按 owner 聚合的查询永远为空，而那种失败不报错。
+    """
     graph = ScriptedGraph([_chunk("ok", input_tokens=5, output_tokens=2)])
-    service = _service(tmp_path, thread_store, graph, usage_store, auth_mode="apikey")
+    service = _service(tmp_path, thread_store, graph, usage_store)
 
-    await _drain(await service.stream("t1", "hi", principal=Principal("alice", "member")))
+    await _drain(await service.stream("t1", "hi"))
 
-    # 认证开启时必须带上 owner，否则按用户聚合全是空
-    assert (await usage_store.summarize(owner_id="alice"))["run_count"] == 1
-    assert (await usage_store.summarize(owner_id="bob"))["run_count"] == 0
+    assert (await usage_store.summarize(thread_id="t1"))["run_count"] == 1
 
 
 async def test_run_without_usage_still_reports_zero(

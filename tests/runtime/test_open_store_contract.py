@@ -1,22 +1,21 @@
 """各存储 ``open_*`` 上下文管理器的异常归因契约。
 
-WHY 单独成文件：这条契约由 7 个 ``open_*`` **共同**承担——会话元数据 / 审计日志 /
-API Key / 用量记录 / 技能状态 / 知识库 / 长期记忆。它们各自的业务测试都在自己文件里，
-而约定管的是**同一件事**，逐文件各写一条只能证明写了七遍。
+WHY 单独成文件：这条契约由 6 个 ``open_*`` **共同**承担——会话元数据 / 审计日志 /
+用量记录 / 技能状态 / 知识库 / 长期记忆。它们各自的业务测试都在自己文件里，
+而约定管的是**同一件事**，逐文件各写一条只能证明写了六遍。
 
 WHY 值得单独守：``yield`` 若落在捕获初始化异常的 ``try`` 里，``async with`` 主体
 （调用方的装配或业务代码）抛出的异常也会被接住，记成「<某表> 初始化失败」并附上堆栈。
-实测代价：``python main.py cli`` 在 ``auth_mode=apikey`` 且未设 ``HARNESS_API_KEY``
-时，真正的原因只有一句话，日志里却是 5 条「XX 初始化失败」加 5 份重复堆栈——排查方向
-被引向数据库，而数据库根本没问题。
+实测代价：一次装配失败时，真正的原因只有一句话，日志里却是 5 条「XX 初始化失败」加
+5 份重复堆栈——排查方向被引向数据库，而数据库根本没问题。
 
 两件事各有一条断言：主体异常必须原样传播、不得被误记为初始化失败；真·初始化失败
 （连不上库）必须仍留下「初始化失败」记录——修归因不等于把真故障一并静音。
 
 WHY 在实现已经收敛之后仍然保留本文件：这个结构现在只剩一份实现
-（``runtime/sqlite_lifecycle.py``），本文件因此从"七份副本的共同约定"变成了
+（``runtime/sqlite_lifecycle.py``），本文件因此从"六份副本的共同约定"变成了
 **那份实现的行为规格**——它把最容易在重构中被顺手改坏的那条性质，从注释里的一句话
-变成了会失败的断言。7 个入口逐条参数化也不是形式：入口的差异（知识库要加载向量扩展、
+变成了会失败的断言。6 个入口逐条参数化也不是形式：入口的差异（知识库要加载向量扩展、
 长期记忆要自动提交）恰恰是最可能有人"绕开公共实现"的地方，而绕开之后就没人守它了。
 """
 
@@ -30,7 +29,6 @@ from typing import Any, Callable
 
 import pytest
 
-from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.knowledge_store import open_knowledge_store
 from runtime.skill_store import open_skill_store
@@ -43,7 +41,6 @@ _OpenStore = Callable[[Path], Any]
 _OPENERS: list[tuple[str, _OpenStore]] = [
     ("会话元数据", open_thread_store),
     ("审计日志", open_audit_store),
-    ("API Key", open_api_key_store),
     ("用量记录", open_usage_store),
     ("技能状态", open_skill_store),
     # 向量关闭：本文件验的是异常归因，把 sqlite-vec 能否加载混进来只会引入一条与本约定
@@ -55,7 +52,7 @@ _OPENERS: list[tuple[str, _OpenStore]] = [
     ("长期记忆", open_store),
 ]
 
-# 用一个具名变量承载装饰器：六个实现各写一遍 parametrize 样板会让文件被样板占满，
+# 用一个具名变量承载装饰器：多个实现各写一遍 parametrize 样板会让文件被样板占满，
 # 而真正要读的只有下面两条断言。
 _OPENER_CASES = pytest.mark.parametrize(
     ("label", "open_store"), _OPENERS, ids=[label for label, _ in _OPENERS]

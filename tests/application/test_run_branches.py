@@ -18,8 +18,6 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from application.errors import (
     NotFoundError,
-    OwnershipError,
-    PermissionDeniedError,
     ThreadBusyError,
 )
 from application.run_service import RunService
@@ -29,7 +27,6 @@ from tests.application.test_run_service import (
     FakeGraphFactory,
     _drain,
     _make_service,
-    _principal,
 )
 from tests.conftest import StubSessionRegistry, make_config
 
@@ -154,13 +151,6 @@ def _chunk(text: str = "", **usage: Any) -> tuple[str, Any]:
     if usage:
         message.usage_metadata = usage
     return ("messages", (message, {"langgraph_node": "model"}))
-
-
-def _auth_config(tmp_path: Any) -> Any:
-    """开启认证的配置；会话密钥是构造前置条件，不补会让用例集体失败。"""
-    return make_config(
-        tmp_path, auth_mode="apikey", auth_session_secret="测试用会话密钥" * 8
-    )
 
 
 # ------------------------------------------------------------------ 分叉点
@@ -400,19 +390,9 @@ async def test_regenerate_keeps_the_previous_attempt_usage(
 # ------------------------------------------------------------------ 权限与归属
 
 
-async def test_edit_requires_thread_create_permission(tmp_path, thread_store):
-    """只读角色（viewer）不得改写他人会话的消息。"""
-    service = _make_service(_auth_config(tmp_path), thread_store, BranchingGraph(_chain(2)))
-    await thread_store.create("t1", title="会话", owner_id="alice")
+async def test_edit_rejects_unknown_thread(test_config, thread_store):
+    """改写一个不存在的会话必须报「会话不存在」，而不是凭历史消息凭空跑一轮。"""
+    service = _make_service(test_config, thread_store, BranchingGraph(_chain(2)))
 
-    with pytest.raises(PermissionDeniedError):
-        await service.edit("t1", 0, "不该成功", principal=_principal("alice", "viewer"))
-
-
-async def test_edit_requires_ownership(tmp_path, thread_store):
-    """有权限但不是会话所有者，同样不得改写。"""
-    service = _make_service(_auth_config(tmp_path), thread_store, BranchingGraph(_chain(2)))
-    await thread_store.create("t1", title="会话", owner_id="alice")
-
-    with pytest.raises(OwnershipError):
-        await service.edit("t1", 0, "不该成功", principal=_principal("bob"))
+    with pytest.raises(NotFoundError):
+        await service.edit("missing", 0, "不该成功")

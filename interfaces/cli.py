@@ -12,11 +12,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from application.api_key_auth import record_api_key_auth, validate_api_key
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
-from application.ports import APIKeyRepository, AuditSink
-from application.principal import Principal
 from bootstrap.core import build_app_context
 
 if TYPE_CHECKING:
@@ -147,72 +144,11 @@ def ask_human(payload: dict[str, Any]) -> dict[str, Any]:
     return {"decisions": decisions}
 
 
-async def _validate_api_key_for_cli(
-    config: AppConfig,
-    api_key: str,
-    *,
-    api_key_store: APIKeyRepository | None = None,
-    audit_store: AuditSink | None = None,
-) -> Principal:
-    """校验单个 API Key，返回 Principal；校验失败直接抛异常。
-
-    WHY 保留这层薄封装：CLI 的失败语义是"抛异常让 ``run_cli`` 打印提示并以 2 退出"，
-    而共用实现用 ``principal=None`` 表达失败（Web 侧要的是"按未认证处理"）。
-    两者的差异只在翻译方式上，校验本身已经共用。
-
-    WHY 审计写在这里：失败路径上只有本函数拿得到结果对象——上层只看到一个异常，
-    写不出失败原因，而"为什么失败"正是审计里最有用的一列
-    （存储没装配 vs 凭据无效，处置方式完全不同）。
-    """
-    result = await validate_api_key(
-        api_key, dev_key=config.auth_api_key_dev, store=api_key_store
-    )
-    # WHY entry="cli" 且不传 ip / user_agent：CLI 根本没有这两个字段。不打入口标记的话，
-    # 这条审计在面板上与一次 HTTP 请求长得完全一样——看不出"有人在本机命令行用了这把 Key"。
-    await record_api_key_auth(audit_store, result, entry="cli")
-    if result.principal is None:
-        raise ValueError("HARNESS_API_KEY 无效")
-    return result.principal
-
-
-async def _build_cli_principal(
-    config: AppConfig,
-    *,
-    api_key_store: APIKeyRepository | None = None,
-    audit_store: AuditSink | None = None,
-) -> Principal | None:
-    """根据配置构造认证主体。
-
-    - disabled：返回 ``None``，走匿名兼容路径。
-    - apikey：必须提供 API Key（``HARNESS_API_KEY``，写在 ``.env`` 或同名环境变量里），
-      校验后返回对应主体。
-    """
-    if config.auth_mode == "disabled":
-        return None
-
-    # WHY 从配置对象读而不是直接读 ``os.environ``：``.env`` 里的值只进 ``AppConfig``、
-    # 不进进程环境变量（本项目没有 load_dotenv），读 os.environ 会让「照着
-    # .env.example 配好了却仍提示没配」成为必然。真实环境变量由 pydantic-settings
-    # 以更高优先级读进同一个字段，两种来源都汇到这一处。
-    api_key = config.harness_api_key.strip()
-    if not api_key:
-        raise ValueError(
-            "auth_mode=apikey 时，请在 .env 里设置 HARNESS_API_KEY（或设置同名环境变量）后启动 CLI"
-        )
-    return await _validate_api_key_for_cli(
-        config,
-        api_key,
-        api_key_store=api_key_store,
-        audit_store=audit_store,
-    )
-
-
 async def _run_turn(
     runs: RunService,
     thread_id: str,
     user_input: str,
     *,
-    principal: Principal | None = None,
     model_name: str | None = None,
     workspace: str | None = None,
 ) -> None:
@@ -222,7 +158,6 @@ async def _run_turn(
         runs: 运行服务。
         thread_id: 会话 ID。
         user_input: 本轮输入。
-        principal: 当前主体。
         model_name: 模型别名。
         workspace: 本次启动给出的工作空间（``--workspace``）；``None`` 表示不绑定，
             这条 CLI 会话将使用应用为它创建的专属目录。**只在首轮生效**——第一轮之后
@@ -243,7 +178,6 @@ async def _run_turn(
     events = await runs.stream(
         thread_id,
         user_input,
-        principal=principal,
         model_name=model_name,
         workspace=workspace,
     )
@@ -255,7 +189,7 @@ async def _run_turn(
         # WHY 恢复时同样带上 model_name：中断与恢复是同一次运行的两个半程，
         # 走不同模型会让缓存里多出一个实例，也会让成本与行为出现不可预期偏差。
         # WHY 不再带 workspace：根在第一轮就锁定了，恢复时再传只是重复一个已生效的事实。
-        resumed = await runs.resume(thread_id, decision, principal=principal, model_name=model_name)
+        resumed = await runs.resume(thread_id, decision, model_name=model_name)
         await consume(resumed)
 
 
@@ -284,25 +218,6 @@ async def run_cli(
     # 装配逻辑集中在 bootstrap，两种形态不会出现「一方有审计、另一方没有」
     # 这类难以通过功能测试发现的行为分叉。
     async with build_app_context(config) as context:
-        try:
-            principal = await _build_cli_principal(
-                config,
-                api_key_store=context.api_key_store,
-                # WHY 传的正是 bootstrap 装配的那一份：与 Web 侧同一个对象、同一张表，
-                # 于是两个入口的认证审计可以并排看——这正是本次收敛要的结果。
-                audit_store=context.audit_store,
-            )
-        except ValueError as exc:
-            # WHY 在这里收住而不是让它抛到 main()：密钥缺失或无效属于用户当场就能
-            # 修正的配置问题，抛出去会让终端刷出一份与原因无关的堆栈（还要叠加装配
-            # 退出路径上的日志），真正的一句提示被埋在中间。退出码 2 与「参数错误」
-            # 同义，脚本据此可以区分「配置没给」与「跑起来之后失败」（后者是 1）。
-            print(f"错误：{exc}")
-            print(
-                "提示：在 .env 里设置 HARNESS_API_KEY（本机开发可直接填 AUTH_API_KEY_DEV 的值）；"
-                "生产环境应改用管理面板创建的 Key。"
-            )
-            return 2
         threads = context.threads
         runs = context.runs
         catalog = context.catalog
@@ -347,7 +262,6 @@ async def run_cli(
                 runs,
                 thread_id,
                 user_input,
-                principal=principal,
                 model_name=model_name,
                 workspace=workspace,
             )

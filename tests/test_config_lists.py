@@ -34,7 +34,6 @@ def _config_from_env(tmp_path: Path) -> AppConfig:
     workspace.mkdir(parents=True, exist_ok=True)
     return AppConfig(
         _env_file=tmp_path / "does-not-exist.env",
-        auth_mode="disabled",
         workspace=workspace,
         memory_file=workspace / "AGENTS.md",
         db_path=tmp_path / "agent.db",

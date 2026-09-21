@@ -13,25 +13,9 @@ from runtime.audit_archive import AuditArchive
 from runtime.audit_retention import AuditRetentionWorker
 from runtime.audit_store import AuditStore
 from runtime.interval_worker import IntervalWorker
-from runtime.rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
     from application.run_service import RunService
-
-
-def build_rate_limiter(config: AppConfig) -> RateLimiter:
-    """按配置构造认证端点限流器。
-
-    Args:
-        config: 应用配置，提供窗口长度与窗口内最大请求数。
-    """
-    if config is None:
-        raise ValueError("config 不能为 None")
-
-    return RateLimiter(
-        window_seconds=config.auth_rate_limit_window_seconds,
-        max_attempts=config.auth_rate_limit_max_attempts,
-    )
 
 
 def build_audit_retention_worker(config: AppConfig, audit_store: AuditStore) -> AuditRetentionWorker:

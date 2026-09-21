@@ -112,10 +112,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def _run_cli(config: AppConfig, model_name: str | None, workspace: str | None) -> int:
     from interfaces.cli import run_cli
 
-    # CLI 不监听端口，但「HOST 非回环 + 未启用认证」说明的是部署形态不安全，
-    # 而同一份 .env 通常也用于 Web 形态；在跑 CLI 时就提示，比等暴露之后再
-    # 从别处发现更早。
-    config.warn_if_unauthenticated_exposure()
+    # CLI 不监听端口，但「HOST 非回环」说明的是部署形态不安全，而同一份 .env
+    # 通常也用于 Web 形态；在跑 CLI 时就提示，比等暴露之后再从别处发现更早。
+    config.warn_if_publicly_exposed()
     return asyncio.run(run_cli(config, model_name=model_name, workspace=workspace))
 
 
@@ -127,7 +126,7 @@ def _run_web(config: AppConfig, host: str | None, port: int | None) -> int:
     # 命令行 --host 优先于配置，因此自检必须盯住「最终真正绑定的地址」：
     # 若只检查 config.host，`main.py web --host 0.0.0.0` 恰好绕过了这条检查。
     bind_host = host or config.host
-    config.warn_if_unauthenticated_exposure(bind_host)
+    config.warn_if_publicly_exposed(bind_host)
 
     app = create_app(config)
     try:

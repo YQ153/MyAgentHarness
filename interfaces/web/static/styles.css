@@ -536,33 +536,7 @@ textarea:focus { border-color: var(--accent); }
   .sidebar { display: none; }
 }
 
-/* ---------- 认证状态 ---------- */
-.auth-status {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.auth-status .auth-link {
-  color: var(--accent);
-  text-decoration: none;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-}
-
-.auth-status .auth-link:hover {
-  background: var(--accent-soft);
-}
-
-.auth-status .auth-name {
-  color: var(--text);
-  font-weight: 500;
-}
-
-/* ---------- 管理面板与弹窗 ---------- */
+/* ---------- 弹窗 ---------- */
 .modal {
   position: fixed;
   inset: 0;
@@ -619,92 +593,6 @@ textarea:focus { border-color: var(--accent); }
   color: var(--text);
 }
 
-.modal-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 10px 18px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.modal-tabs .tab {
-  padding: 8px 14px;
-  border: none;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.modal-tabs .tab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-
-.tab-panel {
-  display: none;
-  padding: 16px 18px;
-}
-
-.tab-panel.active {
-  display: block;
-}
-
-.apikey-form {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  gap: 10px 12px;
-  align-items: center;
-  margin-bottom: 16px;
-}
-
-.apikey-form label {
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.apikey-form input,
-.apikey-form select {
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 13px;
-}
-
-.apikey-form button {
-  grid-column: 2;
-  justify-self: start;
-}
-
-.apikey-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.apikey-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #fbfcfd;
-}
-
-.apikey-meta {
-  font-size: 12px;
-  color: var(--text);
-  word-break: break-all;
-}
-
-.admin-empty {
-  padding: 20px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 13px;
-}
-
 button.danger {
   background: #fee2e2;
   border-color: #fecaca;
@@ -718,69 +606,6 @@ button.danger:hover {
 button.small {
   padding: 4px 10px;
   font-size: 12px;
-}
-
-.apikey-value-wrap {
-  display: flex;
-  gap: 8px;
-  padding: 0 18px 18px;
-}
-
-.apikey-value-wrap input {
-  flex: 1;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-}
-
-.hint,
-.copy-msg {
-  padding: 0 18px;
-  margin: 0 0 10px;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.copy-msg {
-  color: var(--ok);
-  min-height: 18px;
-}
-
-/* ---------- API Key 凭据对话框 ---------- */
-.auth-form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 0 18px 6px;
-}
-
-.auth-form label {
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.auth-form input {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-}
-
-.auth-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
-.auth-msg {
-  margin: 0;
-  padding: 0 18px 14px;
-  font-size: 13px;
-  min-height: 18px;
-  color: var(--danger);
 }
 
 .audit-toolbar {

@@ -19,7 +19,7 @@ import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from application.audit_context import audit_client_info, audit_trace_id
+from application.audit_context import LOCAL_ACTOR_ID, audit_client_info, audit_trace_id
 from application.dto import (
     WorkspaceEntryInfo,
     WorkspaceFileContent,
@@ -36,7 +36,6 @@ from runtime.workspace_files import (
 
 if TYPE_CHECKING:
     from application.ports import AuditLog
-    from application.principal import Principal
     from config import AppConfig, SessionRoot
 
 logger = logging.getLogger(__name__)
@@ -45,8 +44,13 @@ KIND_TEXT = "text"
 KIND_IMAGE = "image"
 KIND_BINARY = "binary"
 KIND_TOO_LARGE = "too_large"
+"""``WorkspaceFileContent.kind`` 的四个取值，也就是与前端的渲染约定。
 
-_ANONYMOUS_ACTOR = "anonymous"
+WHY 集中成模块级常量：前端按取值分派四条分支（按文本展示 / 按图片内联 / 提示无法
+预览 / 提示文件过大），而它们同时出现在 ``__all__`` 与接口响应里；散落成字面量时，
+改一处漏一处只会让某个取值悄悄失去渲染分支，而那种失效不报任何错。
+"""
+
 _BYTES_PER_CHAR = 4
 """由字符窗口换算读取字节数的系数（UTF-8 单字符最多 4 字节）。"""
 
@@ -87,14 +91,11 @@ class WorkspaceService:
         self._audit_store = audit_store
         logger.info("WorkspaceService 就绪：root=%s mounts=%d", self._root, len(self._mounts))
 
-    async def list_dir(
-        self, virtual_path: str = "/", principal: Principal | None = None
-    ) -> WorkspaceListing:
+    async def list_dir(self, virtual_path: str = "/") -> WorkspaceListing:
         """列出工作区内一级目录。
 
         Args:
             virtual_path: 虚拟路径，``/`` 表示工作区根。
-            principal: 当前主体；仅用于审计归属（本方法不落审计）。
 
         Returns:
             目录项清单（目录在前）。
@@ -135,7 +136,7 @@ class WorkspaceService:
         )
 
     async def read_file(
-        self, virtual_path: str, principal: Principal | None = None, *, offset: int = 0
+        self, virtual_path: str, *, offset: int = 0
     ) -> WorkspaceFileContent:
         """读取一个文件，返回一段文本、图片 data URL 或降级标记。
 
@@ -147,7 +148,6 @@ class WorkspaceService:
 
         Args:
             virtual_path: 文件虚拟路径。
-            principal: 当前主体，用于审计归因。
             offset: 起始字符偏移；由前一次响应的 ``offset + len(text)`` 得到。
 
         Returns:
@@ -182,7 +182,7 @@ class WorkspaceService:
         if size > self._config.workspace_file_max_bytes:
             # 只回大小不回正文：调用方（界面）要展示「它有多大」，
             # 而把整份内容读进内存再丢弃是纯粹的浪费。
-            await self._audit("file_read", actor_id=self._actor(principal), path=normalized)
+            await self._audit("file_read", actor_id=LOCAL_ACTOR_ID, path=normalized)
             return WorkspaceFileContent(
                 path=normalized,
                 name=target.name,
@@ -197,7 +197,7 @@ class WorkspaceService:
         data, total, _ = await asyncio.to_thread(
             read_bytes_capped, target, max_bytes=window_bytes
         )
-        await self._audit("file_read", actor_id=self._actor(principal), path=normalized)
+        await self._audit("file_read", actor_id=LOCAL_ACTOR_ID, path=normalized)
 
         if offset == 0:
             # 类型判定只在第一页做：续取时类型早已确定，重复判定没有信息增量
@@ -241,10 +241,6 @@ class WorkspaceService:
         )
 
     # ------------------------------------------------------------------ 内部
-
-    def _actor(self, principal: Principal | None) -> str:
-        """审计主体标识；认证关闭时与其它服务保持同一口径。"""
-        return principal.user_id if principal else _ANONYMOUS_ACTOR
 
     def _mime_of(self, target: Path) -> str:
         """按扩展名推断 MIME；命中不到的按文本处理。"""

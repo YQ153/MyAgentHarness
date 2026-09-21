@@ -83,21 +83,12 @@ async def _main() -> int:
     failures: list[str] = []
     skipped = False
 
-    # WHY 需要凭据：本机 .env 常是 ``AUTH_MODE=apikey``，而附件端点带权限依赖。
-    # 用开发用 key 而不是伪造主体——脚本要验证的是真实鉴权链路上的行为。
-    headers: dict[str, str] = {}
-    if config.auth_mode != "disabled":
-        if not config.auth_api_key_dev:
-            print("[SKIP] 认证已启用但未配置 AUTH_API_KEY_DEV，无法在无凭据的情况下验收")
-            return 2
-        headers[config.auth_api_key_header] = config.auth_api_key_dev
-
     # WHY 手动进入 lifespan：httpx 的 ASGITransport 不会代跑它，而附件服务、数据库
     # 与检查点都只在 lifespan 里装配；不跑就会得到一屏「服务未初始化」的 503。
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://smoke", timeout=120.0, headers=headers
+            transport=transport, base_url="http://smoke", timeout=120.0
         ) as http:
             print("=== 1. 上限查询 ===")
             limits_response = await http.get("/api/attachments/limits")

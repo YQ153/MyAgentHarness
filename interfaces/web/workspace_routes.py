@@ -5,9 +5,6 @@
 - **只读**。文件面板不提供写入 / 删除——它要回答的是「Agent 产出了什么」。
   写入能力留在 Agent 自己的文件工具里（那条路径受权限与审批链约束），
   在这里再开一个入口等于多出一条绕过该链的写路径。
-- **权限复用 ``file:read``**（``member`` 已持有）。不为面板单造一项权限：面板要
-  展示的正是 Agent 能读的东西，两套语义漂开之后就会出现「Agent 读得到、面板看
-  不到」这种自相矛盾的状态。
 - **路径一律用虚拟路径**（``/react-vite-app/src/main.jsx``）。越界判定在服务层，
   路由只负责把失败映射成状态码。
 """
@@ -20,9 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from application.dto import WorkspaceFileContent, WorkspaceInfo, WorkspaceListing
 from application.errors import NotFoundError
-from application.principal import Principal
 from application.workspace_service import WorkspaceService
-from interfaces.web.auth import require_permission
 from interfaces.web.deps import describe_session_root, resolve_scoped_services
 
 logger = logging.getLogger(__name__)
@@ -61,7 +56,6 @@ async def get_workspace_info(
     workspace: str | None = Query(
         default=None, description="仅在该会话尚未锁定时生效（草稿态预览就是这种情况）"
     ),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> WorkspaceInfo:
     """返回当前会话文件根的信息。
 
@@ -71,9 +65,6 @@ async def get_workspace_info(
 
     比路径多出来的两个字段各有用途：``bound`` 让界面说清这是「工作空间」还是「本会话
     专属目录」，``locked`` 让界面在首条消息之后不再提供更换入口。
-
-    权限与文件面板同口径（``file:read``）：它暴露的是文件系统的绝对路径，
-    属于文件可见性的一部分，不该另开一项权限让两套语义漂开。
     """
     return await describe_session_root(request, thread_id=thread_id, requested=workspace)
 
@@ -82,7 +73,6 @@ async def get_workspace_info(
 async def list_workspace_files(
     path: str = Query(default="/", description="目录的虚拟路径，/ 表示工作区根"),
     service: WorkspaceService = Depends(get_workspace),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> WorkspaceListing:
     """列出工作区内一级目录（懒加载：前端按需展开下一层）。
 
@@ -90,7 +80,7 @@ async def list_workspace_files(
     让真正需要留痕的读取记录淹没在里面。
     """
     try:
-        return await service.list_dir(path, principal)
+        return await service.list_dir(path)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -109,7 +99,6 @@ async def read_workspace_file(
     path: str = Query(description="文件的虚拟路径"),
     offset: int = Query(default=0, ge=0, description="起始字符偏移，用于续取大文件/长工具输出"),
     service: WorkspaceService = Depends(get_workspace),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> WorkspaceFileContent:
     """读取一个文件，返回一段文本、图片 data URL，或降级标记。
 
@@ -118,7 +107,7 @@ async def read_workspace_file(
     即可拼出完整内容——「查看完整输出」用的就是这条路径。
     """
     try:
-        return await service.read_file(path, principal, offset=offset)
+        return await service.read_file(path, offset=offset)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:

@@ -22,7 +22,7 @@ from application.audit_context import (
     bind_request_context,
     reset_request_context,
 )
-from interfaces.web.auth.utils import client_ip, user_agent
+from interfaces.web.deps import client_ip, user_agent
 
 logger = logging.getLogger(__name__)
 

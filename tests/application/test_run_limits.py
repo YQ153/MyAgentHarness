@@ -21,11 +21,8 @@ from tests.application.test_run_service import (
     SlowGraph,
     _drain,
     _make_service,
-    _principal,
 )
 from tests.conftest import make_config
-
-_AUTH_SECRET = "测试用会话密钥" * 8
 
 
 def _limited_service(tmp_path: Any, store: Any, **overrides: Any) -> RunService:
@@ -119,50 +116,25 @@ async def test_concurrent_acquisitions_never_exceed_the_cap(tmp_path, thread_sto
     assert service.rejected_runs == 9
 
 
-# ------------------------------------------------------------------ 按用户限流
+# ------------------------------------------------------------------ 运行限流
 
 
-async def test_rate_limit_is_per_user(tmp_path, thread_store):
-    """一个人被限流，不该影响另一个人。"""
+async def test_rate_limit_applies_to_the_single_identity(tmp_path, thread_store):
+    """窗口内超过上限的运行被拒绝：所有请求属于同一个人，共用一个计数桶。"""
     service = _limited_service(
         tmp_path,
         thread_store,
-        auth_mode="apikey",
-        auth_session_secret=_AUTH_SECRET,
         max_concurrent_runs=0,
         run_rate_limit_window_seconds=60,
-        run_rate_limit_max_attempts=1,
-    )
-    alice = _principal("alice")
-    bob = _principal("bob")
-
-    held = await service.stream("t1", "alice 的第一轮", principal=alice)
-
-    with pytest.raises(RunRejectedError) as info:
-        await service.stream("t2", "alice 的第二轮", principal=alice)
-
-    assert info.value.reason == REASON_RATE
-
-    # 换个人照样能进：限流的键是主体，不是进程级的总闸
-    other = await service.stream("t3", "bob 的第一轮", principal=bob)
-
-    await _drain(held)
-    await _drain(other)
-
-
-async def test_disabled_auth_rate_limits_as_one_anonymous_user(tmp_path, thread_store):
-    """认证关闭时所有请求落到同一个匿名主体，限流仍然生效。"""
-    service = _limited_service(
-        tmp_path,
-        thread_store,
-        max_concurrent_runs=0,
         run_rate_limit_max_attempts=1,
     )
 
     held = await service.stream("t1", "第一轮")
 
-    with pytest.raises(RunRejectedError):
+    with pytest.raises(RunRejectedError) as info:
         await service.stream("t2", "第二轮")
+
+    assert info.value.reason == REASON_RATE
 
     await _drain(held)
 

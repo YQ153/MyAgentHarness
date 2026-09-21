@@ -1,11 +1,11 @@
 """容器化交付的静态契约。
 
 WHY 用静态断言而不是「构建一次镜像」：跑 Docker 不是每台机器、每次 CI 都有的能力，
-而这些承诺（非 root、探活打哪、默认开不开认证、密钥不进镜像层）全部写在文本里，
+而这些承诺（非 root、探活打哪、端口只绑回环、密钥不进镜像层）全部写在文本里，
 静态断言恰好能钉住它们，且在任意环境都能跑。
 
 WHY 值得钉：这几条一旦被改坏，症状都不会立刻出现在测试里——以 root 运行、探活改成
-查依赖、认证退回 disabled、`.env` 被打进镜像层，都是「部署之后才发现」的类型。
+查依赖、端口默认暴露到局域网、`.env` 被打进镜像层，都是「部署之后才发现」的类型。
 """
 
 from __future__ import annotations
@@ -46,13 +46,9 @@ def test_secrets_are_excluded_from_build_context() -> None:
     assert ".env" in dockerignore
 
 
-def test_compose_keeps_authentication_on_and_persists_state() -> None:
+def test_compose_persists_state_in_one_volume() -> None:
     compose = _read("docker-compose.yml")
 
-    # WHY 默认必须是 apikey：容器会把端口映射到宿主机，网络边界比本机进程宽得多，
-    # 跟随本机开发配置（disabled）等于把 Agent 交给任何能连上该端口的人。
-    # 注意断言的是「带默认值的可覆盖形式」——改回硬编码会让本机排查时无法临时覆盖。
-    assert "${AUTH_MODE:-apikey}" in compose
     assert "/app/.data" in compose
     # WHY 断的是「会话专属目录也在那个卷里」：不绑定工作空间的会话，其文件根落在
     # SESSIONS_ROOT 下——它必须在可写卷里，否则容器重建一次，那些会话的产物就没了，
@@ -77,11 +73,4 @@ def test_identity_provider_does_not_mount_the_docker_socket() -> None:
     # 而 `"docker.sock" not in compose` 会把那句注释判成违规——一条会把正确行为判失败的
     # 断言比没有断言更糟。带冒号的容器侧路径只在真正的 volume 映射里出现。
     assert ":/var/run/docker.sock" not in compose
-
-
-def test_auth_mode_is_overridable_and_defaults_to_apikey() -> None:
-    compose = _read("docker-compose.yml")
-
-    # 默认仍是 apikey（容器化不裸奔）；要改必须由 .env 显式决定，而不是改编排文件
-    assert "${AUTH_MODE:-apikey}" in compose
 

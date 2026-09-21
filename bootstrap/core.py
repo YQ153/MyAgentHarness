@@ -25,7 +25,6 @@ from application.session_registry import SessionRegistry
 from bootstrap.context import AppContext
 from config import AppConfig
 from knowledge_runtime import close_service, ensure_service
-from runtime.api_key_store import open_api_key_store
 from runtime.audit_store import open_audit_store
 from runtime.checkpointer import checkpointer_context
 from runtime.skill_store import open_skill_store
@@ -64,7 +63,6 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         checkpointer_context(config.db_path) as checkpointer,
         open_thread_store(config.db_path) as thread_store,
         open_audit_store(config.db_path) as audit_store,
-        open_api_key_store(config.db_path) as api_key_store,
         open_usage_store(config.db_path) as usage_store,
         # 技能启停状态与其余元数据同库：它没有独立的生命周期诉求（不像知识库要加载
         # 向量扩展、且要能整库重建），故沿用「一个 db_path 装全部元数据」的既有约定。
@@ -131,7 +129,6 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
             checkpointer=checkpointer,
             thread_store=thread_store,
             audit_store=audit_store,
-            api_key_store=api_key_store,
             graph_factory=graph_factory,
             threads=ThreadService(
                 config,
@@ -171,10 +168,9 @@ async def build_app_context(config: AppConfig) -> AsyncIterator[AppContext]:
         )
 
         logger.info(
-            "核心依赖装配完成：db=%s sessions_root=%s auth_mode=%s tools=%d",
+            "核心依赖装配完成：db=%s sessions_root=%s tools=%d",
             config.db_path,
             config.resolved_sessions_root,
-            config.auth_mode,
             len(tool_bundle.tools),
         )
         # 注：知识库的向量能力不再在这里报告——它按根各有一份，启动时一个都没装配。

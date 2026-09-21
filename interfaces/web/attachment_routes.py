@@ -2,10 +2,8 @@
 
 约定：
 
-- **归属校验在服务层**：路由只负责把失败映射成状态码，「这个会话归不归你」只有
-  一处判定（``application.ownership.ensure_thread_access``）。
-- **上传是写操作**，因此用 ``attachment:write`` 而不是 ``file:read``；读取清单沿用
-  ``file:read``（与文件面板同一口径——附件本来就存在工作区里）。
+- **会话存在性判定在服务层**：路由只负责把失败映射成状态码，「这个会话存不存在」
+  只有一处判定（``AttachmentService._require_thread``）。
 - **大小上限在读请求体时就要生效**：``UploadFile`` 会把大文件落到临时文件，等
   服务层再判超限时，磁盘与带宽已经付出去了。这里的截断读取是内存与磁盘的第一道闸，
   服务层的判定是第二道（它同时覆盖非 HTTP 调用方）。
@@ -29,8 +27,6 @@ from fastapi import (
 from application.attachment_service import AttachmentService, attachment_limits
 from application.dto import AttachmentInfo, AttachmentLimits, AttachmentListResult
 from application.errors import NotFoundError
-from application.principal import Principal
-from interfaces.web.auth import require_permission
 from interfaces.web.deps import resolve_scoped_services
 from interfaces.web.schemas import AttachmentDeleteResponse
 
@@ -104,18 +100,13 @@ async def _read_upload(upload: UploadFile, max_bytes: int) -> bytes:
 
 
 @router.get("/api/attachments/limits", response_model=AttachmentLimits)
-async def get_attachment_limits(
-    request: Request,
-    principal: Principal = Depends(require_permission("file:read")),
-) -> AttachmentLimits:
+async def get_attachment_limits(request: Request) -> AttachmentLimits:
     """返回当前生效的附件上限。
 
     WHY 与具体会话、甚至与任何文件根都解耦：上限来自进程配置，前端要在用户**选择文件的
     那一刻**就提示「太大 / 类型不支持」。若只能按会话取，这条提示就永远晚一步——用户要
     等到上传失败才知道；而若为此去解析一个会话根，一个纯配置查询会在「会话还没有根」
     时变成 409（草稿态第一次打开就撞上）。
-
-    权限仍与文件面板同口径（``file:read``）：它属于「这个部署接受什么」这类信息。
     """
     return attachment_limits(request.app.state.config)
 
@@ -125,7 +116,6 @@ async def upload_attachment(
     thread_id: str,
     file: UploadFile = File(description="要上传的图片文件"),
     service: AttachmentService = Depends(get_attachments),
-    principal: Principal = Depends(require_permission("attachment:write")),
 ) -> AttachmentInfo:
     """上传一个附件。
 
@@ -144,7 +134,6 @@ async def upload_attachment(
             filename=file.filename or "",
             mime_type=file.content_type or "",
             data=data,
-            principal=principal,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -161,7 +150,6 @@ async def upload_attachment(
 async def list_attachments(
     thread_id: str,
     service: AttachmentService = Depends(get_attachments),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> AttachmentListResult:
     """列出某会话的附件清单及其上限。
 
@@ -169,7 +157,7 @@ async def list_attachments(
     而不是等上传失败；让它多打一次接口只会多一条配置漂移的路径。
     """
     try:
-        return await service.list(thread_id, principal)
+        return await service.list(thread_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -189,7 +177,6 @@ async def delete_attachment(
     thread_id: str,
     attachment_id: str,
     service: AttachmentService = Depends(get_attachments),
-    principal: Principal = Depends(require_permission("attachment:write")),
 ) -> AttachmentDeleteResponse:
     """删除一个附件。
 
@@ -197,7 +184,7 @@ async def delete_attachment(
     误操作顶到上限、再也传不进去。删除是幂等的：不存在时返回 200 且 ``deleted=false``。
     """
     try:
-        removed = await service.delete(thread_id, attachment_id, principal)
+        removed = await service.delete(thread_id, attachment_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:

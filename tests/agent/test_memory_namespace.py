@@ -23,7 +23,6 @@ from agent.run_context import (
     memory_owner_of,
     namespace_of_runtime,
 )
-from application.principal import ANONYMOUS_PRINCIPAL
 from tests.conftest import make_config, make_root
 
 
@@ -65,15 +64,6 @@ def test_namespace_is_scoped_by_user():
 @pytest.mark.parametrize("value", [None, "", "   "])
 def test_namespace_falls_back_to_anonymous(value):
     assert memory_namespace(value) == (MEMORY_NAMESPACE_ROOT, ANONYMOUS_USER_ID)
-
-
-def test_anonymous_principal_shares_one_pool():
-    """认证关闭时，接口层的匿名主体必须与命名空间兜底是同一个池子。
-
-    WHY 断言相等而不是各写一份：两处字面量一旦漂移，会得到「Web 写的记忆
-    CLI 读不到」这种现象——功能没坏，但用户会觉得记忆随机丢失。
-    """
-    assert ANONYMOUS_PRINCIPAL.user_id == ANONYMOUS_USER_ID
 
 
 @pytest.mark.parametrize(

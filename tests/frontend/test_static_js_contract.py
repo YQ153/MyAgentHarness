@@ -145,7 +145,6 @@ def test_static_scripts_are_discovered() -> None:
 
     assert {
         "app.js",
-        "auth_credential.js",
         "markdown.js",
         "workspace_scope.js",
     } <= names, sorted(names)

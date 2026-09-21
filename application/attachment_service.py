@@ -20,10 +20,9 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from application.audit_context import audit_client_info, audit_trace_id
+from application.audit_context import LOCAL_ACTOR_ID, audit_client_info, audit_trace_id
 from application.dto import AttachmentInfo, AttachmentLimits, AttachmentListResult
 from application.errors import NotFoundError, VisionUnsupportedError
-from application.ownership import ensure_thread_access
 from runtime.attachments import (
     AttachmentError,
     AttachmentRecord,
@@ -37,14 +36,10 @@ from thread_utils import normalize_thread_id
 
 if TYPE_CHECKING:
     from application.ports import AuditLog, ThreadMetadataReader
-    from application.principal import Principal
     from config import AppConfig, SessionRoot
     from llm.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
-
-_ANONYMOUS_ACTOR = "anonymous"
-"""未认证时的审计主体标识；与 ``WorkspaceService`` 保持同一口径。"""
 
 IMAGE_BLOCK_TYPE = "image_url"
 """多模态内容里图片块的类型名。
@@ -96,7 +91,7 @@ class AttachmentService:
             scope: 本实例服务的工作区；**必填**。附件落在 ``<工作区>/.attachments/``
                 下，指向别的工作区会让「上一条消息引用的图」在新会话里找不到。
             registry: 模型注册表，用于判定目标模型是否接受图片。
-            thread_store: 会话元数据存储，用于归属校验。
+            thread_store: 会话元数据存储，用于确认会话存在。
             audit_store: 审计存储；``None`` 表示不落审计（测试与无库场景）。
 
         Raises:
@@ -109,7 +104,7 @@ class AttachmentService:
         if registry is None:
             raise ValueError("registry 不能为 None：模型能力判定依赖它")
         if thread_store is None:
-            raise ValueError("thread_store 不能为 None：归属校验依赖它")
+            raise ValueError("thread_store 不能为 None：会话存在性判定依赖它")
 
         self._config = config
         self._registry = registry
@@ -127,15 +122,14 @@ class AttachmentService:
         """当前生效的附件上限。"""
         return attachment_limits(self._config)
 
-    async def list(self, thread_id: str, principal: Principal | None = None) -> AttachmentListResult:
+    async def list(self, thread_id: str) -> AttachmentListResult:
         """列出某会话的附件。
 
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
         """
-        normalized = await self._ensure_ownership(thread_id, principal)
+        normalized = await self._require_thread(thread_id)
         records = await asyncio.to_thread(list_attachments, self._root, normalized)
         return AttachmentListResult(
             thread_id=normalized,
@@ -152,7 +146,6 @@ class AttachmentService:
         filename: str,
         mime_type: str,
         data: bytes,
-        principal: Principal | None = None,
     ) -> AttachmentInfo:
         """保存一个附件。
 
@@ -161,7 +154,6 @@ class AttachmentService:
             filename: 上传时的原始文件名（仅用于展示）。
             mime_type: 调用方声明的 MIME；不在白名单内直接拒绝。
             data: 字节内容。
-            principal: 当前主体。
 
         Returns:
             写入后的附件信息。
@@ -169,12 +161,11 @@ class AttachmentService:
         Raises:
             ValueError: 内容为空 / 超限、MIME 不受支持、附件数已达上限、会话 ID 非法。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
             RuntimeError: 落盘失败。
         """
-        # WHY 允许认领未登记的会话：Web 前端会先 ``POST /api/threads`` 取一个 ID，
+        # WHY 允许尚未登记的会话：Web 前端会先 ``POST /api/threads`` 取一个 ID，
         # 元数据要到首轮运行才落库。若这里强制要求已登记，用户就无法在首轮带附件。
-        normalized = await self._ensure_ownership(thread_id, principal, allow_claim=True)
+        normalized = await self._require_thread(thread_id, allow_claim=True)
 
         blob = self._validate_payload(mime_type, data)
 
@@ -201,12 +192,10 @@ class AttachmentService:
                 logger.exception("附件落盘失败：thread=%s filename=%s", normalized, filename)
                 raise RuntimeError(f"附件保存失败：{exc}") from exc
 
-        await self._audit_upload(record, principal)
+        await self._audit_upload(record)
         return attachment_info(record)
 
-    async def delete(
-        self, thread_id: str, attachment_id: str, principal: Principal | None = None
-    ) -> bool:
+    async def delete(self, thread_id: str, attachment_id: str) -> bool:
         """删除一个附件。
 
         Returns:
@@ -215,10 +204,9 @@ class AttachmentService:
         Raises:
             ValueError: ``thread_id`` / ``attachment_id`` 非法。
             NotFoundError: 会话不存在。
-            OwnershipError: 无权访问该会话。
             RuntimeError: 删除失败。
         """
-        normalized = await self._ensure_ownership(thread_id, principal)
+        normalized = await self._require_thread(thread_id)
         try:
             removed = await asyncio.to_thread(
                 delete_attachment, self._root, normalized, attachment_id
@@ -230,7 +218,7 @@ class AttachmentService:
             raise RuntimeError(f"附件删除失败：{exc}") from exc
         return removed
 
-    # ------------------------------------------------------- 消息内容构造
+    # ------------------------------------------------------------------ 消息内容构造
 
     async def build_user_content(
         self,
@@ -239,7 +227,6 @@ class AttachmentService:
         attachment_ids: list[str],
         *,
         model_name: str | None = None,
-        principal: Principal | None = None,
     ) -> str | list[dict[str, Any]]:
         """把文本与附件拼成一条用户消息的内容。
 
@@ -252,7 +239,6 @@ class AttachmentService:
             text: 用户输入的文本（已由调用方去空白）。
             attachment_ids: 要携带的附件 ID 列表；空列表表示纯文本。
             model_name: 目标模型别名；``None`` 表示默认模型。
-            principal: 当前主体。
 
         Returns:
             纯文本（无附件）或多模态内容块列表。
@@ -260,11 +246,10 @@ class AttachmentService:
         Raises:
             ValueError: 附件 ID 列表非法、或数量超出上限。
             NotFoundError: 会话或某个附件不存在。
-            OwnershipError: 无权访问该会话。
             VisionUnsupportedError: 目标模型不接受图片输入。
             KeyError: 模型别名未注册。
         """
-        normalized = await self._ensure_ownership(thread_id, principal, allow_claim=True)
+        normalized = await self._require_thread(thread_id, allow_claim=True)
         ids = _normalize_attachment_ids(attachment_ids)
         if not ids:
             return text
@@ -336,24 +321,24 @@ class AttachmentService:
         key = model_name or self._registry.default_name
         raise VisionUnsupportedError(key, capable)
 
-    async def _ensure_ownership(
-        self, thread_id: str, principal: Principal | None, *, allow_claim: bool = False
-    ) -> str:
-        """校验会话归属，返回规范化后的会话 ID。
+    async def _require_thread(self, thread_id: str, *, allow_claim: bool = False) -> str:
+        """确认会话存在，返回规范化后的会话 ID。
+
+        Args:
+            thread_id: 会话 ID。
+            allow_claim: 允许会话尚未登记（首轮消息之前上传附件的场景）。
 
         Raises:
             ValueError: ``thread_id`` 非法。
             NotFoundError: 会话不存在且 ``allow_claim=False``。
-            OwnershipError: 无权访问。
         """
         normalized = normalize_thread_id(thread_id)
         record = await self._thread_store.get(normalized)
-        ensure_thread_access(
-            record, normalized, self._config, principal, allow_claim=allow_claim
-        )
+        if record is None and not allow_claim:
+            raise NotFoundError("会话", normalized)
         return normalized
 
-    async def _audit_upload(self, record: AttachmentRecord, principal: Principal | None) -> None:
+    async def _audit_upload(self, record: AttachmentRecord) -> None:
         """写一条上传审计（含元信息，**不含内容**）。
 
         WHY 审计失败不上抛：与 ``WorkspaceService._audit`` 同一取舍——一次成功的
@@ -365,7 +350,7 @@ class AttachmentService:
         try:
             await self._audit_store.log(
                 event_type="attachment_upload",
-                actor_id=principal.user_id if principal else _ANONYMOUS_ACTOR,
+                actor_id=LOCAL_ACTOR_ID,
                 target_id=record.path,
                 action="write",
                 outcome="success",

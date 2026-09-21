@@ -255,7 +255,7 @@ class RunBranchService:
             origin: 分支来源标记（``edit`` / ``regenerate``）。
             label: 人可读的分支名。
             model_name: 模型别名；``None`` 表示默认模型。
-            owner_id: 会话所有者；认证关闭时为空串。
+            owner_id: 会话所有者；本应用不区分用户，固定为空串。
             actor_id: 发起本轮运行的主体标识。
 
         Returns:

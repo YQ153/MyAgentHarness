@@ -1,7 +1,6 @@
 """技能端点的回归测试。
 
-覆盖面：清单与诊断字段、启停真的改变了视图、未知技能名 404、以及
-``skill:write`` 只归管理员（技能集全应用共享，停用会影响所有人）。
+覆盖面：清单与诊断字段、启停真的改变了视图、未知技能名 404、以及请求体校验。
 
 WHY 用 httpx 的 ASGITransport 而不是 ``TestClient``：与知识库、附件端点同一理由——
 这些用例要读真实的 ``SkillStateStore``（异步连接），而 ``TestClient`` 自带事件循环。
@@ -16,7 +15,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from application.principal import ROLE_PERMISSIONS
 from application.skill_service import SkillService
 from config import AppConfig
 from interfaces.web.skill_routes import router
@@ -186,19 +184,3 @@ async def test_missing_body_field_is_rejected(api: tuple[httpx.AsyncClient, AppC
     response = await http.patch("/api/skills/code-review", params=_SESSION, json={})
 
     assert response.status_code == 422
-
-
-# --------------------------------------------------------------- 权限
-
-
-def test_skill_pair_is_split_between_roles() -> None:
-    """查看清单归成员，启停**只归管理员**。
-
-    WHY：技能集是全应用共享的一份（物化视图在工作区里只有一个），启停影响所有人。
-    给了 member，任何一个成员都能把别人依赖的技能停掉，而受害者的表现是「Agent 忽然
-    不会做某件事」且无迹可查。
-    """
-    assert "skill:read" in ROLE_PERMISSIONS["member"]
-    assert "skill:write" not in ROLE_PERMISSIONS["member"]
-    assert "skill:read" not in ROLE_PERMISSIONS["viewer"]
-    assert "skill:write" in ROLE_PERMISSIONS["admin"]

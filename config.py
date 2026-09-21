@@ -937,29 +937,6 @@ class AppConfig(BaseSettings):
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"
 
-    # ---------------- 认证与鉴权 ----------------
-    auth_mode: Literal["disabled", "apikey"] = "disabled"
-    """认证模式。
-
-    ``disabled``：不校验身份（仅推荐本地开发）。
-    ``apikey``：API Key 认证，适合 CLI、脚本与集成方。
-    """
-
-    # API Key 模式
-    auth_api_key_header: str = "X-API-Key"
-    auth_api_key_dev: str = Field(default="", repr=False)
-    """开发用 API Key；生产环境应使用可轮换的 key store，禁止长期单 key。"""
-
-    harness_api_key: str = Field(default="", repr=False)
-    """CLI 在 ``apikey`` 模式下出示的凭据（``python main.py cli``）。
-
-    WHY 做成配置字段而不是让 CLI 自己读 ``os.environ``：``.env`` 的值只进
-    ``AppConfig``、**不进**进程环境变量，CLI 若直接摸 ``os.environ``，
-    「照着 .env.example 配好了却仍提示没配」就是必然结果。同名的真实环境变量
-    照样生效——pydantic-settings 中环境变量的优先级高于 ``.env``，因此容器里
-    ``docker compose exec -e HARNESS_API_KEY=...`` 的写法不受影响。
-    """
-
     # 审计保留
     audit_retention_days: int = Field(default=180, ge=1)
     """审计日志保留天数；超期的记录会被定期清理任务删除。
@@ -1014,11 +991,6 @@ class AppConfig(BaseSettings):
     WHY 需要上限：窗口越大扫描的记录越多，无上限的接口可以被用来发起
     一次全表聚合，进而拖慢同一数据库上的会话读写。
     """
-
-    # 认证端点限流
-    auth_rate_limit_window_seconds: int = Field(default=60, ge=1)
-    auth_rate_limit_max_attempts: int = Field(default=10, ge=1)
-    """单 IP 在窗口内允许的最大认证请求数（login/callback/apikey 校验）。"""
 
     # 运行并发与限流
     max_concurrent_runs: int = Field(default=4, ge=0)
@@ -1240,12 +1212,12 @@ class AppConfig(BaseSettings):
             return value.strip() or None
         return value
 
-    def warn_if_unauthenticated_exposure(self, effective_host: str | None = None) -> bool:
-        """绑定非回环地址且未启用认证时，输出 ERROR 级告警。
+    def warn_if_publicly_exposed(self, effective_host: str | None = None) -> bool:
+        """绑定非回环地址时，输出 ERROR 级告警。
 
         WHY 告警而不是拒绝启动：本项目默认绑定 ``127.0.0.1``，硬拒绝会让
         「改绑内网地址做联调」这类正当场景被误伤；要消除的只是「静默」——
-        一旦服务对非本机可达且没有任何认证，任何能访问该地址的客户端都能
+        服务不再区分调用方，一旦它对非本机可达，任何能访问该地址的客户端都能
         直接使用 ``execute`` 等工具，操作者必须有机会看见这件事。
 
         WHY 接受 ``effective_host`` 覆盖：``python main.py web --host`` 的
@@ -1256,8 +1228,7 @@ class AppConfig(BaseSettings):
             effective_host: 实际生效的监听地址；``None`` 表示取 ``self.host``。
 
         Returns:
-            True 表示已发出告警（非回环 + 未启用认证）；False 表示无需告警
-            （绑定回环，或已启用认证）。
+            True 表示已发出告警（绑定非回环）；False 表示无需告警（绑定回环）。
 
         Raises:
             ValueError: ``effective_host`` 既非 ``None`` 也非字符串。
@@ -1267,18 +1238,14 @@ class AppConfig(BaseSettings):
             logger.error("%s", msg)
             raise ValueError(msg)
 
-        if self.auth_mode != "disabled":
-            # 已启用认证就不属于「未认证暴露」；此处若也告警，告警会失去指向性
-            return False
-
         bind_host = self.host if effective_host is None else effective_host
         if is_loopback_host(bind_host):
             return False
 
         logger.error(
-            "未认证暴露风险：监听地址 %r 不是本机回环，且 AUTH_MODE=disabled——"
-            "任何能访问该地址的客户端都可直接使用本服务（含 execute 工具）；"
-            "请改绑 127.0.0.1，或设置 AUTH_MODE=apikey",
+            "对外暴露风险：监听地址 %r 不是本机回环——任何能访问该地址的客户端"
+            "都可直接使用本服务（含 execute 工具）；请改绑 127.0.0.1，"
+            "或在有访问控制的网络边界之后运行",
             bind_host,
         )
         return True

@@ -313,11 +313,11 @@ async def test_index_truncates_chunks_beyond_cap(tmp_path: Path) -> None:
 
 
 async def test_search_is_isolated_by_owner(service: tuple[KnowledgeService, AppConfig]) -> None:
-    """检索只返回本主体的片段。
+    """检索只返回本命名空间的片段。
 
-    WHY 这里经存储层预置另一个主体的同名文档：服务层的归属由 ``effective_owner_id``
-    决定，认证关闭时两侧都是空串，没法**通过服务接口**造出「另一个主体」——而隔离
-    本身正是在存储层按 ``owner_id`` 实现的，故从那一层注入数据。
+    WHY 这里经存储层预置另一个 ``owner_id`` 的同名文档：服务层的归属固定为空串，
+    没法**通过服务接口**造出「另一个归属」——而隔离本身正是在存储层按 ``owner_id``
+    实现的，故从那一层注入数据来验证它确实生效。
     """
     knowledge, config = service
     path = _write(config, "notes/login.md", "登录接口超时排查记录。")

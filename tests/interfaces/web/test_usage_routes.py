@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from application.errors import NotFoundError, OwnershipError
+from application.errors import NotFoundError
 from application.usage_service import UsageService
 from config import AppConfig
 from interfaces.web.routes import router
@@ -141,7 +141,7 @@ def test_usage_endpoint_passes_thread_and_group_by(tmp_path):
     assert response.json()["thread_id"] == "t1"
     assert store.calls[0]["thread_id"] == "t1"
     assert store.calls[0]["group_by"] == "day"
-    # auth_mode=disabled：不过滤 owner
+    # 不区分主体：不过滤 owner
     assert store.calls[0]["owner_id"] is None
 
 
@@ -153,7 +153,6 @@ def test_usage_endpoint_passes_thread_and_group_by(tmp_path):
     [
         (ValueError("days 必须在 1..90 之间"), 400, "days"),
         (NotFoundError("会话", "t1"), 404, "会话"),
-        (OwnershipError("会话", "t1"), 403, "会话"),
         (RuntimeError("用量聚合失败"), 500, "用量聚合失败"),
     ],
 )

@@ -20,7 +20,7 @@
 | 会话持久化 | 基于 SQLite 异步检查点，进程重启后可续聊；刷新页面不丢上下文 |
 | 会话清单 | 独立元数据表登记标题、创建/活动时间与对话轮数；只收录**真正发过消息**的会话，Web 侧栏可切换历史 |
 | 会话整理 | 标题搜索、重命名、归档（软删除，可恢复）与「含已归档」开关；归档不影响历史、用量与运行 |
-| 长期记忆 | 三层：**全局** `AGENTS.md`（`MEMORY_FILE` 指定，人工维护、跨全部会话共享，以只读挂载 `/global/` 交给 Agent）+ **工作区** `AGENTS.md`（未配全局记忆时生效，随项目走）+ `/memories/`（Agent 自写，**按用户隔离**并落 SQLite，重启不丢）；Web 端「记忆」面板可查看与删除 |
+| 长期记忆 | 三层：**全局** `AGENTS.md`（`MEMORY_FILE` 指定，人工维护、跨全部会话共享，以只读挂载 `/global/` 交给 Agent）+ **工作区** `AGENTS.md`（未配全局记忆时生效，随项目走）+ `/memories/`（Agent 自写，落 SQLite，重启不丢）；Web 端「记忆」面板可查看与删除 |
 | 模型切换 | 每次请求可指定模型别名，也可走配置里的默认模型 |
 | 执行护栏 | 单次运行的模型调用次数、递归深度、shell 超时与输出长度均有上限 |
 
@@ -157,9 +157,9 @@ uv run python main.py web --host 0.0.0.0 --port 8080
   （`工作空间：…` / `会话专属目录：…`）以及是否已锁定（`GET /api/workspace/info?thread_id=…`）。
   文件面板、附件、技能与知识库接口都按会话解析各自的根。
 
-> **任意目录都可选**（这是产品规则）。所以：能访问这个服务、且有 `file:read` 权限的人，
-> 就能把 Agent 的文件根指到宿主机任意位置。对外暴露部署时请收紧 `AUTH_MODE`，并清楚
-> 这意味着什么。
+> **任意目录都可选**（这是产品规则）。所以：能访问这个服务的人，就能把 Agent 的文件根
+> 指到宿主机任意位置。因此请只在本机可访问的形态下使用它；若必须对外暴露，请把它放在
+> 有访问控制的网络边界之后。
 
 会话由地址栏承载（形如 `/#/c/{thread_id}`）：刷新会**恢复**当前会话而不是新建，
 「新会话」按钮只清空界面进入草稿态。只有真正发出第一条消息，服务端才会创建会话——
@@ -188,15 +188,14 @@ curl -s http://127.0.0.1:8000/ready
 
 | 来源 | 内容 | 怎么进来的 |
 | --- | --- | --- |
-| 宿主机 `.env` | `AUTH_SESSION_SECRET`、`AUTH_API_KEY_DEV` 等既有配置 | compose 的 `env_file: .env` |
+| 宿主机 `.env` | 模型别名、执行档位、沙箱与知识库等既有配置 | compose 的 `env_file: .env` |
 | 宿主机环境变量 | `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | compose 的 `${VAR:-}` 透传 |
-| compose `environment` | `HOST` / `PORT` / `AUTH_MODE` / `DB_PATH` / `SESSIONS_ROOT` / `MEMORY_FILE` | 覆盖上面两处的取值 |
+| compose `environment` | `HOST` / `PORT` / `DB_PATH` / `SESSIONS_ROOT` / `MEMORY_FILE` | 覆盖上面两处的取值 |
 
 两类变量名与 `.env` 里完全一致（配置是扁平的，环境变量名就是字段名大写）。
 
-容器化默认 **`AUTH_MODE=apikey`**，不跟随本机开发用的 `disabled`——端口一旦映射到
-宿主机，网络边界比本机进程宽得多。因此 `AUTH_SESSION_SECRET` 必须已设置（≥32 字节，
-`auth_mode != disabled` 时必填），否则服务会拒绝启动。
+**服务不区分调用方**：端口一旦映射到宿主机，网络边界就比本机进程宽得多，因此 compose
+默认只绑 `127.0.0.1`。需要别的机器访问时，请自行在其前面提供访问控制。
 
 **执行档位按 `.env` 原样生效，compose 不覆盖它。** 本仓库 `.env` 里是
 `EXECUTION_MODE=disabled`，容器因此以该档位启动，`execute` 工具调用会直接返回错误
@@ -251,34 +250,27 @@ mkdir -p ./projects && sudo chown -R 10001:10001 ./projects
 # compose 里加：  - ./projects:/work/projects
 ```
 
-#### 容器内跑 CLI（apikey 模式）
+#### 容器内跑 CLI
 
-CLI 通过 `HARNESS_API_KEY` 取凭据，它和其余配置一样写在 `.env` 里（compose 的
-`env_file` 会把它带进容器），不需要再往命令行传参。最省事的入口是 `.env` 里的
-`AUTH_API_KEY_DEV`（单 key 快速通道，角色为 `admin`）；生产环境应把它留空，
-改用管理面板创建真实 Key：
+CLI 直接使用与 Web 相同的配置（compose 的 `env_file` 会把它带进容器）：
 
 ```bash
 docker compose exec agent python main.py cli
 ```
 
-只想临时换一次凭据（不动 `.env`）时，仍可用同名环境变量顶掉 `.env` 里的值——
-它优先级更高：
+想临时换一个工作空间时用 `--workspace`：
 
 ```bash
-docker compose exec -e HARNESS_API_KEY="$SOME_KEY" agent python main.py cli
+docker compose exec agent python main.py cli --workspace /app/.data/sessions/demo
 ```
 
-本机（非容器）同理：在 `.env` 里填好 `HARNESS_API_KEY`，直接 `python main.py cli`。
+本机（非容器）同理：直接 `python main.py cli`。
 
 Web 接口在同一个容器里，无需另起进程。
 
 #### 一次性维护命令
 
 ```bash
-# 给历史会话补归属（从单用户升级到多用户时执行一次）
-docker compose exec agent python scripts/migrate_thread_owners.py
-
 # 查看日志 / 停止
 docker compose logs -f agent
 docker compose down            # 保留卷；加 -v 会连数据一起删
@@ -307,7 +299,7 @@ docker compose down            # 保留卷；加 -v 会连数据一起删
 | `auto` | 默认 | 按 `wsl → process` 顺序探测，选中首个可用的最强档位。**不含 `docker`**，理由见下 |
 | `docker` | **已实现（Tier 2）** | 一次性容器：**只有镜像与挂载进来的工作区可见**，网络默认切断，进程随容器结束而消失，内存 / CPU / 进程数上限，丢弃全部 capabilities |
 | `wsl` | **已实现（Tier 1）** | 命令跑在 WSL2 发行版内：utility VM 边界 + Linux rlimit（进程数 / 内存 / CPU 时间），超时由 GNU `timeout` 终止整个进程组 |
-| `process` | **已实现（Tier 0）** | Windows Job Object：进程树管控、活动进程数/内存/CPU 上限、超时终止整棵树；零新增依赖 |
+| `process` | **已实现（Tier 0）** | Windows Job Object：进程树管控、活动进程数/内存/CPU 上限、超时终止整棵树 |
 
 > **三个档位都不是「强隔离」，都不能替代安全边界。** 它们解决的是「命令失控」：
 > fork bomb、无限输出、超时残留进程、环境变量泄漏。
@@ -520,20 +512,21 @@ Web 形态对外提供以下接口（均以 `/api` 为前缀）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/models` | 列出可切换的模型（不含任何密钥信息） |
-| `GET` | `/api/workspaces/dirs` | 列出一个目录下的**子目录**（一次一层，需 `file:read`），供界面逐级挑选工作空间；不传 `path` 返回起点（Windows 盘符列表 / POSIX `/`）。不存在的路径 → `400` |
-| `POST` | `/api/workspaces/pick` | 在**服务端**弹出系统的文件夹选择对话框，返回选中的路径（需 `file:read`）。用户取消 → `200 {"cancelled": true}`；环境不支持（无桌面 / 缺 tkinter）→ `501`；已有弹窗在等待 → `409`；超时 → `504` |
-| `GET` | `/api/tools` | 列出生效工具（内置 + 自定义 + MCP）及每台 MCP 服务器的加载状态（需 `tool:read`） |
-| `GET` | `/api/memories` | 列出**当前主体自己**的长期记忆（需 `memory:read`） |
-| `DELETE` | `/api/memories/{path}` | 删除一条长期记忆（需 `memory:delete`）；删除不存在的条目仍返回 200 |
+| `GET` | `/api/workspaces/dirs` | 列出一个目录下的**子目录**（一次一层），供界面逐级挑选工作空间；不传 `path` 返回起点（Windows 盘符列表 / POSIX `/`）。不存在的路径 → `400` |
+| `POST` | `/api/workspaces/pick` | 在**服务端**弹出系统的文件夹选择对话框，返回选中的路径。用户取消 → `200 {"cancelled": true}`；环境不支持（无桌面 / 缺 tkinter）→ `501`；已有弹窗在等待 → `409`；超时 → `504` |
+| `GET` | `/api/tools` | 列出生效工具（内置 + 自定义 + MCP）及每台 MCP 服务器的加载状态 |
+| `GET` | `/api/audit` | 读取审计日志（最近在前，支持 `actor_id` / `event_type` / `limit` / `offset`）；只读 |
+| `GET` | `/api/memories` | 列出长期记忆 |
+| `DELETE` | `/api/memories/{path}` | 删除一条长期记忆；删除不存在的条目仍返回 200 |
 | `POST` | `/api/threads` | 申请一个会话 ID；**不落库**，会话在首条消息被接受时才创建 |
 | `GET` | `/api/threads/{thread_id}/export` | 导出会话为可移植 JSON（`format=json` 或 `markdown`）。文件里记有来源工作区供人查看，**不作为**导入后的绑定值 |
 | `POST` | `/api/threads/import` | 导入一份导出快照为**新会话**；可用查询参数 `workspace` 指定它绑定到哪个工作空间，缺省表示不绑定（用它的专属目录） |
 | `GET` | `/api/threads` | 列出会话（最近活动在前，支持 `limit` / `offset` / `query` 标题搜索 / `include_archived`），默认不含已归档 |
-| `PATCH` | `/api/threads/{thread_id}` | 重命名（`title`）或归档（`archived`），需 `thread:update`；两项至少要给一项 |
+| `PATCH` | `/api/threads/{thread_id}` | 重命名（`title`）/ 归档（`archived`）/ 打标签（`tags`），三项至少要给一项 |
 | `GET` | `/api/threads/{thread_id}` | 读取会话历史，用于刷新后恢复上下文 |
 | `DELETE` | `/api/threads/{thread_id}` | 删除会话及其检查点 |
 | `POST` | `/api/threads/{thread_id}/runs` | 发起一轮对话，**以 SSE 流式返回** |
-| `POST` | `/api/threads/{thread_id}/resume` | 提交人工审批结果，继续被中断的运行（需 `hitl:approve` 权限） |
+| `POST` | `/api/threads/{thread_id}/resume` | 提交人工审批结果，继续被中断的运行 |
 | `POST` | `/api/threads/{thread_id}/stop` | 请求停止当前运行；幂等返回 200，未运行时 `stopped=false` |
 | `GET` | `/api/attachments/limits` | 附件上限（大小 / 张数 / MIME 白名单）；不依赖会话，草稿态也能取 |
 | `POST` | `/api/threads/{thread_id}/attachments` | 上传附件（`multipart/form-data`，字段名 `file`） |
@@ -629,7 +622,7 @@ MyAgentHarness/
 ├── knowledge_tools.py        # 知识库工具（默认不加载）
 │
 ├── Dockerfile                # 应用镜像：多阶段构建，以非 root 用户运行
-├── docker-compose.yml        # 编排：默认 apikey 认证，只绑定回环地址
+├── docker-compose.yml        # 编排：端口只绑定回环地址
 ├── docker/                   # 沙箱执行镜像（受众是"跑命令"，与应用镜像分开）
 ├── pyproject.toml            # 依赖声明（requires-python >= 3.14）
 ├── uv.lock                   # 精确锁定的依赖版本
@@ -641,13 +634,12 @@ MyAgentHarness/
 ├── bootstrap/                # 组装层：唯一的装配点
 │   ├── context.py            # ★ AppContext：装配完成的依赖集合（不可变）
 │   ├── core.py               # ★ build_app_context：CLI 与 Web 共用
-│   └── web.py                # Web 专有资源（限流器、审计清理、运行治理）
+│   └── web.py                # Web 专有资源（审计清理、运行治理）
 ├── agent/                    # 内核层：模型后端、工具、护栏、图构建
 ├── application/              # 应用层：会话编排、运行推进、事件模型、中断编解码
 ├── interfaces/               # 接口层：两种适配器
 │   ├── cli.py                # 命令行交互
 │   └── web/                  # FastAPI 服务（REST + SSE）与前端页面
-│       └── auth/             # 认证与鉴权子包：会话 / OIDC / API Key / 审计
 ├── llm/                      # 模型层：模型注册表与嵌入后端
 ├── runtime/                  # 运行时层：检查点、各类 store、文件与沙箱
 │   └── sandbox/              # 三档沙箱：进程 / WSL / 容器
@@ -738,7 +730,5 @@ MyAgentHarness/
   镜像。其请求构造（含 `format=json`）与响应解析已由用例钉住，接上可达实例后跑同一条脚本即可补齐。
 - 检查点为单机 SQLite，多副本部署需另行替换为共享存储（如 PostgreSQL 检查点）；
   长期记忆与它共用同一个文件，多副本部署时需一并替换。
-- 长期记忆按主体隔离，但**没有**「管理员查看/清理他人记忆」的入口：跨主体读取属于
-  另一类授权与审计设计，本期只做「自己看自己删」。主体标识含命名空间不允许的字符
-  （例如某些 IdP 的 `sub` 形如 `auth0|abc`）时会改用 sha256 前 32 位作为命名空间
-  组件，此时无法从命名空间反推主体，排障需对照日志里的告警。
+- 长期记忆只有一份（工作区里没有第二份）：记忆命名空间由进程内唯一的主体标识派生，
+  因此**换一台机器不会自动带上另一台的记忆**——要迁移请搬数据目录（`DB_PATH` 所在处）。

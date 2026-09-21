@@ -1,6 +1,6 @@
 """附件服务的回归测试。
 
-覆盖面：四项上限与白名单（大小 / MIME / 单会话张数 / ID 形态）、归属校验、
+覆盖面：四项上限与白名单（大小 / MIME / 单会话张数 / ID 形态）、会话校验、
 上传审计「有元信息无内容」、多模态消息构造（纯文本保持字符串、图片块、模型不
 支持时显式拒绝）、清单里带上限、删除幂等，以及历史消息的附件回填。
 """
@@ -16,8 +16,8 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from application.attachment_service import AttachmentService, attachment_info
-from application.errors import NotFoundError, OwnershipError, VisionUnsupportedError
-from application.principal import Principal
+from application.audit_context import LOCAL_ACTOR_ID
+from application.errors import NotFoundError, VisionUnsupportedError
 from application.thread_service import ThreadService
 from llm.registry import build_default_registry
 from runtime.attachments import AttachmentRecord, index_by_sha256, save_attachment
@@ -54,10 +54,6 @@ def _service(tmp_path: Path, thread_store: ThreadMetaStore, **overrides: Any):
         scope=make_root(config), registry=registry, thread_store=thread_store, audit_store=audit
     )
     return service, config, audit, registry
-
-
-def _principal(user_id: str = "alice") -> Principal:
-    return Principal(user_id=user_id)
 
 
 # ------------------------------------------------------------------ 上限与白名单
@@ -119,13 +115,13 @@ async def test_upload_audits_metadata_without_content(
     service, _config, audit, _registry = _service(tmp_path, thread_store)
 
     info = await service.upload(
-        _THREAD, filename="shot.png", mime_type="image/png", data=_PNG, principal=_principal()
+        _THREAD, filename="shot.png", mime_type="image/png", data=_PNG
     )
 
     assert len(audit.calls) == 1
     call = audit.calls[0]
     assert call["event_type"] == "attachment_upload"
-    assert call["actor_id"] == "alice"
+    assert call["actor_id"] == LOCAL_ACTOR_ID
     assert call["action"] == "write"
     details = call["details"]
     assert details["sha256"] == info.sha256
@@ -170,25 +166,6 @@ async def test_delete_is_idempotent(tmp_path: Path, thread_store: ThreadMetaStor
 
     assert await service.delete(_THREAD, info.id) is True
     assert await service.delete(_THREAD, info.id) is False
-
-
-# ------------------------------------------------------------------ 归属
-
-
-async def test_upload_enforces_ownership_when_authenticated(
-    tmp_path: Path, thread_store: ThreadMetaStore
-):
-    service, _config, _audit, _registry = _service(tmp_path, thread_store, auth_mode="apikey")
-    await thread_store.create(_THREAD, owner_id="alice")
-
-    with pytest.raises(OwnershipError):
-        await service.upload(
-            _THREAD,
-            filename="a.png",
-            mime_type="image/png",
-            data=_PNG,
-            principal=_principal("bob"),
-        )
 
 
 # ------------------------------------------------------------ 多模态内容构造

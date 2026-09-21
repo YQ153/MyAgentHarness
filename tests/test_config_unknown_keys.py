@@ -45,7 +45,7 @@ def test_a_lowercase_known_key_is_not_reported(tmp_path: Path, caplog) -> None:
 
     WHY 单列：误报会把这条提示训练成噪音，而噪音很快就会被所有人忽略——那时它等于没有。
     """
-    env_file = _write(tmp_path, f"db_path={tmp_path / 'agent.db'}\nauth_mode=disabled\n")
+    env_file = _write(tmp_path, f"db_path={tmp_path / 'agent.db'}\nlog_level=debug\n")
 
     with caplog.at_level(logging.WARNING, logger="config"):
         config = AppConfig(_env_file=env_file)

@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from application.tool_catalog import ToolCatalog
     from application.usage_service import UsageService
     from config import AppConfig
-    from runtime.api_key_store import APIKeyStore
     from runtime.audit_store import AuditStore
     from runtime.thread_store import ThreadMetaStore
     from runtime.usage_store import UsageStore
@@ -37,7 +36,6 @@ class AppContext:
         checkpointer: LangGraph 检查点持久化实现。
         thread_store: 会话元数据存储。
         audit_store: 审计日志存储。
-        api_key_store: API Key 存储。
         graph_factory: 按模型别名提供已装配图的工厂。
         threads: 会话元数据服务。
         runs: 运行推进服务。
@@ -60,7 +58,6 @@ class AppContext:
     checkpointer: BaseCheckpointSaver
     thread_store: ThreadMetaStore
     audit_store: AuditStore
-    api_key_store: APIKeyStore
     graph_factory: AgentFactory
     threads: ThreadService
     runs: RunService

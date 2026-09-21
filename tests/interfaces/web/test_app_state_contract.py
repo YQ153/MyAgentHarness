@@ -8,7 +8,7 @@ WHY 需要它：``app.state`` 是接口层与装配层之间的一处**隐式**�
 - 读取方用 ``getattr(state, "x", None)``（宽容）：**静默降级**，功能悄悄少一半。
 
 本仓两种都发生过：``app.state.audit_store`` 漏铺，一边让审计查询端点 500，一边让
-``auth/audit.py`` 把**全部认证审计**丢掉——后者藏了很久，直到有人点开审计面板才暴露。
+依赖它的写入路径静默丢审计——后者藏了很久，直到有人点开审计面板才暴露。
 本文件把「读到的必须被写过」钉成静态断言，正是为了不让第三例出现。
 
 WHY 静态断言而不是跑一次真实应用：真应用的 lifespan 要建库、连模型、编译图，跑不起来就
@@ -89,7 +89,7 @@ def test_scanner_sees_both_sides() -> None:
     assignments = _assignments()
 
     assert len(reads) >= _MIN_READS, f"只扫到 {len(reads)} 个读取点，正则可能写错了：{sorted(reads)}"
-    assert {"config", "api_key_store", "audit_store"} <= assignments, sorted(assignments)
+    assert {"config", "audit_store"} <= assignments, sorted(assignments)
 
 
 def test_every_state_read_is_assigned_in_lifespan() -> None:

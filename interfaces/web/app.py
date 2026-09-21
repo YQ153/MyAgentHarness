@@ -17,12 +17,10 @@ from fastapi.staticfiles import StaticFiles
 from bootstrap.core import build_app_context
 from bootstrap.web import (
     build_audit_retention_worker,
-    build_rate_limiter,
     build_run_governance_worker,
 )
 from config import AppConfig
 from interfaces.web.attachment_routes import router as attachment_router
-from interfaces.web.auth import router as auth_router
 from interfaces.web.health import router as health_router
 from interfaces.web.knowledge_routes import router as knowledge_router
 from interfaces.web.request_context import RequestContextMiddleware
@@ -46,10 +44,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     config: AppConfig = app.state.config
 
     async with build_app_context(config) as context:
-        # WHY rate_limiter 不放进 AppContext：它只有 Web 形态需要，
-        # 放进共享上下文会让 CLI 承担无谓的构造开销。
-        rate_limiter = build_rate_limiter(config)
-
         # WHY 整个启动段都包在 try/finally 里：后台任务在 yield 之前创建，
         # 若构造阶段抛错而不进 finally，它们会连同已装配的连接一起泄漏。
         retention_worker = None
@@ -76,13 +70,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
             # 保持既有路由代码不变。
             # WHY 凡是路由会读的依赖都必须在这里铺开：漏掉一项时，宽容的读取点
-            # （``getattr(state, name, None)``）会静默降级——``auth/audit.py`` 就因此
-            # 把**全部认证审计**（登录成功/失败、权限拒绝、logout、key 增删）丢了很久，
-            # 而严格的读取点（``state.audit_store``）会在真机上直接 500。
+            # （``getattr(state, name, None)``）会静默降级，而严格的读取点
+            # （``state.audit_store``）会在真机上直接 500。
             # 这条约束由 tests/interfaces/web/test_app_state_contract.py 静态兜住。
             app.state.audit_store = context.audit_store
-            app.state.rate_limiter = rate_limiter
-            app.state.api_key_store = context.api_key_store
             app.state.context = context
             app.state.threads = context.threads
             # WHY 只挂注册表、不挂它按启动默认值装配的那四类服务：工作区在会话级可选
@@ -98,7 +89,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.tools = context.tools
             app.state.memories = context.memories
 
-            logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
+            logger.info("Web 服务启动完成：host=%s", config.host)
             yield
         finally:
             # WHY 先停后台任务再关连接：清理任务持有 audit_store 连接，
@@ -157,7 +148,6 @@ def create_app(config: AppConfig) -> FastAPI:
     # 启动阶段（业务路由尚未就绪）探活请求仍能被应答，而不是被后面的
     # 静态挂载吞成 404。
     app.include_router(health_router)
-    app.include_router(auth_router)
     app.include_router(router)
     app.include_router(workspace_router)
     app.include_router(attachment_router)

@@ -27,15 +27,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 ANONYMOUS_USER_ID = "__anonymous__"
-"""未启用鉴权时的记忆归属标识。
+"""记忆归属的兜底标识（本应用全部记忆都落在它这一个命名空间下）。
 
-WHY 要有兜底主体而不是用空串：``StoreBackend`` 也可以在图外被调用（管理
-接口直接读写、测试直接驱动 backend），此时拿不到运行时；若用空串，命名空间
-组件会被 deepagents 判为非法并抛错，表现为「记忆功能整体不可用」。统一落到
-本标识后，本地单用户场景仍是同一个记忆池，语义与"一个人一台机器"一致。
+WHY 要有兜底主体而不是用空串：``StoreBackend`` 也可以在图外被调用（面板直接
+读写、测试直接驱动 backend），此时拿不到运行时；若用空串，命名空间组件会被
+deepagents 判为非法并抛错，表现为「记忆功能整体不可用」。
 
-``application.principal.ANONYMOUS_PRINCIPAL`` 复用本常量，避免两处各写一份
-字面量后悄悄漂移成两个池子。
+WHY 需要它是**唯一**的取值来源：会话侧（``RunHandle.memory_owner``）与面板侧
+（``MemoryService``）必须算出同一个命名空间，否则会出现「面板说没记住、Agent
+却照着做」——两边都不报错，只是看的不是同一份数据。
 """
 
 MEMORY_NAMESPACE_ROOT = "memories"

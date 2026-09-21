@@ -52,6 +52,15 @@ WHY 必须过滤而不是只截断：它会被拼进日志行，含换行或制�
 未列出的字符一律替换掉，不必去枚举所有危险字符。
 """
 
+LOCAL_ACTOR_ID = "local"
+"""审计记录里 ``actor_id`` 的固定取值。
+
+WHY 还要一个主体标识：审计表按 ``actor_id`` 检索与归档，留空会让「谁做的」这一列
+永远是空的，也让「同一主体在别处做了什么」这类查询无从下手。本应用不再区分用户，
+所有操作都来自本机操作者，因此定义为一个常量而不是让各服务各写一份字面量——
+各写一份迟早会出现两种写法（``local`` / ``anonymous``），而它们在检索时不是同一个值。
+"""
+
 
 @dataclass(frozen=True)
 class RequestContext:
@@ -206,6 +215,7 @@ def audit_trace_id() -> str | None:
 
 
 __all__ = [
+    "LOCAL_ACTOR_ID",
     "MAX_IP_CHARS",
     "MAX_TRACE_ID_CHARS",
     "MAX_USER_AGENT_CHARS",

@@ -109,7 +109,6 @@ def _config(workdir: pathlib.Path, **overrides: Any) -> AppConfig:
     """构造落在临时目录里的配置，避免冒烟污染真实数据目录。"""
     params: dict[str, Any] = {
         "_env_file": workdir / "none.env",
-        "auth_mode": "disabled",
         "memory_file": workdir / "AGENTS.md",
         "db_path": workdir / "agent.db",
         "skill_dirs": [workdir / "skills"],

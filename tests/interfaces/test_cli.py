@@ -9,11 +9,6 @@ WHY 装配用替身而不是真实上下文：真实 ``build_app_context`` 会�
 替换它才能让失败直接指向 CLI 的行为，而不是基础设施。
 
 WHY 断言落在 stdout 与退出码上：CLI 与用户的全部契约就是这两样东西。
-
-覆盖率说明：本模块 223 语句中仅 ``_build_cli_principal`` 末尾的 ``return None``
-未覆盖。它对应「``auth_mode`` 不是两种已知值」的情形，而该字段的类型是
-``Literal["disabled", "apikey"]``，合法配置下不可达。为一行不可达的兜底
-去伪造非法配置，只会得到一条伪装成测试的断言，因此保留这 1 行缺口。
 """
 
 from __future__ import annotations
@@ -29,15 +24,12 @@ import pytest
 
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
-from application.principal import ROLE_PERMISSIONS, Principal
 from config import AppConfig
 from interfaces import cli
 from interfaces.cli import (
     _allowed_decisions,
-    _build_cli_principal,
     _format_args,
     _run_turn,
-    _validate_api_key_for_cli,
     ask_human,
     main_sync,
     render_event,
@@ -99,9 +91,8 @@ class _StubCatalog:
 class _StubRuns:
     """``RunService`` 替身：按调用顺序吐出预置事件流，并记录每次调用的入参。
 
-    WHY 记录入参而不只吐事件：``model_name`` 与 ``principal`` 是否正确传到中断
-    恢复的那一半，是「一轮运行的前后半程不得换模型 / 换主体」这条约定唯一可
-    断言的面。
+    WHY 记录入参而不只吐事件：``model_name`` 是否正确传到中断恢复的那一半，
+    是「一轮运行的前后半程不得换模型」这条约定唯一可断言的面。
     """
 
     def __init__(self, rounds: list[list[AgentEvent]] | None = None) -> None:
@@ -114,7 +105,6 @@ class _StubRuns:
         thread_id: str,
         user_input: str,
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
         workspace: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
@@ -122,7 +112,6 @@ class _StubRuns:
             {
                 "thread_id": thread_id,
                 "user_input": user_input,
-                "principal": principal,
                 "model_name": model_name,
             }
         )
@@ -133,14 +122,12 @@ class _StubRuns:
         thread_id: str,
         decision: dict[str, Any],
         *,
-        principal: Principal | None = None,
         model_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         self.resume_calls.append(
             {
                 "thread_id": thread_id,
                 "decision": decision,
-                "principal": principal,
                 "model_name": model_name,
             }
         )
@@ -153,52 +140,13 @@ class _StubRuns:
             yield event
 
 
-class _StubApiKeyStore:
-    """``APIKeyRepository`` 替身：返回预置记录，并记录被查询过的密钥。"""
-
-    def __init__(self, record: dict[str, Any] | None = None) -> None:
-        self._record = record
-        self.validated: list[str] = []
-
-    async def validate(self, api_key: str) -> dict[str, Any] | None:
-        self.validated.append(api_key)
-        return self._record
-
-
-class _StubAuditStore:
-    """``AuditSink`` 替身：记录每次写入的字段。
-
-    WHY 记录字段而不是只记调用次数：这条路径上真正要守的是"记了什么"
-    （事件类型 / actor / 失败原因 / 入口标记），只数次数的话，
-    把 event_type 写反也能过。
-    """
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    async def log(self, **fields: Any) -> None:
-        self.calls.append(fields)
-
-
 class _StubContext:
     """``build_app_context`` 的替身：只暴露主循环真正取用的几个对象。"""
 
-    def __init__(
-        self,
-        threads: Any,
-        runs: Any,
-        catalog: Any,
-        api_key_store: Any = None,
-        audit_store: Any = None,
-    ) -> None:
+    def __init__(self, threads: Any, runs: Any, catalog: Any) -> None:
         self.threads = threads
         self.runs = runs
         self.catalog = catalog
-        self.api_key_store = api_key_store
-        # WHY 必须有这一项：CLI 的认证审计与 Web 落进同一个存储（由 bootstrap 装配）。
-        # 替身少这一个字段，主循环会在取值时抛 AttributeError——那不是被测代码的问题，
-        # 而是替身没跟上 AppContext 的形状。
-        self.audit_store = audit_store
 
     async def __aenter__(self) -> _StubContext:
         return self
@@ -212,8 +160,6 @@ def _patch_context(
     *,
     model_names: list[str] | None = None,
     rounds: list[list[AgentEvent]] | None = None,
-    api_key_store: Any = None,
-    audit_store: Any = None,
 ) -> _StubRuns:
     """替换 ``build_app_context``，并返回其中的假 ``RunService`` 供断言。"""
     runs = _StubRuns(rounds)
@@ -221,8 +167,6 @@ def _patch_context(
         threads=_StubThreads(),
         runs=runs,
         catalog=_StubCatalog(model_names or ["stub-model"]),
-        api_key_store=api_key_store,
-        audit_store=audit_store,
     )
     monkeypatch.setattr(cli, "build_app_context", lambda config: context)
     return runs
@@ -230,10 +174,6 @@ def _patch_context(
 
 def _event(kind: AgentEventType, **payload: Any) -> AgentEvent:
     return AgentEvent(kind, dict(payload))
-
-
-def _principal() -> Principal:
-    return Principal(user_id="u1", role="member", auth_method="apikey")
 
 
 # ================================================================== 事件渲染
@@ -467,189 +407,7 @@ def test_ask_human_returns_empty_decisions_without_requests():
     assert ask_human({}) == {"decisions": []}
 
 
-# ================================================================== API Key 校验
-
-
-async def test_validate_api_key_accepts_dev_key(tmp_path: Path):
-    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
-
-    principal = await _validate_api_key_for_cli(config, "dev-secret")
-
-    assert principal == Principal(
-        user_id="apikey:dev",
-        display_name="dev",
-        role="admin",
-        # WHY 断言 scopes：同一个应急密钥换来的主体，两个入口必须长得一样。
-        # 此前 CLI 侧不带 scopes、Web 侧带（Web 把 admin 的权限集给了它），
-        # 而 scopes 会经 /auth/me 回给浏览器，也是 has_scope 唯一的输入——
-        # 一旦它参与权限判断，CLI 侧会静默少权限。
-        scopes=frozenset(ROLE_PERMISSIONS["admin"]),
-        auth_method="apikey",
-    )
-
-
-async def test_validate_api_key_checks_dev_key_before_store(tmp_path: Path):
-    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
-    store = _StubApiKeyStore({"key_id": "k1", "key_prefix": "abcd", "role": "member"})
-
-    principal = await _validate_api_key_for_cli(config, "dev-secret", api_key_store=store)
-
-    assert principal.user_id == "apikey:dev"
-    # 命中 dev key 后不该再查库：多一次查询没有意义，也给了库侧记录夺走应急入口的机会
-    assert store.validated == []
-
-
-async def test_validate_api_key_uses_store_record(tmp_path: Path):
-    config = make_config(tmp_path)
-    store = _StubApiKeyStore(
-        {
-            "key_id": "k1",
-            "key_prefix": "abcd",
-            "role": "member",
-            "scopes": "usage:read audit:read",
-        }
-    )
-
-    principal = await _validate_api_key_for_cli(config, "key-1", api_key_store=store)
-
-    assert principal.user_id == "apikey:k1"
-    assert principal.display_name == "API Key abcd..."
-    assert principal.role == "member"
-    assert principal.scopes == frozenset({"usage:read", "audit:read"})
-    assert store.validated == ["key-1"]
-
-
-async def test_validate_api_key_rejects_unknown_key(tmp_path: Path):
-    config = make_config(tmp_path)
-
-    with pytest.raises(ValueError, match="HARNESS_API_KEY 无效"):
-        await _validate_api_key_for_cli(config, "nope", api_key_store=_StubApiKeyStore())
-
-
-# ================================================================== 认证审计
-
-
-async def test_validate_api_key_for_cli_writes_success_audit(tmp_path: Path):
-    """CLI 认证成功要落审计，并标出入口。
-
-    WHY 单独立一条：这条审计此前**根本不存在**。两个入口的认证语义没有收敛时，
-    Web 侧成功/失败各落一条，CLI 侧一条都不落——而两边都"能登录"，
-    功能测试永远发现不了这种差异。
-    """
-    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
-    audit = _StubAuditStore()
-
-    await _validate_api_key_for_cli(config, "dev-secret", audit_store=audit)
-
-    assert len(audit.calls) == 1
-    call = audit.calls[0]
-    assert call["event_type"] == "apikey_auth_success"
-    assert call["actor_id"] == "apikey:dev"
-    assert call["outcome"] == "success"
-    assert call["action"] == "validate"
-    assert call["details"] == {"source": "env_dev_key", "entry": "cli"}
-    # CLI 没有来源地址与客户端标识。传空串会让审计面板上出现一个看起来像异常的空白值，
-    # 而"这个字段不存在"与"取到了空值"是两回事。
-    assert call["ip"] is None
-    assert call["user_agent"] is None
-
-
-async def test_validate_api_key_for_cli_writes_failure_audit_before_raising(tmp_path: Path):
-    """失败也要落审计，且在抛异常之前落。
-
-    WHY 时序也要测：失败路径上只有这一层拿得到结果对象——上层只看到一个异常，
-    写不出"为什么失败"，而"存储没装配"与"凭据无效"的处置方式完全不同。
-    """
-    config = make_config(tmp_path)
-    audit = _StubAuditStore()
-
-    with pytest.raises(ValueError, match="HARNESS_API_KEY 无效"):
-        await _validate_api_key_for_cli(
-            config, "nope", api_key_store=_StubApiKeyStore(), audit_store=audit
-        )
-
-    assert len(audit.calls) == 1
-    call = audit.calls[0]
-    assert call["event_type"] == "apikey_auth_failure"
-    assert call["actor_id"] == "unknown"
-    assert call["outcome"] == "failure"
-    assert call["details"] == {"reason": "invalid_or_revoked", "entry": "cli"}
-
-
-async def test_audit_write_failure_does_not_break_cli_auth(tmp_path: Path):
-    """审计写坏了也不能让认证失败——否则存储故障直接演变成「谁都登录不了」。"""
-    config = make_config(tmp_path, auth_api_key_dev="dev-secret")
-
-    class _BrokenAuditStore:
-        async def log(self, **fields: Any) -> None:
-            raise RuntimeError("审计库炸了")
-
-    principal = await _validate_api_key_for_cli(
-        config, "dev-secret", audit_store=_BrokenAuditStore()
-    )
-
-    assert principal.user_id == "apikey:dev"
-
-
-# ================================================================== 主体构造
-
-
-def _cli_auth_config(tmp_path: Path, mode: str, **overrides: Any) -> AppConfig:
-    """构造用于 apikey 模式的配置。"""
-    params: dict[str, Any] = {"auth_mode": mode}
-    params.update(overrides)
-    return make_config(tmp_path, **params)
-
-
-async def test_build_principal_disabled_returns_none(tmp_path: Path):
-    assert await _build_cli_principal(make_config(tmp_path)) is None
-
-
-async def test_build_principal_apikey_requires_env(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("HARNESS_API_KEY", raising=False)
-    config = _cli_auth_config(tmp_path, "apikey")
-
-    with pytest.raises(ValueError, match="HARNESS_API_KEY"):
-        await _build_cli_principal(config)
-
-
-async def test_build_principal_apikey_uses_env_key(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("HARNESS_API_KEY", "dev-secret")
-    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
-
-    principal = await _build_cli_principal(config)
-
-    assert principal is not None
-    assert principal.user_id == "apikey:dev"
-
-
-async def test_build_principal_apikey_reads_key_from_env_file(tmp_path: Path, monkeypatch):
-    """写在 ``.env`` 里的密钥必须生效——它是 .env.example 指的配置位置。
-
-    WHY 单独测：``.env`` 的值只进 ``AppConfig``、不进 ``os.environ``，所以「CLI 直接读
-    环境变量」的实现会让这条路径永远失败，而它恰是容器内与「照模板配好」两条真实场景
-    的主路径；症状是提示「没配密钥」而用户刚刚才配过。
-    """
-    monkeypatch.delenv("HARNESS_API_KEY", raising=False)
-    config = _cli_auth_config(
-        tmp_path,
-        "apikey",
-        harness_api_key="dev-secret",
-        auth_api_key_dev="dev-secret",
-    )
-
-    principal = await _build_cli_principal(config)
-
-    assert principal is not None
-    assert principal.user_id == "apikey:dev"
-
-
-async def test_build_principal_apikey_rejects_invalid_env_key(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("HARNESS_API_KEY", "wrong")
-    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
-
-    with pytest.raises(ValueError, match="无效"):
-        await _build_cli_principal(config)
+# ================================================================== 一轮输入
 
 
 async def test_run_turn_renders_events_without_any_interrupt(capsys):
@@ -662,7 +420,6 @@ async def test_run_turn_renders_events_without_any_interrupt(capsys):
         {
             "thread_id": "t1",
             "user_input": "你好",
-            "principal": None,
             "model_name": "m",
         }
     ]
@@ -670,7 +427,6 @@ async def test_run_turn_renders_events_without_any_interrupt(capsys):
 
 
 async def test_run_turn_handles_interrupt_then_resumes(capsys, monkeypatch):
-    principal = _principal()
     runs = _StubRuns(
         [
             [
@@ -682,7 +438,7 @@ async def test_run_turn_handles_interrupt_then_resumes(capsys, monkeypatch):
     )
     monkeypatch.setattr(cli, "ask_human", lambda payload: {"decisions": [{"type": "approve"}]})
 
-    await _run_turn(runs, "t1", "跑一下", principal=principal, model_name="m")
+    await _run_turn(runs, "t1", "跑一下", model_name="m")
 
     # 中断本身不该被渲染成普通事件：它要交给审批循环，打印出来只会让终端多一段噪音
     assert capsys.readouterr().out.strip() == "恢复后"
@@ -692,7 +448,6 @@ async def test_run_turn_handles_interrupt_then_resumes(capsys, monkeypatch):
     assert resume_call["decision"] == {"decisions": [{"type": "approve"}]}
     # 恢复必须带同一个 model_name：前后半程换模型会多建一个实例，成本与行为都不可预期
     assert resume_call["model_name"] == "m"
-    assert resume_call["principal"] == principal
 
 
 async def test_run_turn_handles_two_interrupts_in_one_turn(monkeypatch):
@@ -758,8 +513,6 @@ async def test_run_cli_runs_one_turn_and_exits_on_quit_alias(tmp_path: Path, mon
     assert code == 0
     assert "回答" in capsys.readouterr().out
     assert len(runs.stream_calls) == 1
-    # auth_mode=disabled 时主体为 None，走匿名兼容路径
-    assert runs.stream_calls[0]["principal"] is None
 
 
 async def test_run_cli_skips_blank_input(tmp_path: Path, monkeypatch):
@@ -830,57 +583,6 @@ async def test_run_cli_logs_unexpected_failure(tmp_path: Path, monkeypatch, capl
     assert code == 1
     # 未预期异常必须留下堆栈：只打印一句话会让线上排障无从下手
     assert "CLI 运行失败" in caplog.text
-
-
-async def test_run_cli_uses_authenticated_principal(tmp_path: Path, monkeypatch):
-    # WHY 顺序不能反：凭据与其余配置同一个入口（``AppConfig.harness_api_key``），
-    # 而配置在构造期读环境变量——先建配置再设变量，得到的是「变量明明设了却没生效」，
-    # 正是这条用例要防的形态（真实启动顺序也是先有环境、再建配置）。
-    monkeypatch.setenv("HARNESS_API_KEY", "dev-secret")
-    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
-    _feed_input(monkeypatch, "你好", "exit")
-    runs = _patch_context(
-        monkeypatch,
-        model_names=["stub-model"],
-        rounds=[[_event(AgentEventType.DONE)]],
-    )
-
-    assert await run_cli(config, model_name="stub-model") == 0
-
-    principal = runs.stream_calls[0]["principal"]
-    assert principal is not None
-    assert principal.user_id == "apikey:dev"
-
-
-async def test_run_cli_returns_2_when_api_key_missing(tmp_path: Path, monkeypatch, capsys):
-    """``auth_mode=apikey`` 却没给密钥：当场说清并返回 2，不抛堆栈。
-
-    WHY 断言这条：此前这个 ValueError 一路抛到 ``main()``，用户看到的是三层堆栈，
-    真正的一句话提示被夹在中间；退出码 2（参数错误）也让脚本能区分「配置没给」与
-    「跑起来之后失败」（后者是 1）。
-    """
-    monkeypatch.delenv("HARNESS_API_KEY", raising=False)
-    config = _cli_auth_config(tmp_path, "apikey")
-    runs = _patch_context(monkeypatch, model_names=["stub-model"])
-
-    code = await run_cli(config, model_name="stub-model")
-    out = capsys.readouterr().out
-
-    assert code == 2
-    assert "HARNESS_API_KEY" in out
-    assert "AUTH_API_KEY_DEV" in out
-    # 提示与退出码都对了，就说明这一步没有半途发起过任何运行
-    assert runs.stream_calls == []
-
-
-async def test_run_cli_returns_2_when_api_key_invalid(tmp_path: Path, monkeypatch, capsys):
-    """密钥填错同样是配置问题，同样按 2 返回并给出提示。"""
-    monkeypatch.setenv("HARNESS_API_KEY", "wrong")
-    config = _cli_auth_config(tmp_path, "apikey", auth_api_key_dev="dev-secret")
-    _patch_context(monkeypatch, model_names=["stub-model"])
-
-    assert await run_cli(config, model_name="stub-model") == 2
-    assert "无效" in capsys.readouterr().out
 
 
 # ================================================================== 同步入口

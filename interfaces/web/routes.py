@@ -32,8 +32,6 @@ from application.dto import (
 from application.errors import (
     InterruptExpiredError,
     NotFoundError,
-    OwnershipError,
-    PermissionDeniedError,
     RunRejectedError,
     SessionRootLockedError,
     SessionRootNotReadyError,
@@ -44,7 +42,6 @@ from application.errors import (
 from application.events import AgentEvent
 from application.memory_service import MemoryService
 from application.model_catalog import ModelCatalog
-from application.principal import Principal
 from application.run_service import RunService
 from application.session_registry import (
     FolderPickerBusyError,
@@ -55,7 +52,6 @@ from application.thread_export import render_markdown
 from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
-from interfaces.web.auth import get_principal, require_permission
 from interfaces.web.deps import get_session_registry, require_state, resolve_scoped_services
 from interfaces.web.schemas import (
     ChatRequest,
@@ -143,19 +139,17 @@ async def list_workspace_dirs(
         default=None, description="要列的目录；不传则返回起点（盘符或 /）"
     ),
     registry: Any = Depends(get_session_registry),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> DirectoryListing:
     """列出一个目录下的子目录，供界面逐级挑选工作空间。
 
     WHY 没有边界：工作空间允许用户任意选择（这是产品规则），因此服务端不过滤位置——
-    能选任意目录就意味着能读任意目录，这里的门槛只剩权限本身。
+    能选任意目录就意味着能读任意目录。它暴露的是宿主机上的绝对路径，只应在
+    本机可访问的部署形态下使用（见 ``AppConfig.warn_if_publicly_exposed``）。
 
     只列目录、只列一层：这一步的用途是挑目录；一次列全整棵树会让响应变成一次全盘扫描。
 
     WHY 用 ``asyncio.to_thread``：``iterdir`` 是阻塞的系统调用，在事件循环里直接跑会让
     一次慢盘列举拖住所有并发请求（与文件面板同一口径，见 ``WorkspaceService``）。
-
-    权限与文件面板同口径（``file:read``）：它暴露的是宿主机上的绝对路径。
     """
     try:
         return await asyncio.to_thread(registry.list_directories, path)
@@ -168,7 +162,6 @@ async def list_workspace_dirs(
 async def pick_workspace(
     workspace: str | None = Query(default=None, description="对话框的起始目录；不传则用服务端的主目录"),
     registry: Any = Depends(get_session_registry),
-    principal: Principal = Depends(require_permission("file:read")),
 ) -> WorkspacePickResult:
     """在**服务端**弹出系统文件夹选择对话框，把选中的路径回给浏览器。
 
@@ -209,18 +202,42 @@ async def pick_workspace(
 @router.get("/tools", response_model=ToolListResult)
 async def list_tools(
     catalog: ToolCatalog = Depends(get_tool_catalog),
-    principal: Principal = Depends(require_permission("tool:read")),
 ) -> ToolListResult:
     """列出当前生效的工具及其来源。
 
     WHY 需要这个端点：MCP 服务器是在启动期静态加载的，加载失败时既没有
     请求报错也没有界面提示——用户只会发现「助手不会做某件事」。把它做成
     可查询的状态，才能让「装了但没生效」这类问题在首次排查时就被看见。
-
-    WHY 走 ``tool:read`` 而不是 ``system:models``：模型清单是「可选配置」，
-    工具清单是「实际具备的能力」，两者的变更来源与排查路径都不同。
     """
     return catalog.list_tools()
+
+
+@router.get("/audit")
+async def list_audit(
+    request: Request,
+    actor_id: str | None = Query(default=None, description="按操作者过滤；不传表示不过滤"),
+    event_type: str | None = Query(default=None, description="按事件类型过滤；不传表示不过滤"),
+    limit: int = Query(default=50, ge=1, le=500, description="返回条数"),
+    offset: int = Query(default=0, ge=0, description="跳过的条数"),
+) -> list[dict[str, Any]]:
+    """读取审计日志，最近的在最前。
+
+    WHY 是只读视图：审计的写入由业务动作自己完成（会话增删、工具调用、审批决策、
+    记忆删除），这里只回答「发生了什么」。因此它没有写入入口，也不参与任何业务流转。
+
+    Raises:
+        HTTPException: 503 表示审计存储未装配。
+    """
+    # WHY 走 require_state 而不是直接取属性：直接取会在「lifespan 漏铺一项」时抛
+    # AttributeError，由框架兜成 500 + 一屏栈——运维看到的是「服务端有 bug」，而这
+    # 其实是「依赖没装配」。503 才是这条事实的准确表达，也让探活系统能正确摘除实例。
+    audit_store = require_state(request, "audit_store", "审计日志存储")
+    return await audit_store.list(
+        actor_id=actor_id,
+        event_type=event_type,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/usage", response_model=UsageSummary)
@@ -229,19 +246,14 @@ async def get_usage_summary(
     days: int | None = Query(default=None, ge=1, description="统计窗口天数；不传取配置默认值"),
     group_by: str = Query(default="model", description="聚合维度：model / thread / day"),
     usage: UsageService = Depends(get_usage),
-    principal: Principal = Depends(require_permission("usage:read")),
 ) -> UsageSummary:
-    """按用户 / 会话 / 时间窗汇总 token 用量。
+    """按会话 / 时间窗汇总 token 用量。
 
-    WHY 走 ``usage:read`` 而不是复用 ``thread:read``：用量是跨会话的成本数据，
-    能读某条会话不等于能看整体开销；独立权限才能在只读角色上精确收口。
-
-    WHY 非管理员即使有权限也只看到自己的：服务层按 ``owner_id`` 收敛数据，
-    权限控制的是「能不能调这个接口」，不是「能看到谁的数据」。
+    WHY 需要独立端点而不是并入会话清单：用量是跨会话的成本数据，聚合维度
+    （模型 / 会话 / 天）与时间窗都不是会话清单的一部分。
     """
     try:
         return await usage.summarize(
-            principal,
             thread_id=thread_id,
             days=days,
             group_by=group_by,
@@ -252,10 +264,6 @@ async def get_usage_summary(
         ) from exc
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except OwnershipError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.exception("用量聚合失败")
         raise HTTPException(
@@ -266,18 +274,14 @@ async def get_usage_summary(
 @router.get("/memories", response_model=MemoryListResult)
 async def list_memories(
     memories: MemoryService = Depends(get_memory_service),
-    principal: Principal = Depends(require_permission("memory:read")),
 ) -> MemoryListResult:
-    """列出当前主体自己的长期记忆。
+    """列出长期记忆。
 
-    WHY 不做「管理员查看他人记忆」：记忆是个人数据（偏好、项目约定），跨主体
-    读取需要独立的授权与审计设计；管理员在本端点同样只看自己的那一份，否则
-    这个接口会变成一条绕过会话归属的旁路。
+    记忆是 Agent 对使用者长期偏好的沉淀，这个端点让「它到底记住了什么」
+    可见，是记忆可管理（而不是黑箱）的前提。
     """
     try:
-        return await memories.list_memories(principal)
-    except PermissionDeniedError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        return await memories.list_memories()
     except RuntimeError as exc:
         logger.exception("读取长期记忆失败")
         raise HTTPException(
@@ -289,7 +293,6 @@ async def list_memories(
 async def delete_memory(
     path: str,
     memories: MemoryService = Depends(get_memory_service),
-    principal: Principal = Depends(require_permission("memory:delete")),
 ) -> MemoryDeleteResult:
     """删除一条长期记忆。
 
@@ -302,11 +305,9 @@ async def delete_memory(
     重放请求是正常行为；返回 404 只会让用户看到一条与真实结果无关的报错。
     """
     try:
-        return await memories.delete_memory(path, principal)
+        return await memories.delete_memory(path)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.exception("删除长期记忆失败：path=%s", path)
         raise HTTPException(
@@ -317,7 +318,6 @@ async def delete_memory(
 @router.post("/threads", response_model=ThreadResponse)
 async def create_thread(
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> ThreadResponse:
     """申请一个新的会话 ID。
 
@@ -335,7 +335,6 @@ async def list_threads(
     tag: str | None = Query(default=None, description="按标签过滤；不传表示不过滤"),
     include_archived: bool = Query(default=False, description="是否包含已归档的会话"),
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:list")),
 ) -> ThreadListResponse:
     """列出会话清单，最近活动的在前。
 
@@ -349,7 +348,6 @@ async def list_threads(
     """
     try:
         result = await threads.list_threads(
-            principal,
             limit=limit,
             offset=offset,
             query=query,
@@ -373,13 +371,11 @@ async def update_thread(
     thread_id: str,
     body: ThreadUpdateRequest,
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:update")),
 ) -> ThreadSummary:
-    """重命名或归档会话。
+    """重命名、归档或打标签。
 
-    WHY 用 ``thread:update`` 而不是复用 ``thread:delete``：归档可逆、改名无破坏性，
-    与「把数据删掉」不是同一风险量级；复用一个权限会让只想授予整理能力的角色
-    连带拿到删除权。
+    WHY 三项合并成一个 PATCH：它们都是「整理会话清单」的动作，语义上属于对同一
+    资源的同一次更新；拆成三个端点会让前端为了改个名字发三次请求。
     """
     normalized = _validate_thread_id(thread_id)
     if body.title is None and body.archived is None and body.tags is None:
@@ -394,17 +390,15 @@ async def update_thread(
         # ``bool(None)`` 当成 False 顺手把会话取消归档——用户只想加个标签，结果会话
         # 从归档里冒了出来。
         if body.title is not None:
-            result = await threads.rename_thread(normalized, body.title, principal)
+            result = await threads.rename_thread(normalized, body.title)
         if body.archived is not None:
-            result = await threads.set_archived(normalized, bool(body.archived), principal)
+            result = await threads.set_archived(normalized, bool(body.archived))
         if body.tags is not None:
-            result = await threads.update_tags(normalized, body.tags, principal)
+            result = await threads.update_tags(normalized, body.tags)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except OwnershipError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except RuntimeError as exc:
         logger.exception("更新会话失败：thread=%s", normalized)
         raise HTTPException(
@@ -422,7 +416,6 @@ async def export_thread(
     ),
     branch: str | None = Query(default=None, description="要导出的分支；缺省为当前分支"),
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:read")),
 ) -> Response:
     """导出会话：JSON 供机器读，Markdown 供人读。
 
@@ -432,7 +425,7 @@ async def export_thread(
     normalized = _validate_thread_id(thread_id)
 
     try:
-        payload = await threads.export_thread(normalized, principal, branch_id=branch)
+        payload = await threads.export_thread(normalized, branch_id=branch)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -440,10 +433,6 @@ async def export_thread(
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
 
     if format == "markdown":
@@ -468,7 +457,6 @@ async def import_thread(
         description="导入后的新会话使用哪个工作空间；缺省表示不绑定，用它的会话专属目录",
     ),
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> ImportResult:
     """把导出的 JSON 复原成一个**新会话**。
 
@@ -480,14 +468,10 @@ async def import_thread(
     照搬会让导入直接失败。文件里的取值只作为线索（也在 ``notes`` 里说明）。
     """
     try:
-        return await threads.import_thread(body, principal, workspace=workspace)
+        return await threads.import_thread(body, workspace=workspace)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except RuntimeError as exc:
         logger.exception("导入会话失败")
@@ -501,7 +485,6 @@ async def get_history(
     thread_id: str,
     branch: str | None = Query(default=None, description="要读取的分支；缺省为当前分支"),
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:read")),
 ) -> list[HistoryMessage]:
     """读取会话历史，用于刷新页面后恢复上下文。
 
@@ -509,7 +492,7 @@ async def get_history(
     """
     normalized = _validate_thread_id(thread_id)
     try:
-        return await threads.history(normalized, principal, branch_id=branch)
+        return await threads.history(normalized, branch_id=branch)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -517,10 +500,6 @@ async def get_history(
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except (SessionRootNotReadyError, SessionRootUnavailableError) as exc:
         # WHY 单独接：读历史要按会话的根装配图与附件索引（历史里的图片引用是相对本根的
@@ -540,12 +519,11 @@ async def delete_thread(
     thread_id: str,
     threads: ThreadService = Depends(get_threads),
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:delete")),
 ) -> DeleteResponse:
     """删除会话。"""
     normalized = _validate_thread_id(thread_id)
     try:
-        result = await threads.delete_thread(normalized, principal)
+        result = await threads.delete_thread(normalized)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -553,10 +531,6 @@ async def delete_thread(
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
 
     # WHY 同步清理挂起审批登记：会话已被删除，若留着那条登记，「待审批数」
@@ -577,7 +551,6 @@ async def run_agent(
     body: ChatRequest,
     request: Request,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """发起一轮对话，以 SSE 流式返回事件。
 
@@ -605,12 +578,10 @@ async def run_agent(
                 body.content,
                 body.attachment_ids,
                 model_name=body.model,
-                principal=principal,
             )
         events = await runs.stream(
             normalized,
             content,
-            principal=principal,
             model_name=body.model,
             workspace=body.workspace,
         )
@@ -635,17 +606,9 @@ async def run_agent(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
         ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         raise HTTPException(
@@ -678,7 +641,6 @@ async def resume_agent(
     thread_id: str,
     body: ResumeRequest,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("hitl:approve")),
 ) -> StreamingResponse:
     """人工审批后恢复执行，同样以 SSE 流式返回。
 
@@ -692,7 +654,7 @@ async def resume_agent(
     }
 
     try:
-        events = await runs.resume(normalized, payload, principal=principal, model_name=body.model)
+        events = await runs.resume(normalized, payload, model_name=body.model)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -701,17 +663,9 @@ async def resume_agent(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
         ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         raise HTTPException(
@@ -752,7 +706,6 @@ async def regenerate_reply(
     thread_id: str,
     body: RegenerateRequest,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """重新生成最后一轮助手回复，以 SSE 流式返回。
 
@@ -762,7 +715,7 @@ async def regenerate_reply(
     normalized = _validate_thread_id(thread_id)
 
     try:
-        events = await runs.regenerate(normalized, principal=principal, model_name=body.model)
+        events = await runs.regenerate(normalized, model_name=body.model)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -771,17 +724,9 @@ async def regenerate_reply(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
         ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         # WHY 必须回 409 而不是让流里报错：分叉与运行共用同一份槽位登记，
@@ -809,7 +754,6 @@ async def edit_message(
     thread_id: str,
     body: EditRequest,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StreamingResponse:
     """改写指定轮次的用户消息并从该点分叉，以 SSE 流式返回。"""
     normalized = _validate_thread_id(thread_id)
@@ -819,7 +763,6 @@ async def edit_message(
             normalized,
             body.message_index,
             body.content,
-            principal=principal,
             model_name=body.model,
         )
     except ValueError as exc:
@@ -830,17 +773,9 @@ async def edit_message(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
         ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
     except ThreadBusyError as exc:
         raise HTTPException(
@@ -872,13 +807,12 @@ async def edit_message(
 async def list_branches(
     thread_id: str,
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:read")),
 ) -> BranchListResult:
     """列出会话的全部分支。"""
     normalized = _validate_thread_id(thread_id)
 
     try:
-        return await threads.list_branches(normalized, principal)
+        return await threads.list_branches(normalized)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -887,10 +821,6 @@ async def list_branches(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
 
 
 @router.post("/threads/{thread_id}/branches/activate", response_model=BranchListResult)
@@ -898,7 +828,6 @@ async def activate_branch(
     thread_id: str,
     branch_id: str = Query(default="", description="要切换到的分支；空串表示根分支"),
     threads: ThreadService = Depends(get_threads),
-    principal: Principal = Depends(require_permission("thread:read")),
 ) -> BranchListResult:
     """切换当前分支，返回切换后的分支清单。
 
@@ -908,7 +837,7 @@ async def activate_branch(
     normalized = _validate_thread_id(thread_id)
 
     try:
-        return await threads.activate_branch(normalized, branch_id, principal)
+        return await threads.activate_branch(normalized, branch_id)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -916,10 +845,6 @@ async def activate_branch(
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
 
 
@@ -927,33 +852,24 @@ async def activate_branch(
 async def stop_run(
     thread_id: str,
     runs: RunService = Depends(get_runs),
-    principal: Principal = Depends(require_permission("thread:create")),
 ) -> StopResponse:
     """请求停止会话的当前运行。
 
     WHY 幂等返回 200 而不是 409：停止请求的意图是「让运行停下来」，
     会话未在运行时该意图视为已满足；409 暗示冲突，会把「连点停止按钮」
-    变成一次报错。真正的鉴权失败（403 / 404）仍然照常返回。
+    变成一次报错。会话不存在时仍然照常返回 404。
     """
     normalized = _validate_thread_id(thread_id)
 
     try:
-        result = await runs.stop(normalized, principal=principal)
+        result = await runs.stop(normalized)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
-        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    except OwnershipError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
         ) from exc
 
     return StopResponse(**result)

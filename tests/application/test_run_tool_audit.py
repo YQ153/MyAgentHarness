@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 from agent.mcp import MCPServerStatus
 from agent.tooling import ToolBundle
 from agent.tools import BUILTIN_TOOL_NAMES, ToolDescriptor, ToolSource
-from application.principal import Principal
+from application.audit_context import LOCAL_ACTOR_ID
 from application.run_service import RunService
 from application.tool_catalog import ToolCatalog
 from tests.application.test_run_governance import RecordingAuditStore
@@ -200,11 +200,9 @@ async def test_tool_audit_also_records_actor(tmp_path, thread_store):
     graph = ToolCallingGraph(result=_tool_message("srv_weather", "晴"))
     service = _make_service(tmp_path, thread_store, graph, audit, catalog=_catalog())
 
-    await _drain(
-        await service.stream("t1", "上海天气", principal=Principal(user_id="alice", role="member"))
-    )
+    await _drain(await service.stream("t1", "上海天气"))
 
-    assert audit.of_type("tool_call")[0]["actor_id"] == "alice"
+    assert audit.of_type("tool_call")[0]["actor_id"] == LOCAL_ACTOR_ID
 
 
 async def test_tool_audit_survives_missing_catalog(tmp_path, thread_store):
