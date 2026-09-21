@@ -1,4 +1,4 @@
-"""`docs/overview/architecture.html` 的位置引用契约。
+"""`docs/architecture.html` 的位置引用契约。
 
 WHY 需要它：这份文档承诺「位置引用与源文件一致」。2026-09-20 逐条复核时的实测结果：
 全篇 90 处引用里只有 3 处仍然正确，偏移 60~700 行不等；其中三处已指向**文件之外**
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-_DOC = ROOT / "docs/overview/architecture.html"
+_DOC = ROOT / "docs/architecture.html"
 
 #: 带路径的引用：``<code>path/to/file.py:123</code>`` 或 ``<code>path/to/file.py:123-456</code>``
 _REF = re.compile(r"<code>([A-Za-z0-9_./\-]+\.(?:py|js|toml|yml|md)):(\d+)(?:-(\d+))?</code>")
