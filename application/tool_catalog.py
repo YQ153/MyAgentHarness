@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from agent.tools import BUILTIN_TOOL_NAMES
 from application.dto import MCPServerInfo, ToolInfo, ToolListResult
 
 if TYPE_CHECKING:
@@ -119,14 +118,19 @@ class ToolCatalog:
         for descriptor in self._bundle.descriptors:
             if descriptor.name == tool_name:
                 return descriptor.source.value
-        if tool_name in BUILTIN_TOOL_NAMES:
+        if tool_name in self._bundle.builtin_names:
             return "builtin"
         return "unknown"
 
-    @staticmethod
-    def _builtin_names() -> list[str]:
-        """返回按固定顺序排列的内置工具名。"""
-        known = set(BUILTIN_TOOL_NAMES)
+    def _builtin_names(self) -> list[str]:
+        """返回按固定顺序排列的内置工具名。
+
+        WHY 从装配产物取而不是回查内核常量表（``agent.tools.BUILTIN_TOOL_NAMES``）：
+        「本轮装配了哪些内置工具」本身就是装配结果的一部分，``ToolBundle``
+        已经携带它。应用层因此只依赖「装配产物」这一个概念，不必知道内核把
+        内置工具名放在哪里——依赖内核实现细节会让内核的调整波及应用层。
+        """
+        known = set(self._bundle.builtin_names)
         ordered = [name for name in _BUILTIN_ORDER if name in known]
         ordered.extend(sorted(known - set(ordered)))
         return ordered

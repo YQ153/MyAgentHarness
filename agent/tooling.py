@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from agent.mcp import MCPServerStatus, MCPToolLoader
 from agent.tools import (
+    BUILTIN_TOOL_NAMES,
     ToolDescriptor,
     ToolNameConflictError,
     ToolRegistry,
@@ -35,6 +36,14 @@ class ToolBundle:
     descriptors: tuple[ToolDescriptor, ...] = ()
     custom_modules: tuple[str, ...] = ()
     mcp_statuses: tuple[MCPServerStatus, ...] = ()
+    builtin_names: frozenset[str] = frozenset()
+    """本次装配视为"内置"的工具名。
+
+    WHY 随装配结果一起交出：应用层的工具目录需要区分内置 / 自定义 / MCP，
+    而"哪些名字是内置的"来自 ``agent.tools.BUILTIN_TOOL_NAMES``——那是内核
+    装配细节。让 bundle 携带它，应用层就只依赖"装配产物"这一个概念，
+    不必回查内核常量表（见《架构遗留问题治理方案》Q9）。
+    """
 
     @property
     def mcp_enabled(self) -> bool:
@@ -76,7 +85,7 @@ async def build_tool_bundle(config: AppConfig) -> ToolBundle:
 
     registry = ToolRegistry()
 
-    custom_modules = load_custom_tool_modules(config.custom_tool_modules, registry)
+    custom_modules = load_custom_tool_modules(config.custom_tool_modules, registry, config=config)
 
     mcp_statuses: tuple[MCPServerStatus, ...] = ()
     if config.active_mcp_servers():
@@ -109,6 +118,7 @@ async def build_tool_bundle(config: AppConfig) -> ToolBundle:
         descriptors=descriptors,
         custom_modules=tuple(custom_modules),
         mcp_statuses=mcp_statuses,
+        builtin_names=BUILTIN_TOOL_NAMES,
     )
 
 

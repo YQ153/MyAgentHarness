@@ -10,9 +10,10 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from application.audit_context import request_context
+from application.audit_context import LOCAL_ACTOR_ID, request_context
 from application.run_service import RunService
 from application.thread_service import ThreadService
+from tests.conftest import StubSessionRegistry
 
 
 # ------------------------------------------------------------------ 测试替身
@@ -51,7 +52,7 @@ class FakeGraph:
 
 
 class FakeGraphFactory:
-    def get(self, name: str | None = None) -> Any:
+    def get(self, name: str | None = None, *, scope: Any = None) -> Any:
         return FakeGraph()
 
 
@@ -71,7 +72,7 @@ class SlowGraph:
 
 
 class SlowGraphFactory:
-    def get(self, name: str | None = None) -> Any:
+    def get(self, name: str | None = None, *, scope: Any = None) -> Any:
         return SlowGraph()
 
 
@@ -91,6 +92,7 @@ def _thread_service(config: Any, thread_store: Any, audit: RecordingAuditStore) 
         checkpointer=FakeCheckpointer(),
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(),
+        workspaces=StubSessionRegistry(config),
         audit_store=audit,
     )
 
@@ -100,6 +102,7 @@ def _run_service(config: Any, thread_store: Any, audit: RecordingAuditStore) -> 
         config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(),
+        workspaces=StubSessionRegistry(config),
         audit_store=audit,
     )
 
@@ -118,7 +121,7 @@ async def test_thread_delete_audit_carries_client_info(test_config, thread_store
     event = audit.last("thread_delete")
     assert event["ip"] == "203.0.113.9"
     assert event["user_agent"] == "Mozilla/5.0"
-    assert event["actor_id"] == "anonymous"  # disabled 模式下的主体标识
+    assert event["actor_id"] == LOCAL_ACTOR_ID  # 本机操作者的固定标识
 
 
 async def test_run_audit_carries_client_info(test_config, thread_store):
@@ -167,6 +170,7 @@ async def test_stop_audit_carries_client_info(test_config, thread_store):
         test_config,
         thread_store=thread_store,
         graph_factory=SlowGraphFactory(),
+        workspaces=StubSessionRegistry(test_config),
         audit_store=audit,
     )
 

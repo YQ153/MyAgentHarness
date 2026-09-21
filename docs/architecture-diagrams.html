@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MyAgentHarness 架构图（源码实测版）</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:#16213a; --panel2:#1d2b48; --panel3:#22314f; --line:#2b3b5c;
+    --fg:#e6edf7; --dim:#9fb0cc; --dim2:#7f92b3;
+    --accent:#5eead4; --accent2:#93c5fd; --accent3:#c4b5fd;
+    --warn:#fbbf24; --danger:#f87171; --ok:#4ade80;
+    --mono:"Cascadia Mono","JetBrains Mono",Consolas,"Courier New",monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    font-size:15px;line-height:1.7;}
+  a{color:var(--accent2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:var(--mono);font-size:12.4px;background:#0b1220;
+    border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--accent);
+    white-space:nowrap}
+  pre{background:#0b1220;border:1px solid var(--line);border-radius:8px;
+    padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.4px;
+    line-height:1.62;color:#cfe3ff;margin:10px 0}
+  pre code{background:none;border:0;padding:0;color:inherit;white-space:pre}
+
+  .layout{display:flex;min-height:100vh}
+  nav{position:sticky;top:0;align-self:flex-start;width:268px;height:100vh;overflow-y:auto;
+    background:var(--panel);border-right:1px solid var(--line);padding:20px 14px 40px;
+    flex:0 0 268px}
+  nav .brand{font-weight:700;font-size:15.5px;color:#fff}
+  nav .sub{font-size:11.6px;color:var(--dim);margin-bottom:14px;line-height:1.5}
+  nav .part{font-size:10.5px;letter-spacing:1.4px;color:var(--dim2);
+    text-transform:uppercase;margin:15px 0 5px}
+  nav a{display:block;padding:4px 8px;border-radius:6px;color:var(--fg);font-size:13px}
+  nav a:hover{background:var(--panel2);text-decoration:none}
+  nav a.active{background:var(--panel3);color:#fff;box-shadow:inset 2px 0 0 var(--accent)}
+  main{flex:1;min-width:0;padding:30px 42px 90px;max-width:1200px}
+
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.3px}
+  h2{font-size:20px;margin:46px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line);
+    scroll-margin-top:16px}
+  h2 .no{color:var(--accent);font-family:var(--mono);font-size:16px;margin-right:8px}
+  h3{font-size:15.5px;margin:24px 0 8px;color:#fff}
+  p{margin:9px 0}
+  .lede{color:var(--dim);font-size:13.6px;margin:0 0 18px}
+
+  /* ---------- 通用容器 ---------- */
+  .cap{font-size:11.5px;color:var(--dim2);margin:6px 0 0}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:12px 15px;margin:14px 0}
+  .box .t{font-weight:600;color:#fff;display:block;margin-bottom:3px;font-size:13.4px}
+  .box.warn{border-left:3px solid var(--warn)}
+  .box.danger{border-left:3px solid var(--danger)}
+  .box.ok{border-left:3px solid var(--ok)}
+  .box.info{border-left:3px solid var(--accent2)}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:9px 14px;margin:12px 0}
+  details summary{cursor:pointer;font-weight:600;font-size:13.4px;color:#fff}
+  details[open] summary{margin-bottom:8px}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);font-weight:600;color:#fff;white-space:nowrap}
+  tbody tr:nth-child(even){background:rgba(255,255,255,.02)}
+  .pill{display:inline-block;font-size:10.6px;padding:1px 7px;border-radius:99px;
+    border:1px solid var(--line);color:var(--dim);margin:0 4px 2px 0;vertical-align:middle}
+  .pill.ok{color:var(--ok);border-color:#2f6f45}
+  .pill.no{color:var(--danger);border-color:#6f2f2f}
+  .pill.warn{color:var(--warn);border-color:#6f5a2f}
+  .pill.lock{color:var(--accent);border-color:#2f6f68}
+
+  /* ---------- 图 1：分层栈 ---------- */
+  .stack{display:flex;flex-direction:column;gap:0;margin:16px 0}
+  .layer{display:grid;grid-template-columns:126px minmax(0,1fr) 132px;gap:10px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:10px 12px;align-items:start}
+  .lhead{border-right:1px solid var(--line);padding-right:10px}
+  .lhead b{display:block;font-size:13.6px;color:#fff}
+  .lhead span{display:block;font-family:var(--mono);font-size:11.4px;color:var(--accent)}
+  .lhead em{display:block;font-style:normal;font-size:11px;color:var(--dim2);margin-top:3px}
+  .lbody{display:flex;flex-wrap:wrap;gap:6px}
+  .node{background:var(--panel2);border:1px solid var(--line);border-radius:7px;
+    padding:6px 9px;font-size:12.1px;line-height:1.45;min-width:0}
+  .node b{display:block;color:#fff;font-size:12.3px;font-weight:600}
+  .node span{color:var(--dim);font-size:11.3px}
+  .node.mono{font-family:var(--mono);font-size:11.4px}
+  .node.acc{border-color:#2f6f68}
+  .node.hi{border-color:#3b5b96;background:#1b2b49}
+  .node.ext{border-style:dashed;background:transparent}
+  .lside{font-size:11.2px;color:var(--dim2);font-family:var(--mono);
+    border-left:1px solid var(--line);padding-left:9px;line-height:1.5}
+  .darrow{display:flex;align-items:center;justify-content:center;gap:10px;
+    color:var(--dim2);font-size:11.4px;padding:5px 0;font-family:var(--mono)}
+  .darrow .v{color:var(--accent);font-size:15px;line-height:1}
+
+  /* ---------- 图 2：依赖矩阵 ---------- */
+  .matrix{overflow-x:auto}
+  .matrix table{font-size:12.4px;min-width:720px}
+  .matrix th,.matrix td{text-align:center}
+  .matrix th.rowh,.matrix td.rowh{text-align:left;white-space:nowrap;
+    font-family:var(--mono);font-size:11.8px;background:var(--panel2)}
+  .yes{color:var(--ok);font-weight:700}
+  .no{color:var(--danger);font-weight:700}
+  .self{color:var(--dim2)}
+
+  /* ---------- 图 3：链路泳道 ---------- */
+  .chain{counter-reset:step;margin:14px 0}
+  .phase{font-size:11.4px;letter-spacing:1.1px;color:var(--accent);
+    text-transform:uppercase;margin:16px 0 7px;padding-left:2px}
+  .hop{display:grid;grid-template-columns:34px minmax(0,1fr) minmax(0,1.15fr);
+    gap:10px;align-items:start;padding:7px 10px;border-radius:8px;
+    border:1px solid transparent;border-left:2px solid var(--line);
+    background:rgba(255,255,255,.015);margin-bottom:4px}
+  .hop:hover{background:var(--panel2);border-left-color:var(--accent)}
+  .hop .n{counter-increment:step;font-family:var(--mono);font-size:11.4px;
+    color:var(--dim2);text-align:right}
+  .hop .n::before{content:counter(step)}
+  .hop .who{font-family:var(--mono);font-size:11.9px;color:var(--accent2);word-break:break-all}
+  .hop .what{font-size:12.4px;color:var(--fg)}
+  .hop.hot{border-left-color:var(--accent);background:rgba(94,234,212,.05)}
+  .hop.hot .who{color:var(--accent)}
+
+  /* ---------- 图 4：时序图 ---------- */
+  .seq{border:1px solid var(--line);border-radius:9px;background:var(--panel);
+    padding:12px 14px;margin:14px 0;overflow-x:auto}
+  .seq-head{display:grid;gap:6px;margin-bottom:8px}
+  .seq.c5 .seq-head,.seq.c5 .seq-body{grid-template-columns:repeat(5,minmax(118px,1fr))}
+  .seq.c4 .seq-head,.seq.c4 .seq-body{grid-template-columns:repeat(4,minmax(120px,1fr))}
+  .actor{background:var(--panel2);border:1px solid var(--line);border-radius:7px;
+    padding:6px 8px;font-size:12.1px;text-align:center;color:#fff;line-height:1.4}
+  .actor span{display:block;font-family:var(--mono);font-size:10.6px;color:var(--dim)}
+  .seq-body{position:relative;display:grid;gap:0;padding-bottom:4px}
+  .lifelines{position:absolute;inset:0;display:grid;
+    grid-template-columns:inherit;pointer-events:none}
+  .lifelines i{width:0;height:100%;justify-self:center;
+    border-left:1px dashed #33456b}
+  .msg{position:relative;padding:11px 0 5px}
+  .msg .lbl{font-size:11.5px;color:var(--fg);text-align:center;
+    font-family:var(--mono);word-break:break-all;padding:0 3px 3px}
+  .msg .lbl em{font-style:normal;color:var(--dim)}
+  .msg .line{border-top:2px solid var(--accent2);position:relative;margin:0 8px}
+  .msg.ret .line{border-top-style:dashed;border-top-color:var(--accent3)}
+  .msg .line::after{content:"";position:absolute;top:-6px;right:-1px;
+    border-left:9px solid var(--accent2);border-top:5px solid transparent;
+    border-bottom:5px solid transparent}
+  .msg.ret .line::after{right:auto;left:-1px;border-left:0;
+    border-right:9px solid var(--accent3)}
+  .msg.self .line{border-top:0;border-left:2px solid var(--warn);
+    height:26px;border-radius:0 0 0 6px}
+  .msg.self .line::after{border-left:0;border-right:0;border-top:0;
+    top:auto;bottom:-1px;left:-1px;border-bottom:0;
+    border-top:6px solid var(--warn);border-left:5px solid transparent;
+    border-right:5px solid transparent}
+  .nlabel{position:absolute;left:0;top:9px;font-family:var(--mono);font-size:10.4px;
+    color:var(--dim2)}
+
+  /* ---------- 图 5：沙箱分层 ---------- */
+  .tiers{display:flex;flex-direction:column;gap:8px;margin:14px 0}
+  .tier{display:grid;grid-template-columns:96px 150px minmax(0,1fr) 96px;gap:10px;
+    align-items:center;background:var(--panel);border:1px solid var(--line);
+    border-radius:9px;padding:9px 12px}
+  .tier .tn{font-family:var(--mono);font-size:11.4px;color:var(--accent);text-align:center;
+    background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:5px 3px}
+  .tier .tc b{display:block;color:#fff;font-size:12.6px}
+  .tier .tc span{font-family:var(--mono);font-size:11.1px;color:var(--dim)}
+  .tier .td{font-size:12.2px;color:var(--dim)}
+  .tier.t0{border-left:3px solid var(--ok)}
+  .tier.t1{border-left:3px solid var(--accent2)}
+  .tier.t2{border-left:3px solid var(--accent3);opacity:.92}
+
+  /* ---------- 图 6：目录树 ---------- */
+  .tree{font-family:var(--mono);font-size:12.1px;line-height:1.72;color:#cfe3ff;
+    background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:12px 14px;
+    overflow-x:auto;margin:12px 0}
+  .tree .d{color:var(--accent2)}
+  .tree .f{color:#cfe3ff}
+  .tree .c{color:var(--dim2)}
+  .tree .k{color:var(--accent)}
+
+  /* ---------- 图 7：条形图 ---------- */
+  .bars{display:flex;flex-direction:column;gap:7px;margin:14px 0}
+  .barrow{display:grid;grid-template-columns:150px minmax(0,1fr) 122px;gap:10px;
+    align-items:center;font-size:12.4px}
+  .barrow .bl{font-family:var(--mono);font-size:11.6px;color:var(--fg)}
+  .bar{height:15px;border-radius:4px;background:linear-gradient(90deg,#2f6f68,#5eead4)}
+  .bar.b2{background:linear-gradient(90deg,#2a4a7a,#93c5fd)}
+  .bar.b3{background:linear-gradient(90deg,#4a3a76,#c4b5fd)}
+  .bar.b4{background:linear-gradient(90deg,#5a4a1f,#fbbf24)}
+  .barrow .bv{font-family:var(--mono);font-size:11.4px;color:var(--dim);text-align:right}
+
+  /* ---------- 图 12：运行时图拓扑 ---------- */
+  .flow{display:flex;flex-direction:column;gap:0;margin:14px 0;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:15px 17px}
+  .fnode{display:flex;align-items:baseline;gap:9px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:7px 11px;
+    font-family:var(--mono);font-size:12.2px;color:#fff;line-height:1.5}
+  .fnode .tag{font-family:"Segoe UI","Microsoft YaHei",sans-serif;font-size:10.6px;
+    color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:0 7px;
+    white-space:nowrap}
+  .fnode .why{margin-left:auto;font-family:"Segoe UI","Microsoft YaHei",sans-serif;
+    font-size:11.2px;color:var(--dim2);text-align:right}
+  .fnode.term{background:transparent;border-style:dashed;color:var(--dim);justify-content:center}
+  .fnode.opt{border-style:dashed;border-color:#6f5a2f;background:#241f14}
+  .fnode.entry{border-color:#2f6f68;box-shadow:inset 3px 0 0 var(--accent)}
+  .fnode.exit{border-color:#3b5b96}
+  .fconn{display:flex;align-items:center;gap:8px;color:var(--dim2);font-size:11.6px;
+    font-family:var(--mono);padding:3px 0 3px 13px}
+  .fconn .a{color:var(--accent);font-size:14px;line-height:1}
+  .fbranch{border-left:2px dotted #3b5b96;margin:1px 0 1px 13px;
+    padding:5px 0 5px 13px;display:flex;flex-direction:column;gap:4px}
+  .fbranch .hh{font-size:11.2px;color:var(--dim2);letter-spacing:.3px}
+  .fbranch .fe{font-family:var(--mono);font-size:11.9px;color:var(--accent2)}
+  .fbranch .fe em{font-style:normal;color:var(--dim2);
+    font-family:"Segoe UI","Microsoft YaHei",sans-serif;font-size:11.2px}
+  .fnote{font-size:11.4px;color:var(--dim2);margin:6px 0 0;padding-left:13px}
+
+  footer{margin-top:60px;padding-top:16px;border-top:1px solid var(--line);
+    color:var(--dim2);font-size:12.2px}
+  @media(max-width:1080px){
+    nav{display:none}
+    main{padding:20px 16px 60px}
+    .layer,.tier{grid-template-columns:1fr;gap:8px}
+    .lside{border-left:0;padding-left:0}
+    .lhead{border-right:0;padding-right:0}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav>
+  <div class="brand">架构图（源码实测版）</div>
+  <div class="sub">MyAgentHarness v0.1.0<br>由应用代码反向生成 · 独立于 architecture.html</div>
+
+  <div class="part">静态结构</div>
+  <a href="#d1">图 1 · 分层与依赖总览</a>
+  <a href="#d2">图 2 · 依赖契约矩阵</a>
+  <a href="#d3">图 3 · 模块地图</a>
+
+  <div class="part">动态行为</div>
+  <a href="#d4">图 4 · 端到端请求链路</a>
+  <a href="#d5">图 5 · 运行编排内部协作</a>
+  <a href="#d6">图 6 · HITL 中断与恢复时序</a>
+
+  <div class="part">能力子系统</div>
+  <a href="#d7">图 7 · 沙箱三档与选择逻辑</a>
+  <a href="#d8">图 8 · 知识库 / 技能 / 记忆</a>
+
+  <div class="part">数据与运维</div>
+  <a href="#d9">图 9 · 存储落盘地图</a>
+  <a href="#d10">图 10 · 后台任务与治理</a>
+  <a href="#d11">图 11 · 代码体量分布</a>
+
+  <div class="part">Agent 内核</div>
+  <a href="#d12">图 12 · 运行时图拓扑</a>
+
+  <div class="part">附录</div>
+  <a href="#src">事实来源与校验方式</a>
+</nav>
+
+<main>
+
+<h1>MyAgentHarness 架构图（源码实测版）</h1>
+<p class="lede">
+  本页由应用源码逐文件反向生成的**独立**架构图集，不修改也不追加 <code>docs/overview/architecture.html</code>。
+  图中每个节点都标注了真实文件路径与符号名，可逐条回源码核对。全部图形用原生 HTML/CSS 绘制，无外部依赖，可离线打开。
+</p>
+
+<div class="box info">
+  <span class="t">一句话架构</span>
+  <b>一套内核 + 两个适配器 + 六个受约束的包。</b>
+  <code>main.py</code> 分发 CLI / Web 两种形态，两者共用同一条装配流水线
+  （<code>bootstrap/core.py::build_app_context</code>）；Agent 内核只经
+  <code>agent/graph.py::build_agent</code> 的单一入口装配
+  <code>deepagents.create_deep_agent</code>；层间依赖方向由
+  <code>.importlinter</code> 与 3 个契约测试强制，而非靠文档约定。
+</div>
+
+<!-- ============================================================ 图 1 -->
+<h2 id="d1"><span class="no">图 1</span>分层与依赖总览</h2>
+<p class="lede">自上而下是<b>调用方向</b>；反向（下层 import 上层）被 <code>.importlinter</code> 直接判失败。
+右侧一列是该层"允许被谁调用 / 允许调用谁"的口径摘要。</p>
+
+<div class="stack">
+
+  <div class="layer">
+    <div class="lhead"><b>入口</b><span>main.py</span><em>0.17k</em></div>
+    <div class="lbody">
+      <div class="node"><b>子命令分发</b><span>cli / web（argparse 必选子命令）</span></div>
+      <div class="node"><b>日志装配</b><span>_setup_logging + _TraceFilter → 注入 trace_id</span></div>
+      <div class="node"><b>配置自检</b><span>warn_if_unauthenticated_exposure（非回环 + 未鉴权）</span></div>
+    </div>
+    <div class="lside">→ interfaces<br>→ application<br>→ config</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>分发（CLI 进程 / uvicorn 进程）</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>接口适配层</b><span>interfaces/</span><em>3.38k py + 6 静态</em></div>
+    <div class="lbody">
+      <div class="node acc"><b>cli.py</b><span>run_cli → runs.stream 消费事件；ask_human 走 HITL</span></div>
+      <div class="node acc"><b>web/app.py</b><span>create_app + _lifespan（铺开 app.state）</span></div>
+      <div class="node"><b>web/routes.py</b><span>前缀 /api · 22 端点 · 4 个 SSE 端点</span></div>
+      <div class="node"><b>web/sse.py</b><span>encode_sse：AgentEvent → SSE 帧</span></div>
+      <div class="node"><b>web/request_context.py</b><span>纯 ASGI 中间件（不缓冲 SSE）</span></div>
+      <div class="node"><b>web/auth/*</b><span>require_permission · apikey · audit_api</span></div>
+      <div class="node"><b>web/deps.py</b><span>require_state · resolve_scoped_services</span></div>
+      <div class="node"><b>web/static/*</b><span>原生 JS 前端（app.js / markdown.js）</span></div>
+    </div>
+    <div class="lside">✗ runtime<br>✓ application<br>✓ bootstrap</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>bootstrap 组装依赖 → 注入路由 / CLI</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>组装层</b><span>bootstrap/</span><em>0.38k</em></div>
+    <div class="lbody">
+      <div class="node hi"><b>core.py</b><span>build_app_context：一个 async with 打开全部 store</span></div>
+      <div class="node hi"><b>web.py</b><span>限流器 + 两个后台任务工厂（Web 专有）</span></div>
+      <div class="node hi"><b>context.py</b><span>AppContext：跨形态依赖集合</span></div>
+    </div>
+    <div class="lside">✓ 全部<br>（唯一可达所有层的包）</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>注入服务实例（构造期一次性装配）</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>应用编排层</b><span>application/</span><em>≥9.05k / 31 py</em></div>
+    <div class="lbody">
+      <div class="node hi"><b>run_service.py</b><span>stream / resume / regenerate / edit / stop / enforce_governance</span></div>
+      <div class="node hi"><b>thread_service.py</b><span>会话清单 / 历史 / 分支 / 导入导出</span></div>
+      <div class="node"><b>session_registry.py</b><span>SessionRoot 解析 + SessionServices 装配</span></div>
+      <div class="node"><b>run_registry.py</b><span>槽位 / 计数 / HITL 挂起唯一所有者</span></div>
+      <div class="node"><b>run_governance.py</b><span>超时取消 + 审批过期</span></div>
+      <div class="node"><b>run_branch.py</b><span>编辑 / 重生分叉（返回 ForkPlan）</span></div>
+      <div class="node"><b>event_translator.py</b><span>LangGraph 增量 → AgentEvent</span></div>
+      <div class="node"><b>interrupt_codec.py</b><span>HITL 载荷编解码 + build_resume_command</span></div>
+      <div class="node"><b>skill / knowledge / memory / attachment / usage / health</b><span>能力服务</span></div>
+      <div class="node"><b>ports.py · dto.py · errors.py · events.py · principal.py · ownership.py</b><span>契约与模型</span></div>
+    </div>
+    <div class="lside">✗ interfaces<br>✗ bootstrap<br>✓ runtime / agent / llm</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>经 ports.py 协议访问运行时；经 AgentFactory 取图</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>Agent 装配层</b><span>agent/</span><em>2.80k</em></div>
+    <div class="lbody">
+      <div class="node acc"><b>graph.py</b><span>build_agent（唯一 create_deep_agent 调用点）+ AgentFactory 图缓存</span></div>
+      <div class="node"><b>backends.py</b><span>CompositeBackend：/memories/ · 根外只读挂载 · 工作区</span></div>
+      <div class="node"><b>guardrails.py</b><span>build_permissions + build_interrupt_on（_SECRET_PATTERNS）</span></div>
+      <div class="node"><b>sandbox_backend.py</b><span>SandboxedFilesystemBackend（文件走工作区、命令走 runner）</span></div>
+      <div class="node"><b>readonly_mount.py</b><span>根外单文件 / 整目录只读挂载</span></div>
+      <div class="node"><b>tools.py · tooling.py · mcp.py</b><span>工具注册 + 内置/自定义/MCP 合成</span></div>
+      <div class="node"><b>run_context.py</b><span>AgentRunContext + 记忆命名空间</span></div>
+      <div class="node"><b>path_safety.py · profiles.py</b><span>Windows \\?\ 容错 · HarnessProfile</span></div>
+    </div>
+    <div class="lside">✗ application<br>✗ interfaces<br>✗ bootstrap<br>✓ runtime / llm</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>create_deep_agent 内部调模型；工具回调落回 runtime</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>模型层</b><span>llm/</span><em>1.22k</em></div>
+    <div class="lbody">
+      <div class="node"><b>registry.py</b><span>ModelRegistry：双检锁懒加载；deepseek-flash 恒注册</span></div>
+      <div class="node"><b>embeddings.py</b><span>EmbeddingBackend 协议 + openai-compat 实现</span></div>
+      <div class="node"><b>embed_process.py</b><span>subprocess 档：独立 venv 子进程 + 空闲回收</span></div>
+    </div>
+    <div class="lside">✗ agent<br>（防包循环）<br>✓ runtime</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>init_chat_model / HTTP / 子进程 stdio</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>基础设施层</b><span>runtime/</span><em>≥8.81k / 31 py</em></div>
+    <div class="lbody">
+      <div class="node acc"><b>7 个 SQLite store</b><span>thread · audit · api_key · usage · skill · store · knowledge</span></div>
+      <div class="node acc"><b>checkpointer.py</b><span>AsyncSqliteSaver（langgraph 检查点）</span></div>
+      <div class="node"><b>sandbox/</b><span>protocol + process / wsl / docker + factory</span></div>
+      <div class="node"><b>sqlite_lifecycle.py</b><span>WAL + busy_timeout=5000 的统一连接生命周期</span></div>
+      <div class="node"><b>workspace_files.py</b><span>路径安全唯一实现（resolve_in_workspace）</span></div>
+      <div class="node"><b>interval_worker.py</b><span>后台周期任务骨架（失败不退出）</span></div>
+      <div class="node"><b>audit_retention.py · audit_archive.py</b><span>归档后删除（fail-closed）</span></div>
+      <div class="node"><b>execution_registry.py</b><span>在跑命令登记 + abort_scope</span></div>
+      <div class="node"><b>skill_view.py · skills.py · skill_store.py</b><span>技能解析 / 状态 / 物化视图</span></div>
+      <div class="node"><b>tool_outputs.py · attachments.py · folder_picker.py · host_shell.py · rate_limiter.py</b><span>其余叶子能力</span></div>
+    </div>
+    <div class="lside">✗ application<br>✗ interfaces · agent · llm · bootstrap<br>（纯叶子）</div>
+  </div>
+  <div class="darrow"><span class="v">▼</span><span>本地文件 / 进程 / 扩展</span></div>
+
+  <div class="layer">
+    <div class="lhead"><b>外部系统</b><span>进程边界之外</span><em>—</em></div>
+    <div class="lbody">
+      <div class="node ext"><b>LLM Provider</b><span>DeepSeek / OpenAI / Anthropic / Ollama</span></div>
+      <div class="node ext"><b>MCP Server</b><span>langchain-mcp-adapters 逐台拉取</span></div>
+      <div class="node ext"><b>沙箱运行时</b><span>WSL2 发行版 / Docker 容器</span></div>
+      <div class="node ext"><b>SQLite 扩展</b><span>sqlite-vec（vec0）+ FTS5 trigram</span></div>
+      <div class="node ext"><b>宿主文件系统</b><span>工作区 / sessions / roots / 归档目录</span></div>
+      <div class="node ext"><b>嵌入子进程</b><span>独立 venv 里的 scripts/embed_server.py</span></div>
+    </div>
+    <div class="lside">网络 / 进程 / 文件</div>
+  </div>
+
+</div>
+
+<div class="box">
+  <span class="t">根级单文件模块（不在包内，另有一套契约）</span>
+  <span class="pill lock">config</span><span class="pill lock">text_utils</span>
+  <span class="pill lock">thread_utils</span><span class="pill lock">web_safety</span>
+  这四个是<b>中立叶子</b>（不依赖仓库内任何顶层模块）；
+  <span class="pill warn">knowledge_runtime</span>
+  <span class="pill warn">knowledge_tools</span>
+  <span class="pill warn">web_tools</span> 是<b>服务句柄 / 工具插件</b>，允许的依赖被白名单化；
+  <span class="pill warn">main</span> 是<b>入口分发</b>。约束点在
+  <code>tests/test_root_module_contract.py::_BOUNDARIES</code>。
+</div>
+<p class="cap">数据来源：<code>.importlinter</code>（6 条包契约）、<code>tests/test_root_module_contract.py</code>、
+<code>tests/application/test_layer_purity_contract.py</code>、<code>tests/application/test_runtime_port_contract.py</code>、各模块 docstring。</p>
+
+<!-- ============================================================ 图 2 -->
+<h2 id="d2"><span class="no">图 2</span>依赖契约矩阵</h2>
+<p class="lede">行 = 调用方，列 = 被调用方。<span class="yes">✓</span> 允许，<span class="no">✗</span> 被 <code>.importlinter</code> 判失败。</p>
+
+<div class="matrix">
+<table>
+  <thead>
+    <tr>
+      <th class="rowh">调用方 \ 被调用方</th>
+      <th>interfaces</th><th>application</th><th>agent</th><th>llm</th>
+      <th>runtime</th><th>bootstrap</th><th>根级模块</th><th>外部</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="rowh">interfaces</td>
+      <td class="self">—</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td>
+      <td class="no">✗</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+    <tr>
+      <td class="rowh">bootstrap</td>
+      <td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
+      <td class="yes">✓</td><td class="self">—</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+    <tr>
+      <td class="rowh">application</td>
+      <td class="no">✗</td><td class="self">—</td><td class="yes">✓</td><td class="yes">✓</td>
+      <td class="yes">✓</td><td class="no">✗</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+    <tr>
+      <td class="rowh">agent</td>
+      <td class="no">✗</td><td class="no">✗</td><td class="self">—</td><td class="yes">✓</td>
+      <td class="yes">✓</td><td class="no">✗</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+    <tr>
+      <td class="rowh">llm</td>
+      <td class="no">✗</td><td class="no">✗</td><td class="no">✗</td><td class="self">—</td>
+      <td class="yes">✓</td><td class="no">✗</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+    <tr>
+      <td class="rowh">runtime</td>
+      <td class="no">✗</td><td class="no">✗</td><td class="no">✗</td><td class="no">✗</td>
+      <td class="self">—</td><td class="no">✗</td><td class="yes">✓</td><td class="yes">✓</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<details>
+  <summary>6 条 import-linter 契约原文口径（<code>.importlinter</code> L23–L105）</summary>
+  <table>
+    <thead><tr><th>#</th><th>契约名</th><th>source ✗ forbidden</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>interfaces-no-runtime</code></td><td><code>interfaces</code> ✗ <code>runtime</code></td><td><code>allow_indirect_imports=True</code>（接口层经 application 间接用到 runtime 属正常传递）</td></tr>
+      <tr><td>2</td><td><code>llm-no-agent</code></td><td><code>llm</code> ✗ <code>agent</code></td><td>防 <code>llm → agent</code> 反向依赖形成包循环（Profile 注册因此被挪到 bootstrap）</td></tr>
+      <tr><td>3</td><td><code>runtime-is-leaf</code></td><td><code>runtime</code> ✗ application / interfaces / agent / llm / bootstrap</td><td>基础设施叶子，谁都可达但谁都不依赖</td></tr>
+      <tr><td>4</td><td><code>application-no-upper</code></td><td><code>application</code> ✗ interfaces / bootstrap</td><td>应用层不反向依赖适配器与组装层</td></tr>
+      <tr><td>5</td><td><code>agent-no-upper</code></td><td><code>agent</code> ✗ application / interfaces / bootstrap</td><td>Agent 装配层不得依赖业务编排</td></tr>
+      <tr><td>6</td><td><code>bootstrap-not-depended-by-lower</code></td><td><code>agent/application/llm/runtime</code> ✗ <code>bootstrap</code></td><td><code>allow_indirect_imports=True</code></td></tr>
+    </tbody>
+  </table>
+  <p class="cap">补充：接口层不直连 runtime，靠 <code>application/ports.py</code> 的 <code>typing.Protocol</code> 拿能力；
+  runtime 的实现类因结构化子类型自动满足协议，无需继承、无需反向导入。</p>
+</details>
+
+<!-- ============================================================ 图 3 -->
+<h2 id="d3"><span class="no">图 3</span>模块地图</h2>
+<p class="lede">按层列出模块、职责与关键符号。行数取自源码实测（含空行/注释）；标记 <code>≥</code> 的为统计工具单文件 1000 行上限所致。</p>
+
+<details open>
+  <summary>interfaces 层 · 路由与端点清单（Web 前缀 / CLI）</summary>
+  <table>
+    <thead><tr><th>模块</th><th>前缀 / 形式</th><th>端点与关键符号</th></tr></thead>
+    <tbody>
+      <tr><td><code>interfaces/cli.py</code></td><td>进程内交互</td><td><code>run_cli</code>(L262) · <code>main_sync</code>(L369) · <code>_run_turn</code>(L210) · <code>ask_human</code>(L99) · <code>render_event</code>(L41)</td></tr>
+      <tr><td><code>web/health.py</code></td><td>无前缀 · <b>不鉴权</b></td><td><code>GET /health</code> · <code>GET /ready</code> · <code>GET /metrics</code></td></tr>
+      <tr><td><code>web/auth/router.py</code></td><td><code>/auth</code></td><td><code>GET /auth/logout</code> · <code>GET /auth/me</code> · <code>GET /auth/config</code> · <code>POST|GET /auth/api-keys</code> · <code>DELETE /auth/api-keys/{key_id}</code> · <code>GET /auth/audit</code></td></tr>
+      <tr><td><code>web/routes.py</code></td><td><code>/api</code></td><td><code>GET /api/models</code> · <code>GET|POST /api/workspaces/dirs|pick</code> · <code>GET /api/tools</code> · <code>GET /api/usage</code> · <code>GET|DELETE /api/memories</code> · <code>POST|GET /api/threads</code> · <code>PATCH|DELETE /api/threads/{id}</code> · <code>GET /api/threads/{id}/export</code> · <code>POST /api/threads/import</code> · <code>GET /api/threads/{id}</code></td></tr>
+      <tr><td><code>web/routes.py</code> · SSE</td><td><code>/api</code> · <code>text/event-stream</code></td><td><b><code>POST /api/threads/{id}/runs</code></b> · <b><code>POST .../resume</code></b> · <b><code>POST .../regenerate</code></b> · <b><code>POST .../edit</code></b> · <code>POST .../stop</code> · <code>GET .../branches</code> · <code>POST .../branches/activate</code></td></tr>
+      <tr><td><code>web/workspace_routes.py</code></td><td><code>/api/workspace</code></td><td><code>GET /info</code> · <code>GET /files</code> · <code>GET /file</code>（全部 <code>file:read</code>）</td></tr>
+      <tr><td><code>web/attachment_routes.py</code></td><td>无前缀</td><td><code>GET /api/attachments/limits</code> · <code>POST|GET /api/threads/{id}/attachments</code> · <code>DELETE .../attachments/{attachment_id}</code></td></tr>
+      <tr><td><code>web/knowledge_routes.py</code></td><td>无前缀</td><td><code>GET|POST|DELETE /api/knowledge</code>（<b>无检索端点</b>，检索以工具 <code>search_documents</code> 交付）</td></tr>
+      <tr><td><code>web/skill_routes.py</code></td><td>无前缀</td><td><code>GET /api/skills</code> · <code>PATCH /api/skills/{name}</code>（仅 admin）</td></tr>
+    </tbody>
+  </table>
+  <p class="cap">SSE 实现：<code>routes.py::_encode_stream</code>(L962) + <code>sse.py::encode_sse</code>(L23)；
+  四个流式端点返回 <code>StreamingResponse(media_type="text/event-stream", headers=SSE_HEADERS)</code>。
+  鉴权链：<code>RequestContextMiddleware</code>(最外层) → <code>require_permission(perm)</code> → <code>get_principal</code> → <code>_validate_api_key</code> → <code>application/api_key_auth.validate_api_key</code> + <code>record_api_key_auth</code>。</p>
+</details>
+
+<details>
+  <summary>application 层 · 模块职责速查</summary>
+  <table>
+    <thead><tr><th>模块</th><th>职责</th><th>关键符号</th></tr></thead>
+    <tbody>
+      <tr><td><code>run_service.py</code></td><td>发起/恢复运行的唯一入口；编排 + 事件翻译 + 收尾</td><td><code>RunService.stream/resume/regenerate/edit/stop/enforce_governance</code></td></tr>
+      <tr><td><code>run_registry.py</code></td><td>槽位、计数、限流、HITL 挂起的唯一所有者</td><td><code>RunRegistry</code> · <code>RunHandle</code> · <code>ToolCallRecord</code></td></tr>
+      <tr><td><code>run_governance.py</code></td><td>按时间收口：超时取消、审批过期</td><td><code>RunGovernor.enforce/enforce_timeouts/expire_stale_hitl</code></td></tr>
+      <tr><td><code>run_branch.py</code></td><td>编辑/重生的分叉准备（不产出事件）</td><td><code>RunBranchService.prepare_fork/messages_of/refresh_head</code> · <code>ForkPlan</code></td></tr>
+      <tr><td><code>thread_service.py</code></td><td>会话标识/清单/历史/分支/导入导出/删除</td><td><code>ThreadService</code>（10+ 方法）</td></tr>
+      <tr><td><code>session_registry.py</code></td><td>会话文件根解析与按根服务装配</td><td><code>SessionRegistry.resolve/services/services_for/refresh_views</code> · <code>SessionServices</code></td></tr>
+      <tr><td><code>event_translator.py</code></td><td>LangGraph 增量 → 应用事件（有状态）</td><td><code>LangGraphEventTranslator.feed/flush</code> · <code>_pending_tool_calls</code></td></tr>
+      <tr><td><code>interrupt_codec.py</code></td><td>HITL 载荷编解码，收敛 HumanInTheLoopMiddleware 形状</td><td><code>decode_interrupt</code> · <code>normalize_decisions</code> · <code>build_resume_command</code></td></tr>
+      <tr><td><code>events.py</code> / <code>dto.py</code> / <code>errors.py</code></td><td>统一事件、对外 DTO、领域异常</td><td><code>AgentEvent</code>/<code>AgentEventType</code> · <code>ThreadSummary</code> · <code>NotFoundError</code> 等</td></tr>
+      <tr><td><code>ports.py</code></td><td>基础设施端口协议（11 个 Protocol）</td><td><code>AuditSink</code> · <code>UsageLedger</code> · <code>KnowledgeIndex</code> · <code>ThreadMetadataStore</code> · <code>SkillState</code></td></tr>
+      <tr><td><code>principal.py</code> / <code>ownership.py</code></td><td>主体与权限模型、会话归属判定</td><td><code>ROLE_PERMISSIONS</code> · <code>ensure_thread_access</code> · <code>UNAUTHENTICATED_OWNER</code></td></tr>
+      <tr><td><code>api_key_auth.py</code></td><td>CLI/Web 共用 Key 校验与认证审计</td><td><code>validate_api_key</code> · <code>record_api_key_auth</code> · <code>write_auth_audit</code></td></tr>
+      <tr><td><code>audit_context.py</code> / <code>audit_recorder.py</code></td><td>审计上下文 contextvar；审计写入窄协议</td><td><code>bind_request_context</code> · <code>AuditRecorder</code></td></tr>
+      <tr><td><code>skill_service.py</code></td><td>技能清单、启停与物化视图重建</td><td><code>list_skills/set_enabled/refresh_view/graph_sources</code></td></tr>
+      <tr><td><code>knowledge_service.py</code></td><td>切分、嵌入、索引与融合检索</td><td><code>index_workspace</code> · <code>search</code>（RRF <code>_RRF_K=60</code>）</td></tr>
+      <tr><td><code>memory_service.py</code></td><td>长期记忆查询与删除</td><td><code>to_store_key</code> · <code>to_virtual_path</code></td></tr>
+      <tr><td><code>attachment_service.py</code></td><td>附件上传/列举/删除 + 多模态消息构造</td><td><code>upload/list/delete/build_user_content/limits</code></td></tr>
+      <tr><td><code>usage_service.py</code> / <code>usage.py</code></td><td>用量聚合；token 累计器</td><td><code>summarize</code> · <code>UsageAccumulator</code></td></tr>
+      <tr><td><code>health.py</code> / <code>model_catalog.py</code> / <code>tool_catalog.py</code></td><td>存活就绪指标、模型清单、工具清单</td><td><code>readiness</code> · <code>metrics</code> · <code>source_of</code></td></tr>
+      <tr><td><code>workspace_service.py</code> / <code>thread_export.py</code> / <code>message_utils.py</code> / <code>runnable.py</code></td><td>文件面板、Markdown 导出、消息工具、运行配置构造</td><td><code>list_dir</code> · <code>render_markdown</code> · <code>build_runnable_config</code></td></tr>
+    </tbody>
+  </table>
+</details>
+
+<details>
+  <summary>runtime 层 · 模块与 7 个存储</summary>
+  <table>
+    <thead><tr><th>模块</th><th>职责</th><th>关键符号</th></tr></thead>
+    <tbody>
+      <tr><td><code>thread_store.py</code></td><td>会话元数据与分支记录（<code>thread_meta</code> / <code>thread_branches</code>）</td><td><code>open_thread_store</code> · <code>ThreadMetaStore</code></td></tr>
+      <tr><td><code>audit_store.py</code> / <code>audit_archive.py</code> / <code>audit_retention.py</code></td><td>审计表、JSONL 归档、保留期清理</td><td><code>AuditStore</code> · <code>AuditArchive.batch</code> · <code>AuditRetentionWorker.prune_once</code></td></tr>
+      <tr><td><code>api_key_store.py</code></td><td>API Key 存储（<code>api_keys</code>）</td><td><code>open_api_key_store</code></td></tr>
+      <tr><td><code>usage_store.py</code></td><td>Token 用量（<code>usage_log</code>）</td><td><code>UsageStore.record/summarize</code></td></tr>
+      <tr><td><code>skill_store.py</code> / <code>skills.py</code> / <code>skill_view.py</code></td><td>技能状态表、技能包解析、物化视图重建</td><td><code>SkillStateStore</code> · <code>inspect_skills</code> · <code>rebuild_view</code>/<code>sources_for_graph</code></td></tr>
+      <tr><td><code>store.py</code> / <code>checkpointer.py</code></td><td>长期记忆（<code>AsyncSqliteStore</code>）、对话检查点（<code>AsyncSqliteSaver</code>）</td><td><code>open_store</code> · <code>checkpointer_context</code></td></tr>
+      <tr><td><code>knowledge_store.py</code></td><td>知识库：FTS5 trigram + vec0 三路检索</td><td><code>open_knowledge_store</code> · <code>search_vector/search_keyword</code> · <code>_vec_table_ddl</code></td></tr>
+      <tr><td><code>sqlite_lifecycle.py</code></td><td>统一连接生命周期（WAL + <code>busy_timeout=5000</code>）</td><td><code>open_sqlite_store</code></td></tr>
+      <tr><td><code>sandbox/</code>（9 模块）</td><td>执行隔离协议与三档实现、装配工厂</td><td><code>SandboxRunner</code> · <code>ProcessSandboxRunner</code> · <code>WslSandboxRunner</code> · <code>DockerSandboxRunner</code> · <code>build_sandbox_runner</code></td></tr>
+      <tr><td><code>workspace_files.py</code></td><td>工作区路径校验（安全边界唯一实现）与文件读取</td><td><code>resolve_in_workspace</code> · <code>read_bytes_capped</code></td></tr>
+      <tr><td><code>execution_registry.py</code> / <code>host_shell.py</code></td><td>在跑命令登记与终止、宿主 shell 执行</td><td><code>bound_scope</code> · <code>register</code> · <code>abort_scope</code></td></tr>
+      <tr><td><code>interval_worker.py</code></td><td>后台周期任务骨架</td><td><code>IntervalWorker.start/stop/run_once</code></td></tr>
+      <tr><td><code>tool_outputs.py</code> / <code>attachments.py</code> / <code>folder_picker.py</code> / <code>rate_limiter.py</code></td><td>工具输出留存、附件文件、目录选择、限流</td><td><code>write_tool_output</code> · <code>save_attachment</code> · <code>pick_folder</code> · <code>is_allowed</code></td></tr>
+    </tbody>
+  </table>
+</details>
+
+<details>
+  <summary>agent 层 · 装配参数与工具集</summary>
+  <p><code>build_agent(config, *, scope, checkpointer, store, model_name, tools)</code> 传给 <code>create_deep_agent</code> 的参数：</p>
+  <pre><code>model          = ModelRegistry.get(resolved_name)
+system_prompt  = _FALLBACK_SYSTEM_PROMPT（兜底；Profile 的 base_system_prompt 仍生效）
+backend        = build_backend(config, store, scope=scope)          # CompositeBackend
+tools          = tool_bundle.tools                                   # 内置 + 自定义 + MCP
+skills         = sources_for_graph(...)                              # /.skills-active 或配置目录
+memory         = memory_plan.sources
+permissions    = build_permissions(backend)
+interrupt_on   = build_interrupt_on(execution_mode, sandbox_tier, require_approval)
+middleware     = [TodoListMiddleware, ContextEditingMiddleware,
+                  ModelCallLimitMiddleware(run_limit=max_model_calls_per_run, exit_behavior="end")]
+checkpointer   = AsyncSqliteSaver
+store          = AsyncSqliteStore
+context_schema = AgentRunContext
+name           = "universal-agent"</code></pre>
+  <p><b>工具集</b>（<code>agent/tools.py::BUILTIN_TOOL_NAMES</code>）：
+  <span class="pill">ls</span><span class="pill">read_file</span><span class="pill">write_file</span>
+  <span class="pill">edit_file</span><span class="pill">glob</span><span class="pill">grep</span>
+  <span class="pill">execute</span><span class="pill">task</span><span class="pill">write_todos</span></p>
+  <p><b>扩展工具</b>：<span class="pill ok">web_tools.py → web_search / web_fetch</span>
+  <span class="pill ok">knowledge_tools.py → search_documents / index_documents</span>
+  <span class="pill warn">MCP（agent/mcp.py，可选，逐台记录状态）</span>
+  <span class="pill">自定义模块（config.custom_tool_modules，默认空）</span></p>
+  <p><b>图缓存</b>：<code>AgentFactory.get(model_name, *, scope)</code> 以 <code>(根绝对路径, 模型别名)</code> 为键、双检锁；<code>drop_workspace</code> / <code>cached_workspaces</code> 管理失效。</p>
+</details>
+
+<!-- ============================================================ 图 4 -->
+<h2 id="d4"><span class="no">图 4</span>端到端请求链路</h2>
+<p class="lede">场景：Web 界面发起一次对话并流式返回（<code>POST /api/threads/{thread_id}/runs</code>）。左侧为跳数，中列是"在哪"，右列是"发生了什么"。
+标 <span class="pill lock">写入点</span> 的三处是数据真正落盘的位置。</p>
+
+<div class="chain">
+
+  <div class="phase">阶段 A · 接入与鉴权</div>
+  <div class="hop"><div class="n"></div><div class="who">web/request_context.py::RequestContextMiddleware.__call__</div><div class="what">纯 ASGI 中间件解析并绑定 trace_id / IP / UA，回传 <code>X-Request-Id</code>；不缓冲 SSE</div></div>
+  <div class="hop"><div class="n"></div><div class="who">web/routes.py::run_agent</div><div class="what">依赖注入 <code>get_runs</code> → <code>require_state(request,"runs")</code>，缺依赖即 503</div></div>
+  <div class="hop"><div class="n"></div><div class="who">web/auth/deps.py::require_permission("thread:create")</div><div class="what">无主体 401 / 无权限 403 + 写 <code>permission_denied</code> 审计</div></div>
+  <div class="hop"><div class="n"></div><div class="who">application/api_key_auth.py::validate_api_key</div><div class="what">校验 API Key，随后 <code>record_api_key_auth</code> 写认证审计（带 ip/UA）</div></div>
+
+  <div class="phase">阶段 B · 运行准备</div>
+  <div class="hop hot"><div class="n"></div><div class="who">application/run_service.py::RunService.stream</div><div class="what">入口校验：<code>_check_run_limits</code>（→RunRegistry）· <code>normalize_thread_id</code> · <code>_split_user_input</code> · <code>_ensure_ownership</code></div></div>
+  <div class="hop"><div class="n"></div><div class="who">application/session_registry.py::SessionRegistry.resolve</div><div class="what">解析并确保 <code>SessionRoot</code>（会话文件根），按根装配 <code>SessionServices</code></div></div>
+  <div class="hop"><div class="n"></div><div class="who">agent/graph.py::AgentFactory.get → build_agent</div><div class="what">缓存未命中则以 <code>create_deep_agent</code> 建图（backend / permissions / interrupt_on / skills）</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">runtime/thread_store.py::ThreadMetaStore.record_turn</div><div class="what"><span class="pill lock">写入点</span> UPSERT <code>thread_meta</code>，顺带锁定文件根与 <code>workspace_bound</code></div></div>
+  <div class="hop"><div class="n"></div><div class="who">runtime/audit_store.py::AuditStore.log</div><div class="what">写 <code>thread_run</code> 事件（ip / UA / trace_id 取自 contextvar）</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">application/run_registry.py::RunRegistry.acquire</div><div class="what">占用运行槽位，返回 <code>RunHandle</code>（model / owner / actor / workspace）</div></div>
+  <div class="hop"><div class="n"></div><div class="who">runtime/execution_registry.py::bound_scope</div><div class="what">把本线程的命令执行纳入可终止作用域</div></div>
+
+  <div class="phase">阶段 C · 图执行</div>
+  <div class="hop"><div class="n"></div><div class="who">application/event_translator.py::LangGraphEventTranslator</div><div class="what">构造有状态翻译器，挂 <code>full_output_capture</code> 钩子</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">application/runnable.py::build_runnable_config</div><div class="what">构造 <code>config</code>（含 <code>recursion_limit</code>、分叉用的 <code>checkpoint_id</code>）</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">agent/run_context.py::AgentRunContext</div><div class="what">以 <code>memory_owner</code> 作为 context 传入，决定记忆命名空间</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">langgraph graph.astream(stream_mode=["messages","updates"])</div><div class="what">模型调用经 <code>llm/registry.py</code> 的懒加载实例</div></div>
+  <div class="hop"><div class="n"></div><div class="who">agent/backends.py::CompositeBackend</div><div class="what">工具执行按路径路由：<code>/memories/</code> → StoreBackend；根外 → 只读挂载；其余 → 工作区 / 沙箱</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">runtime/checkpointer.py::AsyncSqliteSaver</div><div class="what"><span class="pill lock">写入点</span> 每个节点写检查点（按 <code>thread_id</code>，供续跑与分叉）</div></div>
+
+  <div class="phase">阶段 D · 事件翻译与落库</div>
+  <div class="hop"><div class="n"></div><div class="who">RunService._iterate → translator.feed / _track_event</div><div class="what">增量翻译：文本 token、工具调用参数分片累积、todos、节点进度；INTERRUPT → <code>mark_hitl_pending</code></div></div>
+  <div class="hop"><div class="n"></div><div class="who">runtime/tool_outputs.py::write_tool_output</div><div class="what">大结果落盘留存（<code>asyncio.to_thread</code>），对话里只带引用</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">runtime/usage_store.py::UsageStore.record</div><div class="what"><span class="pill lock">写入点</span> <code>AgentEventType.USAGE</code> → 落 <code>usage_log</code></div></div>
+  <div class="hop"><div class="n"></div><div class="who">RunService._audit_tool_calls → AuditStore.log</div><div class="what">工具调用审计（<code>source_of(name)</code> 标注来源；内置默认不审计）</div></div>
+
+  <div class="phase">阶段 E · 收尾与传输</div>
+  <div class="hop"><div class="n"></div><div class="who">RunService._consume 的 finally</div><div class="what">释放槽位 → <code>_touch</code> 刷新活跃时间 → <code>_branches.refresh_head</code> 冻结分支头</div></div>
+  <div class="hop"><div class="n"></div><div class="who">RunService 产出 AgentEvent(DONE)</div><div class="what">应用事件与传输解耦，CLI 与 Web 共享同一事件流</div></div>
+  <div class="hop hot"><div class="n"></div><div class="who">web/routes.py::_encode_stream → web/sse.py::encode_sse</div><div class="what">编码为 SSE 帧</div></div>
+  <div class="hop"><div class="n"></div><div class="who">StreamingResponse(text/event-stream)</div><div class="what">响应头含 <code>X-Accel-Buffering: no</code>，避免反代缓冲</div></div>
+
+</div>
+
+<!-- ============================================================ 图 5 -->
+<h2 id="d5"><span class="no">图 5</span>运行编排内部协作</h2>
+<p class="lede"><code>RunService</code> 是接口层唯一认识的运行入口，但它本身很薄——真正的状态与规则被拆给三个协作者，构造期一次性装配。</p>
+
+<div class="grid2">
+  <div class="box">
+    <span class="t">组合结构</span>
+    <pre><code>RunService(config, thread_store, graph_factory,
+           workspaces, audit_store, usage_store, tool_catalog)
+ ├── self._registry = RunRegistry(config)
+ │      槽位 / 累计计数 / 限流 / HITL 挂起登记
+ ├── self._governor = RunGovernor(config, registry, audit=self._audit)
+ │      超时取消 · 审批过期（同一把 Lock，临界区不 await）
+ └── self._branches = RunBranchService(
+           config, thread_store, graph_factory,
+           registry, workspaces, audit=self._audit)
+        编辑/重生分叉：只准备，不产出事件</code></pre>
+  </div>
+  <div class="box">
+    <span class="t">职责边界（谁不做什么）</span>
+    <ul style="margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--dim)">
+      <li><code>RunRegistry</code>：不碰图、不产出事件，只维护运行态事实</li>
+      <li><code>RunGovernor</code>：只读 registry 快照 + <code>abort_scope</code>，不做业务判断</li>
+      <li><code>RunBranchService</code>：返回 <code>ForkPlan</code>，事件由 <code>RunService._consume</code> 统一产出</li>
+      <li><code>ThreadService</code>：会话聚合读写，与运行期事件流解耦</li>
+      <li><code>SessionRegistry</code>：解析根 + 装配服务，不承载运行语义</li>
+    </ul>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th>调用点</th><th>被调用</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>接口层 <code>routes.py</code> / <code>cli.py</code></td><td><code>RunService.stream / resume / regenerate / edit / stop</code></td><td>唯一入口，无第二个运行通道</td></tr>
+    <tr><td><code>RunService.stream</code></td><td><code>_check_run_limits</code> · <code>workspaces.resolve</code> · <code>graph_factory.get</code> · <code>_record_turn</code> · <code>_acquire_run_slot</code> · <code>_consume</code></td><td>准备 + 委托</td></tr>
+    <tr><td><code>RunService.resume</code></td><td><code>build_resume_command</code> · <code>_ensure_ownership</code> · <code>_acquire_run_slot</code> · <code>_consume</code></td><td>HITL 恢复复用同一消费链</td></tr>
+    <tr><td><code>RunService.regenerate / edit</code></td><td><code>_branches.messages_of</code> → <code>_fork_and_run</code> → <code>prepare_fork</code> → <code>_consume(plan.graph, plan.payload, plan.handle)</code></td><td>分叉准备与事件消费的拼接点</td></tr>
+    <tr><td><code>RunService._consume</code></td><td><code>bound_scope</code> · <code>_iterate</code> · <code>_record_usage</code> · <code>_audit_tool_calls</code> · <code>release_run_slot</code> · <code>_touch</code> · <code>_branches.refresh_head</code></td><td>收尾链唯一所有者</td></tr>
+    <tr><td><code>RunService.enforce_governance</code></td><td><code>RunGovernor.enforce</code></td><td>由后台巡检协程周期调用</td></tr>
+    <tr><td><code>RunService._iterate</code></td><td><code>translator.feed / flush</code> · <code>_stream_graph</code> · <code>_track_event</code></td><td>流式翻译循环</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ 图 6 -->
+<h2 id="d6"><span class="no">图 6</span>HITL 中断与恢复时序</h2>
+<p class="lede">审批发生在图的 <code>__interrupt__</code> 节点：事件流推给前端 → 前端决策 → 恢复端点把决策编回 <code>Command(resume=...)</code>。</p>
+
+<div class="seq c5">
+  <div class="seq-head">
+    <div class="actor">前端<span>static/app.js</span></div>
+    <div class="actor">routes.py<span>/api/threads</span></div>
+    <div class="actor">RunService<span>run_service.py</span></div>
+    <div class="actor">LangGraph<span>astream</span></div>
+    <div class="actor">SQLite<span>checkpoint</span></div>
+  </div>
+  <div class="seq-body">
+    <div class="lifelines"><i></i><i></i><i></i><i></i><i></i></div>
+
+    <div class="msg" style="grid-column:1 / 3"><div class="lbl">① POST /runs <em>run_agent</em></div><div class="line"></div></div>
+    <div class="msg" style="grid-column:3 / 4"><div class="lbl">② stream()</div><div class="line"></div></div>
+    <div class="msg" style="grid-column:4 / 6"><div class="lbl">③ astream()</div><div class="line"></div></div>
+    <div class="msg ret" style="grid-column:4 / 6"><div class="lbl">④ 每节点写检查点</div><div class="line"></div></div>
+    <div class="msg ret" style="grid-column:4 / 5"><div class="lbl">⑤ <em>{"__interrupt__": (...)}</em></div><div class="line"></div></div>
+
+    <div class="msg self" style="grid-column:3 / 4"><div class="lbl">⑥ decode_interrupt<br>→ AgentEvent(INTERRUPT)</div><div class="line"></div></div>
+
+    <div class="msg ret" style="grid-column:1 / 3"><div class="lbl">⑦ SSE <em>interrupt</em> 帧 → 前端弹出审批</div><div class="line"></div></div>
+    <div class="msg" style="grid-column:1 / 3"><div class="lbl">⑧ POST /resume <em>resume_agent · hitl:approve</em></div><div class="line"></div></div>
+    <div class="msg" style="grid-column:3 / 5"><div class="lbl">⑨ build_resume_command → Command(resume={"decisions":[...]})</div><div class="line"></div></div>
+    <div class="msg" style="grid-column:4 / 6"><div class="lbl">⑩ astream(Command) 继续执行</div><div class="line"></div></div>
+    <div class="msg ret" style="grid-column:1 / 3"><div class="lbl">⑪ SSE token / tool_call / done</div><div class="line"></div></div>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="box">
+    <span class="t">挂起与过期</span>
+    <code>RunRegistry.mark_hitl_pending</code> 登记挂起；<code>RunGovernor.expire_stale_hitl</code> 按
+    <code>config.hitl_pending_ttl_seconds</code> 让超期审批失效。超期后恢复请求会得到领域异常而非静默成功。
+  </div>
+  <div class="box warn">
+    <span class="t">为什么不把审批放在接口层</span>
+    决策需要先归一化（<code>normalize_decisions</code>）再编成 LangGraph 能理解的
+    <code>Command</code> 形状；这段形状知识属于应用层。接口层只负责"把事件画出来 + 要一个决策"。
+  </div>
+</div>
+
+<!-- ============================================================ 图 7 -->
+<h2 id="d7"><span class="no">图 7</span>沙箱三档与选择逻辑</h2>
+<p class="lede">协议：<code>runtime/sandbox/protocol.py::SandboxRunner</code>（<code>tier</code> / <code>probe</code> / <code>describe</code> / <code>run</code> / <code>close</code>）。
+装配入口：<code>agent/backends.py::build_backend</code> 在 <code>execution_mode=="sandbox"</code> 时调 <code>build_sandbox_runner(config, workspace=...)</code>。</p>
+
+<div class="tiers">
+  <div class="tier t0">
+    <div class="tn">Tier 0</div>
+    <div class="tc"><b>ProcessSandboxRunner</b><span>sandbox/process_runner.py</span></div>
+    <div class="td">进程树管控 + 资源上限。Windows 下经 <code>_winjob.py</code>（Job Object + ctypes）兜住子树</div>
+    <div class="td">兜底档</div>
+  </div>
+  <div class="tier t1">
+    <div class="tn">Tier 1</div>
+    <div class="tc"><b>WslSandboxRunner</b><span>sandbox/wsl_runner.py</span></div>
+    <div class="td">WSL2 发行版 + Linux rlimit + GNU <code>timeout</code>；<code>distro=config.sandbox_wsl_distro</code></div>
+    <div class="td">auto 首选</div>
+  </div>
+  <div class="tier t2">
+    <div class="tn">Tier 2</div>
+    <div class="tc"><b>DockerSandboxRunner</b><span>sandbox/docker_runner.py</span></div>
+    <div class="td">一次性容器、仅挂载工作区、网络默认切断；<b>刻意不参与 auto</b></div>
+    <div class="td">仅显式指定</div>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="box">
+    <span class="t">auto 选择顺序（从强到弱）</span>
+    <code>_AUTO_ORDER = (WSL, PROCESS)</code> → 取首个 <code>probe()</code> 通过者。
+    Docker 不进 auto 的原因写在 <code>factory.py</code> 头注释：容器启动代价与镜像依赖会让"默认路径"不可预期。
+  </div>
+  <div class="box danger">
+    <span class="t">显式档位不静默降级</span>
+    显式指定 <code>docker</code> 时若 <code>probe()</code> 失败 → 直接抛
+    <code>SandboxUnavailableError</code>；请求的档位不在 <code>_IMPLEMENTED_TIERS</code> 内同样报错。
+    宁可拒绝运行，也不悄悄换成更弱的隔离。
+  </div>
+</div>
+<p class="cap">相关配置：<code>execution_mode</code> · <code>sandbox_tier</code> · <code>sandbox_require_approval</code> · <code>sandbox_wsl_distro</code>（见 <code>config.py</code>）。
+审批联动：<code>agent/guardrails.py::build_interrupt_on(execution_mode, sandbox_tier, require_approval)</code>。</p>
+
+<!-- ============================================================ 图 8 -->
+<h2 id="d8"><span class="no">图 8</span>知识库 / 技能 / 记忆三子系统</h2>
+
+<div class="box">
+  <span class="t">技能（三段收敛，各管一件事）</span>
+  <pre><code>是什么   runtime/skills.py::inspect_skills         技能包解析与校验
+是否启用 runtime/skill_store.py::SkillStateStore  表 skill_state，唯一真相（无记录 = 启用）
+物化视图 runtime/skill_view.py::rebuild_view      派生产物，先建临时目录再整体替换
+
+写入顺序（application/skill_service.py::set_enabled）：先落库 → 再重建视图
+建图读取 runtime/skill_view.py::sources_for_graph(view_dir, configured_sources, view_source)
+        视图存在 → /.skills-active ；不存在 → 退回配置目录并告警
+装配时机 SessionRegistry._assemble 时按根刷新；SessionRegistry.refresh_views 可全量重建</code></pre>
+</div>
+
+<div class="box">
+  <span class="t">知识库（按工作区各一份，嵌入后端全局共享）</span>
+  <pre><code>句柄   knowledge_runtime.py::ensure_service(config, scope=...)  dict[根绝对路径] → (退出栈, 服务)
+       knowledge_db_path  →  &lt;db_path 父目录&gt;/knowledge-&lt;workspace_slug&gt;.db
+服务   application/knowledge_service.py::KnowledgeService
+       切分：MarkdownHeaderTextSplitter + RecursiveCharacterTextSplitter
+       检索：向量 + FTS + LIKE 三路 → 倒数排名融合（_RRF_K = 60）
+存储   runtime/knowledge_store.py::KnowledgeStore（只存取，不切分/不嵌入）
+       三路共用一库：vec0 KNN / FTS5 trigram / &lt;3 字符回落 instr
+       owner_id 冗余进 vec0 metadata，跨主体隔离在 SQL 内完成
+工具   knowledge_tools.py::search_documents / index_documents（按本轮 AgentRunContext.workspace 取服务）
+接口   web/knowledge_routes.py（查看/索引/删除，无检索端点）</code></pre>
+</div>
+
+<div class="box">
+  <span class="t">记忆（与图共享同一个 store 实例）</span>
+  <pre><code>存储   runtime/store.py::open_store → langgraph AsyncSqliteStore
+命名空间 agent/run_context.py::namespace_of_runtime → (memories, &lt;主体&gt;)；非法字符退化 sha256 前 32 位
+路由   agent/backends.py 中 /memories/ → StoreBackend(namespace=_MEMORY_NAMESPACE, store=store)
+管理   application/memory_service.py::list_memories / delete_memory（/memories/x.md ↔ /x.md）</code></pre>
+  <p class="cap">装配时"面板与管理共用同一 store 实例"是有意为之：各持一份会让"面板显示已删除"与"Agent 还记得"同时成立。见 <code>bootstrap/core.py</code> 注释。</p>
+</div>
+
+<!-- ============================================================ 图 9 -->
+<h2 id="d9"><span class="no">图 9</span>存储落盘地图</h2>
+<p class="lede">6 个业务 store + checkpointer + 长期记忆 store 共用同一个 <code>config.db_path</code>，由 <code>bootstrap/core.py</code> 的一个 <code>async with</code> 组统一打开；知识库按工作区各自独立一库。</p>
+
+<div class="grid2">
+  <div class="box">
+    <span class="t">主库 <code>DB_PATH</code>（默认 <code>./.data/agent.db</code>）</span>
+    <table>
+      <thead><tr><th>表</th><th>所有者</th><th>领域对象</th></tr></thead>
+      <tbody>
+        <tr><td><code>thread_meta</code></td><td><code>ThreadMetaStore</code></td><td>会话元数据（标题/轮次/owner/标签/归档/workspace 绑定）</td></tr>
+        <tr><td><code>thread_branches</code></td><td><code>ThreadMetaStore</code></td><td>分支与分支头检查点</td></tr>
+        <tr><td><code>audit_log</code></td><td><code>AuditStore</code></td><td>审计事件</td></tr>
+        <tr><td><code>api_keys</code></td><td><code>APIKeyStore</code></td><td>API Key</td></tr>
+        <tr><td><code>usage_log</code></td><td><code>UsageStore</code></td><td>Token 用量</td></tr>
+        <tr><td><code>skill_state</code></td><td><code>SkillStateStore</code></td><td>技能启停</td></tr>
+        <tr><td>langgraph 检查点表</td><td><code>AsyncSqliteSaver</code></td><td>对话状态（按 thread_id）</td></tr>
+        <tr><td>langgraph store 表</td><td><code>AsyncSqliteStore</code></td><td>长期记忆 <code>/memories/</code></td></tr>
+      </tbody>
+    </table>
+    <p class="cap">全部经 <code>runtime/sqlite_lifecycle.py::open_sqlite_store</code>（WAL + <code>busy_timeout=5000</code>）。</p>
+  </div>
+
+  <div class="box">
+    <span class="t">知识库库（每工作区一个）</span>
+    <table>
+      <thead><tr><th>表</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><code>knowledge_meta</code></td><td>索引元信息</td></tr>
+        <tr><td><code>knowledge_documents</code></td><td>文档级索引（来源路径 + 内容哈希）</td></tr>
+        <tr><td><code>knowledge_chunks</code></td><td>分块正文</td></tr>
+        <tr><td><code>knowledge_chunks_fts</code></td><td>FTS5 trigram 关键词检索</td></tr>
+        <tr><td><code>knowledge_chunks_vec</code></td><td><code>vec0(owner_id text, embedding float[dims])</code></td></tr>
+      </tbody>
+    </table>
+    <p class="cap">加载扩展：<code>conn.enable_load_extension(True)</code> → <code>conn.load_extension(sqlite_vec.loadable_path())</code>。</p>
+  </div>
+</div>
+
+<div class="box">
+  <span class="t">目录树（配置项 → 派生路径）</span>
+  <div class="tree">
+<span class="k">&lt;数据目录&gt;</span> = <span class="c">DB_PATH 的父目录</span>
+<span class="d">├──</span> <span class="f">agent.db</span>                       <span class="c">主库：7 张业务表 + 检查点 + 长期记忆</span>
+<span class="d">├──</span> <span class="f">knowledge-&lt;workspace_slug&gt;.db</span>   <span class="c">按工作区各一份（config.py::resolved_sessions_root 同级的派生）</span>
+<span class="d">├──</span> <span class="d">sessions/</span>                     <span class="c">SESSIONS_ROOT；默认位；config.session_dir(thread_id) 取子目录</span>
+<span class="d">│   └──</span> <span class="d">&lt;thread_id&gt;/</span>              <span class="c">会话未绑定工作区时的专属文件根</span>
+<span class="d">├──</span> <span class="d">roots/</span>                        <span class="c">config.roots_store_root；根外存储父目录</span>
+<span class="d">│   └──</span> <span class="d">&lt;根标识&gt;/</span>                  <span class="c">config.SessionRoot.storage_dir</span>
+<span class="d">│       ├──</span> <span class="d">skills/</span>               <span class="c">技能来源目录</span>
+<span class="d">│       ├──</span> <span class="d">skills-active/</span>        <span class="c">物化视图（虚拟路径 /.skills-active）</span>
+<span class="d">│       └──</span> <span class="d">tool-outputs/</span>         <span class="c">工具输出留存（虚拟路径 /_tool_outputs）</span>
+<span class="d">├──</span> <span class="d">embed-venv/</span>                   <span class="c">embedding_backend=subprocess 时的独立 venv</span>
+<span class="d">└──</span> <span class="d">&lt;audit_archive_dir&gt;/</span>          <span class="c">审计归档（JSONL，写 .part 后改名）</span>
+  </div>
+</div>
+
+<!-- ============================================================ 图 10 -->
+<h2 id="d10"><span class="no">图 10</span>后台任务与治理</h2>
+<p class="lede">两者共用 <code>runtime/interval_worker.py::IntervalWorker</code> 骨架（启动即跑一次、单次失败不退出、停止时 cancel 后 await）；<b>只有 Web 长驻形态启动</b>，CLI 不背负常驻协程。</p>
+
+<table>
+  <thead><tr><th>任务</th><th>类 / 工厂</th><th>启动点</th><th>回调与周期</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>审计保留清理</td>
+      <td><code>AuditRetentionWorker</code><br><code>bootstrap/web.py::build_audit_retention_worker</code></td>
+      <td><code>interfaces/web/app.py::_lifespan</code> L60-66</td>
+      <td><code>prune_once</code>（先归档后删除，fail-closed）；<code>audit_retention_interval_seconds</code> / <code>audit_retention_days</code> / <code>audit_archive_enabled</code></td>
+    </tr>
+    <tr>
+      <td>运行治理巡检</td>
+      <td>裸 <code>IntervalWorker</code><br><code>bootstrap/web.py::build_run_governance_worker</code></td>
+      <td><code>interfaces/web/app.py::_lifespan</code> L70-74</td>
+      <td><code>RunService.enforce_governance</code>；<code>run_governance_interval_seconds</code>，关联 <code>run_max_seconds</code> / <code>hitl_pending_ttl_seconds</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="grid2">
+  <div class="box ok">
+    <span class="t">停止顺序（app.py finally）</span>
+    先停治理任务（它会写审计）→ 再停清理任务（它持有 audit_store 连接）→ 最后连接由
+    <code>build_app_context</code> 退出时统一关闭。顺序颠倒会让清理任务在已关闭的连接上执行 DELETE。
+  </div>
+  <div class="box warn">
+    <span class="t">启动失败不阻断服务</span>
+    两个 worker 的 <code>start()</code> 各自包 try/except：审计清理失败则保留全量日志；治理失败则超时运行与超期审批不再自动收口。两者都记 exception，可另行告警。
+  </div>
+</div>
+
+<div class="box">
+  <span class="t">可观测性三条线（互相独立，不可替代）</span>
+  <div class="grid2">
+    <div>
+      <b>审计</b><br>
+      <span style="font-size:12.6px;color:var(--dim)">入口：<code>AuditStore.log</code>；上下文由 <code>application/audit_context.py</code> 的 contextvar 提供（ip / UA / trace_id）。
+      <code>main.py</code> 的 <code>_TraceFilter</code> 把同一 trace_id 注入每条日志，text 与 JSON 两种格式都带。</span>
+    </div>
+    <div>
+      <b>用量</b><br>
+      <span style="font-size:12.6px;color:var(--dim)">运行期由 <code>usage.py::UsageAccumulator</code> 累计 → <code>USAGE</code> 事件 → <code>UsageStore.record</code>；
+      对外经 <code>UsageService.summarize</code> 按用户/会话/时间窗聚合。</span>
+    </div>
+    <div>
+      <b>指标与就绪</b><br>
+      <span style="font-size:12.6px;color:var(--dim)"><code>HealthService.readiness</code> 复用同一个 <code>run_service</code> 实例读取运行登记与挂起审批集合（另建一份会永远读到 0）。</span>
+    </div>
+    <div>
+      <b>限流</b><br>
+      <span style="font-size:12.6px;color:var(--dim)"><code>runtime/rate_limiter.py::RateLimiter</code> 滑动窗口，只挂在认证端点（<code>auth/deps.py::enforce_rate_limit</code>）；
+      不进 <code>AppContext</code>，因为只有 Web 需要。</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ 图 11 -->
+<h2 id="d11"><span class="no">图 11</span>代码体量分布</h2>
+<p class="lede">按目录实测（含空行与注释）。标记 <code>≥</code> 表示该目录内有文件行数触达统计工具的单文件 1000 行上限，实际值更大。</p>
+
+<div class="bars">
+  <div class="barrow"><div class="bl">tests/ （测试）</div><div><div class="bar b2" style="width:98%"></div></div><div class="bv">20,627</div></div>
+  <div class="barrow"><div class="bl">application/</div><div><div class="bar" style="width:43%"></div></div><div class="bv">≥ 9,053</div></div>
+  <div class="barrow"><div class="bl">runtime/</div><div><div class="bar" style="width:42%"></div></div><div class="bv">≥ 8,814</div></div>
+  <div class="barrow"><div class="bl">docs/ （文档）</div><div><div class="bar b4" style="width:35%"></div></div><div class="bv">≥ 7,377</div></div>
+  <div class="barrow"><div class="bl">scripts/ （探针/冒烟）</div><div><div class="bar b3" style="width:27%"></div></div><div class="bv">5,642</div></div>
+  <div class="barrow"><div class="bl">interfaces/web/static</div><div><div class="bar b3" style="width:20%"></div></div><div class="bv">≈ 4,200</div></div>
+  <div class="barrow"><div class="bl">interfaces/ （py）</div><div><div class="bar" style="width:16%"></div></div><div class="bv">3,384</div></div>
+  <div class="barrow"><div class="bl">agent/</div><div><div class="bar" style="width:13%"></div></div><div class="bv">2,804</div></div>
+  <div class="barrow"><div class="bl">llm/</div><div><div class="bar" style="width:6%"></div></div><div class="bv">1,219</div></div>
+  <div class="barrow"><div class="bl">根级模块（8 个）</div><div><div class="bar" style="width:4%"></div></div><div class="bv">865 +</div></div>
+  <div class="barrow"><div class="bl">bootstrap/</div><div><div class="bar" style="width:2%"></div></div><div class="bv">384</div></div>
+</div>
+
+<div class="grid2">
+  <div class="box info">
+    <span class="t">规模定位</span>
+    源码 ≈ 3.6–4.0 万行（不含测试/文档），落在"生产级通用 Agent 应用"合理区间（1.5 万–4 万）的中位到上沿；
+    测试/业务比 ≈ 0.6:1。框架适配层（图装配 + 模型注册 + checkpointer）合计约 900 行，占比约 4%——
+    说明没有在 LangGraph 之上重造框架。
+  </div>
+  <div class="box warn">
+    <span class="t">当前最明确的规模债：单文件粒度</span>
+    <code>interfaces/web/routes.py</code> 965 ·
+    <code>runtime/knowledge_store.py</code> 900 ·
+    <code>scripts/inspect_thread.py</code> 718 ·
+    <code>application/thread_service.py</code> / <code>run_service.py</code> · <code>runtime/thread_store.py</code>（均 &gt;1000）·
+    <code>interfaces/web/static/app.js</code>（&gt;1500）。
+    经验阈值：Python &gt;600~800 行、JS &gt;500 行即应考虑拆分。
+  </div>
+</div>
+
+<!-- ============================================================ 图 12 -->
+<h2 id="d12"><span class="no">图 12</span>运行时图拓扑（LangGraph 节点与边）</h2>
+<p class="lede">
+  <code>agent/graph.py</code> 不定义任何节点或边——它把参数交给 deepagents 0.7.14 的
+  <code>create_deep_agent</code>（<code>agent/graph.py</code> L189），后者先组中间件栈，再由 langchain 1.4.0 的
+  <code>agents/factory.py::create_agent</code> 编译成 <code>StateGraph</code>。
+  因此「当前图结构」= <b>中间件栈的推导结果</b>：<code>model</code> / <code>tools</code> 恒建（factory L1543、L1547），
+  其余节点每个对应一个<b>覆写了钩子</b>的中间件，节点名即 <code>&lt;MiddlewareName&gt;.&lt;hook&gt;</code>（factory L1549-1645）。
+  下方节点与边为真实装配后的 dump，非静态推断。
+</p>
+
+<div class="flow">
+  <div class="fnode term">__start__</div>
+  <div class="fconn"><span class="a">↓</span> START → 首个 before_agent（factory L1648-1653：无 before_agent 时才直连循环入口）</div>
+
+  <div class="fnode">SkillsMiddleware.before_agent<span class="tag">一次性</span><span class="why">skills= 非空时存在 · 载入技能索引</span></div>
+  <div class="fconn"><span class="a">↓</span></div>
+
+  <div class="fnode">PatchToolCallsMiddleware.before_agent<span class="tag">一次性</span><span class="why">deepagents 核心栈恒在 · 补齐历史中缺失的 tool_call</span></div>
+  <div class="fconn"><span class="a">↓</span></div>
+
+  <div class="fnode opt">MemoryMiddleware.before_agent<span class="tag">一次性</span><span class="why">memory=memory_plan.sources or None 非空时才有此节点</span></div>
+  <div class="fconn"><span class="a">↓</span> 链尾接「循环入口」（factory L1756-1764）</div>
+
+  <div class="fnode entry">ModelCallLimitMiddleware.before_model<span class="tag">循环入口</span><span class="why">agent/graph.py L143 显式挂载 · 超限跳 __end__</span></div>
+  <div class="fconn"><span class="a">↓</span> 条件边：超限 → __end__；正常 → model（factory L1767-1785）</div>
+
+  <div class="fnode">model<span class="why">RunnableCallable(model_node, amodel_node) · 中间件 wrap_model_call 在节点内部洋葱式包裹</span></div>
+  <div class="fconn"><span class="a">↓</span> 倒序串联 after_model 链（factory L1788-1800）</div>
+
+  <div class="fnode opt">HumanInTheLoopMiddleware.after_model<span class="tag">可选</span><span class="why">interrupt_on 非空时存在：local / sandbox 且未关闭审批</span></div>
+  <div class="fconn"><span class="a">↓</span></div>
+
+  <div class="fnode">ModelCallLimitMiddleware.after_model<span class="why">累计本轮调用次数</span></div>
+  <div class="fconn"><span class="a">↓</span></div>
+
+  <div class="fnode exit">TodoListMiddleware.after_model<span class="tag">循环出口</span><span class="why">loop_exit_node = after_model 链的第 0 个（factory L1664-1667）</span></div>
+  <div class="fbranch">
+    <div class="hh">出口条件边（实测三条，factory L1687-1718）</div>
+    <div class="fe">→ tools <em>本轮有 tool_calls</em></div>
+    <div class="fe">→ ModelCallLimitMiddleware.before_model <em>无 tool_calls 但未结束 / 中间件注入合成消息 → 回到循环入口，不再经过 before_agent 链</em></div>
+    <div class="fe">→ __end__ <em>可以结束</em></div>
+  </div>
+  <div class="fconn"><span class="a">↑</span> 回环：tools 的出边同样指向循环入口（factory L1687-1699），所以「工具 → 再想一轮」必然重跑 before_model 链</div>
+</div>
+
+<p class="fnote">
+  注意哪些中间件<b>不产生节点</b>：<code>FilesystemMiddleware</code>、<code>SubAgentMiddleware</code>、
+  <code>SummarizationMiddleware</code>、<code>ContextEditingMiddleware</code> 只覆写
+  <code>wrap_model_call</code> / <code>wrap_tool_call</code>，它们活在 <code>model</code> 与 <code>tools</code> 节点内部，
+  在拓扑上不可见。这正是「读中间件清单 ≠ 读图」的原因。
+</p>
+
+<h3>节点存在性（两种档位实测对比）</h3>
+<table>
+  <thead><tr><th>节点</th><th>disabled 档位</th><th>local / sandbox 档位</th><th>出现条件</th></tr></thead>
+  <tbody>
+    <tr><td><code>SkillsMiddleware.before_agent</code></td><td class="yes">有</td><td class="yes">有</td><td><code>skills=skill_sources or None</code> 非空（<code>runtime/skill_view.py::sources_for_graph</code>）</td></tr>
+    <tr><td><code>PatchToolCallsMiddleware.before_agent</code></td><td class="yes">有</td><td class="yes">有</td><td>deepagents 核心栈恒在（不可被 profile 排除）</td></tr>
+    <tr><td><code>MemoryMiddleware.before_agent</code></td><td class="yes">有*</td><td class="yes">有*</td><td>*仅当长期记忆来源非空；实测「工作区无 AGENTS.md」时该节点消失</td></tr>
+    <tr><td><code>ModelCallLimitMiddleware.before_model</code></td><td class="yes">有</td><td class="yes">有</td><td>本项目显式挂载（<code>agent/graph.py</code> L143-154）</td></tr>
+    <tr><td><code>model</code> / <code>tools</code></td><td class="yes">有</td><td class="yes">有</td><td>create_agent 恒建；<code>tools</code> 仅在存在工具时建</td></tr>
+    <tr><td><code>HumanInTheLoopMiddleware.after_model</code></td><td class="no">无（实测）</td><td class="yes">有</td><td><code>interrupt_on</code> 非空：<code>agent/guardrails.py::build_interrupt_on</code> 在 disabled 档位返回 <code>{}</code></td></tr>
+    <tr><td><code>TodoListMiddleware.after_model</code></td><td class="yes">有</td><td class="yes">有</td><td>本项目显式挂载（deepagents 0.7.14 默认栈不含规划能力）</td></tr>
+    <tr><td><code>ModelCallLimitMiddleware.after_model</code></td><td class="yes">有</td><td class="yes">有</td><td>同上</td></tr>
+  </tbody>
+</table>
+
+<div class="grid2">
+  <div class="box info">
+    <span class="t">tools 节点实际承载的工具（实测）</span>
+    <code>ls · read_file · write_file · edit_file · glob · grep · delete · execute · task · write_todos</code>
+    <p class="cap">
+      前 7 个来自 <code>FilesystemMiddleware</code>，<code>execute</code> 走 backend 的能力探测（非沙箱后端调用即返回错误），
+      <code>task</code> 来自 <code>SubAgentMiddleware</code>，<code>write_todos</code> 来自我们显式挂的 <code>TodoListMiddleware</code>；
+      传入的扩展工具与 MCP 工具在此列表之后追加。
+    </p>
+  </div>
+  <div class="box warn">
+    <span class="t">子 agent 不在主图拓扑里</span>
+    <code>task</code> 工具背后是 <code>SubAgentMiddleware</code> 在调用时编译的<b>子图</b>
+    （本项目的 general-purpose 子 agent 由 <code>agent/profiles.py</code> L66 显式启用），
+    它在主图上只是一个工具；子图的节点有自己的中间件栈，不会出现在图 12 中。
+  </div>
+</div>
+
+<div class="box">
+  <span class="t">State / Context / 运行配置（图的另外三要素）</span>
+  <table>
+    <thead><tr><th>要素</th><th>取值</th><th>来源</th></tr></thead>
+    <tbody>
+      <tr><td>state_schema</td><td><code>DeepAgentState</code>（<code>messages</code> 走 <code>DeltaChannel</code> reducer，检查点从 O(N²) 降到 O(N)）+ 各中间件贡献的 <code>PlanningState</code> / <code>ModelCallLimitState</code> / <code>FilesystemState</code> / <code>SkillsState</code> / <code>MemoryState</code></td><td>deepagents <code>graph.py</code> L73-77、L939-941</td></tr>
+      <tr><td>context_schema</td><td><code>AgentRunContext</code>（<code>user_id</code> → <code>/memories/</code> 命名空间；<code>workspace</code> → 知识库索引选择）</td><td><code>agent/run_context.py</code> · <code>agent/graph.py</code> L214</td></tr>
+      <tr><td>checkpointer / store</td><td><code>checkpointer</code> 由外层注入（中断恢复的前提）；<code>store</code> 必填，<code>/memories/</code> 路由依赖它</td><td><code>agent/graph.py</code> L114-117</td></tr>
+      <tr><td>编译期配置</td><td><code>recursion_limit=9999</code>、<code>metadata.ls_integration="deepagents"</code>、<code>name="universal-agent"</code></td><td>deepagents <code>graph.py</code> L969-978</td></tr>
+      <tr><td>图的生命周期</td><td><code>AgentFactory</code> 按 <code>(工作区, 模型别名)</code> 缓存已编译图，<code>drop_workspace</code> 按工作区回收</td><td><code>agent/graph.py</code> L287 / L329</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<details>
+  <summary>复现命令与 mermaid 原文（<code>graph.draw_mermaid()</code> 直接输出）</summary>
+  <pre><code># 与 build_agent 同一条装配路径，只把模型换成脚本假模型（避免真实 provider 调用）
+uv run python -c "
+import agent.graph as G
+from tests.conftest import make_config, make_root
+G.get_registry = lambda c: SimpleNamespace(default_name='fake', get=lambda name=None: ScriptedChatModel(...))
+agent = G.build_agent(cfg, scope=root, store=InMemoryStore())
+g = agent.get_graph()
+print(g.draw_mermaid()); print(sorted(g.nodes), list(g.edges))
+"</code></pre>
+  <pre><code>graph TD
+  __start__ --> SkillsMiddleware.before_agent
+  SkillsMiddleware.before_agent --> PatchToolCallsMiddleware.before_agent
+  PatchToolCallsMiddleware.before_agent --> MemoryMiddleware.before_agent
+  MemoryMiddleware.before_agent --> ModelCallLimitMiddleware.before_model
+  ModelCallLimitMiddleware.before_model -.-> model
+  ModelCallLimitMiddleware.before_model -.-> __end__
+  model --> HumanInTheLoopMiddleware.after_model
+  %% 上一行为 local / sandbox 档位；disabled 档位实测是 model --> ModelCallLimitMiddleware.after_model
+  HumanInTheLoopMiddleware.after_model --> ModelCallLimitMiddleware.after_model
+  ModelCallLimitMiddleware.after_model --> TodoListMiddleware.after_model
+  TodoListMiddleware.after_model -.-> tools
+  TodoListMiddleware.after_model -.-> ModelCallLimitMiddleware.before_model
+  TodoListMiddleware.after_model -.-> __end__
+  tools -.-> ModelCallLimitMiddleware.before_model</code></pre>
+  <p class="cap">
+    上游 <code>draw_mermaid()</code> 会把节点名里的 <code>.</code> 转义成 <code>\2e</code>；此处已还原为可读写法。
+    实线 = 无条件边，<code>-.-&gt;</code> = 条件边（节点声明了 <code>hook_config(can_jump_to=...)</code>）。
+  </p>
+</details>
+
+<!-- ============================================================ 附录 -->
+<h2 id="src">事实来源与校验方式</h2>
+<table>
+  <thead><tr><th>图中结论</th><th>可核对位置</th></tr></thead>
+  <tbody>
+    <tr><td>分层与依赖方向</td><td><code>.importlinter</code>（<code>root_packages</code> L15-21，契约 L23-105）；<code>uv run lint-imports</code></td></tr>
+    <tr><td>根级模块角色与白名单</td><td><code>tests/test_root_module_contract.py::_BOUNDARIES</code>(L46-77) · <code>_HANDLE_CALLERS</code>(L87)</td></tr>
+    <tr><td>应用层纯度 / 运行时端口</td><td><code>tests/application/test_layer_purity_contract.py</code> · <code>tests/application/test_runtime_port_contract.py</code></td></tr>
+    <tr><td>app.state 依赖项完整性</td><td><code>tests/interfaces/web/test_app_state_contract.py</code></td></tr>
+    <tr><td>装配流程与生命周期</td><td><code>bootstrap/core.py::build_app_context</code> · <code>interfaces/web/app.py::_lifespan</code></td></tr>
+    <tr><td>端到端链路各跳</td><td><code>application/run_service.py</code>(<code>stream</code> L293 / <code>resume</code> L587 / <code>_consume</code> L790 / <code>_iterate</code> L908 / <code>_stream_graph</code> L1089)</td></tr>
+    <tr><td>路由与端点</td><td><code>interfaces/web/routes.py</code>(<code>APIRouter(prefix="/api")</code> L77 · <code>_encode_stream</code> L962) 及各 <code>*_routes.py</code></td></tr>
+    <tr><td>存储表与落盘路径</td><td><code>runtime/*_store.py</code> · <code>runtime/sqlite_lifecycle.py</code> · <code>config.py</code>(<code>db_path</code> L492 · <code>resolved_sessions_root</code> L1287 · <code>roots_store_root</code> L1299 · <code>SessionRoot.storage_dir</code> L1695)</td></tr>
+    <tr><td>沙箱三档与 auto 顺序</td><td><code>runtime/sandbox/factory.py</code>(<code>resolve_tier</code> L55 · <code>build_sandbox_runner</code> L88 · <code>_create_runner</code> L154)</td></tr>
+    <tr><td>技能 / 知识库 / 记忆</td><td><code>runtime/skill_view.py</code> · <code>runtime/skill_store.py</code> · <code>knowledge_runtime.py</code> · <code>runtime/knowledge_store.py</code> · <code>agent/run_context.py</code></td></tr>
+    <tr><td>工具集清单</td><td><code>agent/tools.py::BUILTIN_TOOL_NAMES</code>(L57-69) · <code>web_tools.py::register_tools</code>(L472) · <code>knowledge_tools.py::register_tools</code>(L157)</td></tr>
+    <tr><td>运行时图节点与边</td><td><b>实测 dump</b>：<code>build_agent(...).get_graph()</code> 后取 <code>nodes</code> / <code>edges</code> / <code>draw_mermaid()</code>；节点生成规则见 <code>.venv/.../langchain/agents/factory.py</code>(L1543 <code>model</code> · L1547 <code>tools</code> · L1549-1645 钩子节点 · L1647-1827 边)；栈序见 <code>.venv/.../deepagents/graph.py</code>(L862-938) 与 <code>agent/graph.py</code>(L143-154 用户中间件插入点)</td></tr>
+    <tr><td>技术栈与版本</td><td><code>pyproject.toml</code>（deepagents ≥0.7.14 · langgraph ≥1.2.11 · langchain ≥1.4.0 · langgraph-checkpoint-sqlite ≥3.1.1 · langchain-mcp-adapters ≥0.3.2 · sqlite-vec ≥0.1.9 · FastAPI ≥0.141.1 · Python ≥3.14）</td></tr>
+  </tbody>
+</table>
+
+<footer>
+  <p><b>本文件独立于</b> <code>docs/overview/architecture.html</code>（该文件是叙述型技术文档，本页是图形化视图），两者互不追加、互不覆盖。</p>
+  <p>生成方式：全仓源码静态扫描（模块 docstring、import 关系、路由装饰器、DDL 语句、契约测试）后手工落图；
+  每个节点均标注真实文件路径与符号名，可直接回源码核对。样式为自包含 CSS，无外部字体 / CDN 依赖，可离线打开。</p>
+  <p><b>图 12 例外说明</b>：该图的节点与边不是静态扫描得出，而是<b>真实装配后 dump</b> 的结果
+  （<code>build_agent</code> + 脚本假模型，两种执行档位各跑一次），因此包含上游框架在编译期才决定的节点名与条件边。</p>
+  <p>行数数据来源：<code>ripgrep</code> 逐文件计数（排除 <code>__pycache__</code> / <code>.venv</code>），单文件上限 1000 行，触顶者以 <code>≥</code> 标注。</p>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav a[href^='#']"));
+  var sections = links.map(function (a) {
+    return document.getElementById(a.getAttribute("href").slice(1));
+  }).filter(Boolean);
+
+  // 滚动高亮：用 rAF 节流，避免高频 scroll 事件造成重复样式计算
+  var ticking = false;
+  function sync() {
+    ticking = false;
+    var best = null;
+    var threshold = 120;
+    for (var i = 0; i < sections.length; i += 1) {
+      var top = sections[i].getBoundingClientRect().top;
+      if (top - threshold <= 0) { best = sections[i].id; }
+    }
+    if (!best && sections.length) { best = sections[0].id; }
+    links.forEach(function (a) {
+      a.classList.toggle("active", a.getAttribute("href") === "#" + best);
+    });
+  }
+  function onScroll() {
+    if (!ticking) {
+      ticking = true;
+      window.requestAnimationFrame(sync);
+    }
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", onScroll);
+  sync();
+})();
+</script>
+</body>
+</html>

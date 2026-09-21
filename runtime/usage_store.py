@@ -21,6 +21,9 @@ from typing import Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
+from thread_utils import normalize_thread_id
+
 logger = logging.getLogger(__name__)
 
 MAX_MODEL_CHARS = 128
@@ -77,6 +80,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
     model             TEXT NOT NULL DEFAULT '',
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
+    trace_id          TEXT,
     created_at        TEXT NOT NULL
 );
 
@@ -85,6 +89,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_log_owner_time
 
 CREATE INDEX IF NOT EXISTS idx_usage_log_thread_time
     ON usage_log (thread_id, created_at DESC);
+"""
+
+_TRACE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_usage_log_trace
+    ON usage_log (trace_id, created_at DESC);
+"""
+"""trace_id 的索引。
+
+WHY 单独放在这里而不是写进 ``_SCHEMA``：``CREATE TABLE IF NOT EXISTS`` 对老库不做
+任何事，老库的 usage_log 里还没有 trace_id 这一列——索引若排在补列的 ALTER 之前，
+``executescript`` 会以「no such column」失败，**应用直接起不来**。
 """
 
 
@@ -116,6 +131,7 @@ class UsageStore:
         prompt_tokens: int,
         completion_tokens: int,
         owner_id: str = "",
+        trace_id: str | None = None,
         created_at: str | None = None,
     ) -> int:
         """写入一条用量记录。
@@ -126,6 +142,7 @@ class UsageStore:
             prompt_tokens: 输入 token 数。
             completion_tokens: 输出 token 数。
             owner_id: 会话所有者；认证关闭时为空串。
+            trace_id: 本次请求的链路标识；``None`` 表示未知（例如 CLI 形态）。
             created_at: 落库时间；``None`` 表示取当前 UTC 时间。
 
         Returns:
@@ -147,8 +164,9 @@ class UsageStore:
                 async with self._conn.execute(
                     """
                     INSERT INTO usage_log
-                        (thread_id, owner_id, model, prompt_tokens, completion_tokens, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (thread_id, owner_id, model, prompt_tokens, completion_tokens,
+                         trace_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_thread,
@@ -156,6 +174,7 @@ class UsageStore:
                         normalized_model,
                         prompt,
                         completion,
+                        trace_id,
                         timestamp,
                     ),
                 ) as cursor:
@@ -307,14 +326,19 @@ class UsageStore:
 
     @staticmethod
     def _validate_thread_id(thread_id: str) -> str:
-        if not isinstance(thread_id, str):
-            raise ValueError(f"thread_id 必须是字符串，实际：{type(thread_id).__name__}")
-        normalized = thread_id.strip()
-        if not normalized:
-            raise ValueError("thread_id 不能为空")
-        if len(normalized) > 128:
-            raise ValueError("thread_id 过长")
-        return normalized
+        """校验会话 ID 并返回规范化结果。
+
+        WHY 委托 ``thread_utils`` 而不是本模块自己判断：这条规则的权威实现在
+        中立模块里（路由层、服务层、其它 store 都用它），长度上限也在那里。
+        本模块曾把「非字符串 / 空 / 超过 128」重写了一遍——上限写成字面量，
+        报错文案也不带具体长度；改上限时它会静默不跟，失效方式是
+        「接口放行、用量入库被拒」这类只在特定长度下才暴露的错误。
+        本方法保留下来只作为调用点的稳定名字，删掉它会牵动 ``record`` 的调用行。
+
+        Raises:
+            ValueError: 非字符串、为空或超出长度上限。
+        """
+        return normalize_thread_id(thread_id)
 
     @staticmethod
     def _validate_model(model: str) -> str:
@@ -347,6 +371,21 @@ class UsageStore:
         return value
 
 
+async def _prepare_usage_store(conn: aiosqlite.Connection) -> UsageStore:
+    """建表、补列并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    try:
+        # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+        # 而升级前的库里已有用量数据。重复执行必然抛「列已存在」，忽略即可。
+        await conn.execute("ALTER TABLE usage_log ADD COLUMN trace_id TEXT;")
+    except Exception:
+        logger.debug("usage_log.trace_id 已存在，跳过迁移")
+    # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+    await conn.executescript(_TRACE_INDEX)
+    await conn.commit()
+    return UsageStore(conn)
+
+
 @asynccontextmanager
 async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
     """以异步上下文的方式提供用量存储，退出时关闭连接。
@@ -361,27 +400,11 @@ async def open_usage_store(db_path: Path) -> AsyncIterator[UsageStore]:
         ValueError: ``db_path`` 为 ``None``。
         aiosqlite.Error: 建表失败时原样向上抛出。
     """
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.executescript(_SCHEMA)
-        await conn.commit()
+    async with open_sqlite_store(
+        db_path, label="用量记录表", prepare=_prepare_usage_store
+    ) as store:
         logger.info("用量记录表已就绪：%s", db_path)
-        yield UsageStore(conn)
-    except Exception:
-        logger.exception("用量记录表初始化失败：%s", db_path)
-        raise
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.info("用量记录连接已关闭：%s", db_path)
+        yield store
 
 
 __all__ = ["MAX_MODEL_CHARS", "UsageStore", "open_usage_store", "utc_now", "window_start"]

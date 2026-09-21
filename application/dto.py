@@ -43,6 +43,140 @@ class ModelInfo(BaseModel):
     name: str = Field(description="模型别名，切换模型时使用")
     provider: str = Field(description="langchain provider 标识")
     model: str = Field(description="provider 侧的原始模型名")
+    supports_vision: bool = Field(
+        default=False, description="是否接受图片输入；前端据此决定能否上传附件"
+    )
+
+
+class AttachmentInfo(BaseModel):
+    """一个已上传的附件。"""
+
+    id: str = Field(description="附件标识，发起运行时用它引用")
+    thread_id: str = Field(description="所属会话")
+    filename: str = Field(description="上传时的原始文件名，仅用于展示")
+    mime_type: str = Field(description="内容类型")
+    size: int = Field(description="字节数")
+    sha256: str = Field(description="内容摘要，用于审计与去重比对")
+    created_at: str = Field(description="上传时刻（ISO8601 UTC）")
+    path: str = Field(description="工作区内的虚拟路径，前端可直接交给文件接口预览")
+
+
+class AttachmentLimits(BaseModel):
+    """附件相关的上限，随清单一起下发。
+
+    WHY 与清单同一个响应：前端要在**用户选文件的那一刻**就给出「太大 / 类型不支持」
+    的提示，而不是等上传请求失败。让它多打一次接口只会多一条「配置与提示不一致」
+    的分叉路径。
+    """
+
+    max_bytes: int = Field(description="单个附件的字节上限")
+    max_per_thread: int = Field(description="单会话附件数上限")
+    allowed_mime_types: list[str] = Field(description="允许上传的 MIME 白名单")
+
+
+class AttachmentListResult(BaseModel):
+    """某会话的附件清单及其上限。"""
+
+    thread_id: str = Field(description="会话标识")
+    items: list[AttachmentInfo] = Field(default_factory=list, description="按上传时间升序")
+    limits: AttachmentLimits = Field(description="当前生效的上限")
+
+
+class WorkspaceEntryInfo(BaseModel):
+    """文件面板里的一条目录项。"""
+
+    name: str = Field(description="条目名")
+    path: str = Field(description="虚拟路径，可直接回传给文件接口")
+    is_dir: bool = Field(description="是否为目录")
+    size: int = Field(description="字节数")
+    modified_at: float = Field(description="最近修改时间（Unix 秒）")
+    is_symlink: bool = Field(default=False, description="是否为符号链接")
+
+
+class WorkspaceListing(BaseModel):
+    """一次目录列举的结果。"""
+
+    path: str = Field(description="当前目录的虚拟路径")
+    parent: str | None = Field(default=None, description="上级目录虚拟路径；根目录为 None")
+    entries: list[WorkspaceEntryInfo] = Field(default_factory=list, description="目录项，目录在前")
+    truncated: bool = Field(default=False, description="是否因条目数上限被截断")
+
+
+class WorkspaceFileContent(BaseModel):
+    """一次文件读取的结果。
+
+    WHY 用 ``kind`` 而不是让调用方看状态码区分：``binary`` / ``too_large`` /
+    ``image`` 都是「读取成功但展示方式不同」，与读取失败（400 / 404）走的是
+    完全不同的分支——把前者做成错误，界面就只能显示一句失败，而用户想知道的是
+    「多大的什么文件」。
+    """
+
+    path: str = Field(description="虚拟路径")
+    name: str = Field(description="文件名")
+    size: int = Field(description="文件总字节数")
+    kind: str = Field(description="text / image / binary / too_large")
+    text: str = Field(default="", description="本次返回的文本片段，或图片的 data URL；其余类型为空")
+    truncated: bool = Field(
+        default=False, description="本次返回的片段之后是否还有内容（前端据此提供「加载更多」）"
+    )
+    offset: int = Field(default=0, description="本次片段在文件中的起始字符偏移；续取时原样传回")
+    mime_type: str = Field(default="", description="据扩展名推断的 MIME 类型")
+
+
+class WorkspaceInfo(BaseModel):
+    """当前会话的文件根信息。
+
+    WHY 要把宿主机绝对路径下发给界面：根是**每条会话都可能不同**的运行时状态（用户选了
+    自己的项目，或者应用给它建了一个专属目录）。界面上不显示它，用户在浏览器里看到的那
+    棵树就成了「不知道是哪台机器上哪个目录」的一堆文件名——而「我刚才到底在改哪里」正是
+    这个面板要回答的第一个问题。
+    """
+
+    path: str = Field(description="根目录的宿主机绝对路径")
+    name: str = Field(description="目录名（用于界面标题）")
+    bound: bool = Field(
+        description=(
+            "``True`` 表示这是用户显式选定的工作空间（可容纳多条会话）；"
+            "``False`` 表示这是应用为这条会话自动创建的专属目录"
+        )
+    )
+    locked: bool = Field(
+        description="是否已锁定（产生过第一条交互之后就锁定了，此后不可更换）"
+    )
+
+
+class DirectoryEntry(BaseModel):
+    """目录列表里的一项。
+
+    WHY 只列目录：这一层的用途是「挑一个目录当工作空间」，把文件也列出来只会让用户在
+    几十个文件里找那个目标目录。文件的存在与否由选定之后的文件面板回答。
+    """
+
+    name: str = Field(description="目录名；盘符根这类没有名字的位置会退化成完整路径")
+    path: str = Field(description="绝对路径；选中时原样回传给服务端")
+
+
+class DirectoryListing(BaseModel):
+    """一次目录列表的结果。"""
+
+    path: str = Field(description="当前所在目录的绝对路径；起点页为空串")
+    parent: str | None = Field(
+        default=None, description="上一级目录；已到文件系统顶层时为 None（不能再往上）"
+    )
+    entries: list[DirectoryEntry] = Field(
+        default_factory=list, description="当前目录下的子目录（不可读时为空）"
+    )
+
+
+class WorkspacePickResult(BaseModel):
+    """一次「系统文件夹选择弹窗」的结果。
+
+    WHY 用 ``cancelled`` 而不是把取消当成错误：用户点取消什么都没做错。把它变成 4xx/5xx
+    会让界面弹一条红条，而用户只是改了主意——那条错误还会掩盖真正的失败（比如环境不支持）。
+    """
+
+    cancelled: bool = Field(description="用户是否取消了选择")
+    path: str | None = Field(default=None, description="选中的目录绝对路径；取消时为空")
 
 
 class ThreadSummary(BaseModel):
@@ -59,6 +193,7 @@ class ThreadSummary(BaseModel):
     created_at: str = Field(description="创建时间（ISO8601 UTC）")
     updated_at: str = Field(description="最近活动时间（ISO8601 UTC）")
     turn_count: int = Field(description="已发生的用户对话轮数")
+    tags: list[str] = Field(default_factory=list, description="会话标签，按写入顺序排列")
     archived: bool = Field(default=False, description="是否已归档（软删除）")
     archived_at: str = Field(default="", description="归档时刻（ISO8601 UTC）；未归档为空串")
 
@@ -79,6 +214,89 @@ class HistoryMessage(BaseModel):
     tool_calls: list[dict[str, Any]] = Field(
         default_factory=list, description="该消息发起的工具调用"
     )
+    tool_call_id: str = Field(
+        default="",
+        description="工具消息对应的调用标识；非工具消息为空串。导出后要能原样导回，缺了它工具消息无法重建",
+    )
+    attachments: list[AttachmentInfo] = Field(
+        default_factory=list,
+        description="该消息携带的图片附件；正文只保留文字，图片内容在附件目录里独立存放",
+    )
+
+
+EXPORT_VERSION = "1"
+"""会话导出格式的版本号。
+
+WHY 单独列出来并写进文件：导入是「别人给我的文件」，格式一旦变化，没有版本号就
+只能靠字段猜测兼容性，而猜错的表现是内容静默错位。
+"""
+
+
+class ThreadExport(BaseModel):
+    """一个会话的可移植快照。
+
+    WHY 只导出当前分支的消息：分支结构与各分支的位置是**上游检查点**的概念，
+    导出成文件后无法在目标库里重建出同样的树；把某一分支的内容原样带过去，
+    比带一个看起来有结构、实际无法复原的树要诚实。
+    """
+
+    version: str = Field(default=EXPORT_VERSION, description="格式版本")
+    thread_id: str = Field(description="来源会话标识；导入时会分配新 ID")
+    title: str = Field(default="", description="会话标题")
+    tags: list[str] = Field(default_factory=list, description="会话标签")
+    created_at: str = Field(default="", description="来源会话创建时间（ISO8601 UTC）")
+    updated_at: str = Field(default="", description="来源会话最近活动时间（ISO8601 UTC）")
+    exported_at: str = Field(default="", description="导出时刻（ISO8601 UTC）")
+    branch_id: str = Field(default="", description="导出的是哪条分支；空串表示根分支")
+    workspace: str = Field(
+        default="",
+        description=(
+            "来源会话绑定的工作区绝对路径（**仅供人看**，不作为导入后的绑定值："
+            "它在别的机器上通常不存在，也不在对方的允许清单里）"
+        ),
+    )
+    messages: list[HistoryMessage] = Field(default_factory=list, description="该分支的消息")
+    notes: list[str] = Field(
+        default_factory=list, description="导入方需要知道的事项，随文件一起传给对方"
+    )
+
+
+class ImportResult(BaseModel):
+    """导入结果。"""
+
+    thread_id: str = Field(description="新建的会话标识")
+    title: str = Field(default="", description="新会话的标题")
+    message_count: int = Field(default=0, description="复原的消息条数")
+    skipped_messages: int = Field(default=0, description="因角色无法还原而丢弃的条数")
+    usage_note: str = Field(
+        default="", description="用量口径说明：新会话的用量自导入时刻重新计"
+    )
+    notes: list[str] = Field(default_factory=list, description="随导出文件带回的注意事项")
+
+
+class BranchSummary(BaseModel):
+    """会话的一条分支。
+
+    WHY ``head_checkpoint`` 对当前分支为空串：当前分支的头随每次运行前移，存下来
+    必然过期；而它本来就是「会话当前的头」，读的时候现取即可。存下的是**离开**该分支
+    时冻结的那个头——那才是切回来时需要的东西。
+    """
+
+    branch_id: str = Field(description="分支标识，会话内唯一；空串表示根分支")
+    head_checkpoint: str = Field(description="离开该分支时冻结的检查点 id；当前分支为空串")
+    parent_branch_id: str = Field(description="从哪条分支分叉而来；根分支为空串")
+    origin: str = Field(description="分支来源：root / edit / regenerate")
+    label: str = Field(description="给界面看的简短说明，如「编辑第 2 轮」")
+    created_at: str = Field(description="创建时间（ISO8601 UTC）")
+    current: bool = Field(default=False, description="是否为当前激活的分支")
+
+
+class BranchListResult(BaseModel):
+    """会话的分支清单。"""
+
+    thread_id: str = Field(description="会话标识")
+    current_branch: str = Field(description="当前分支标识；空串表示根分支")
+    items: list[BranchSummary] = Field(default_factory=list, description="按创建时间升序排列")
 
 
 class DeleteResult(BaseModel):
@@ -176,6 +394,14 @@ class MetricsSnapshot(BaseModel):
     )
     expired_hitl: int = Field(
         default=0, description="进程启动以来因超期未决策而作废的审批挂起次数"
+    )
+    max_concurrent_runs: int = Field(default=0, description="配置的全局并发上限；0 表示不限制")
+    available_run_slots: int = Field(
+        default=-1,
+        description="当前可用的运行槽位数；上限为 0（不限制）时以 -1 表示",
+    )
+    rejected_runs: int = Field(
+        default=0, description="进程启动以来因超出并发上限或被限流而拒绝的运行次数"
     )
     audit_events: int | None = Field(
         default=None, description="审计事件总数；``None`` 表示本次采集失败"

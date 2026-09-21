@@ -1,6 +1,6 @@
 """长期记忆管理服务的测试。
 
-覆盖面：清单与删除的读写口径、路径归一、按主体收敛、上限与截断，以及
+覆盖面：清单与删除的读写口径、路径归一、命名空间收敛、上限与截断，以及
 「删除落审计、审计失败不影响删除、存储失败映射为 RuntimeError」。
 """
 
@@ -12,7 +12,6 @@ import pytest
 from langgraph.store.memory import InMemoryStore
 
 from agent.run_context import ANONYMOUS_USER_ID, memory_namespace
-from application.errors import PermissionDeniedError
 from application.memory_service import (
     _MAX_CONTENT_CHARS,
     _MAX_ITEMS,
@@ -20,7 +19,6 @@ from application.memory_service import (
     to_store_key,
     to_virtual_path,
 )
-from application.principal import Principal
 from tests.application.test_run_governance import RecordingAuditStore
 from tests.conftest import make_config
 
@@ -68,10 +66,9 @@ def _service(
     tmp_path,
     store: InMemoryStore | None = None,
     *,
-    auth_mode: str = "disabled",
     audit: RecordingAuditStore | None = None,
 ) -> MemoryService:
-    config = make_config(tmp_path, auth_mode=auth_mode, auth_session_secret="s" * 32)
+    config = make_config(tmp_path)
     return MemoryService(
         config,
         store=store if store is not None else InMemoryStore(),
@@ -189,45 +186,19 @@ async def test_list_failure_is_runtime_error(tmp_path):
         await _service(tmp_path, BrokenStore()).list_memories()
 
 
-# ------------------------------------------------------------------ 按主体收敛
+# ------------------------------------------------------------------ 命名空间
 
 
-async def test_member_sees_only_own_memories(tmp_path):
+async def test_list_only_reads_the_local_namespace(tmp_path):
+    """只读本机命名空间：别的命名空间里写得再多，也不会串进这份清单。"""
     store = InMemoryStore()
-    await _seed(store, "alice", "/a.md", "alice 的偏好")
-    await _seed(store, "bob", "/b.md", "bob 的偏好")
-    service = _service(tmp_path, store, auth_mode="apikey")
+    await _seed(store, ANONYMOUS_USER_ID, "/a.md", "本机记忆")
+    await _seed(store, "someone-else", "/b.md", "别人的记忆")
+    service = _service(tmp_path, store)
 
-    alice = await service.list_memories(Principal(user_id="alice", role="member"))
-    bob = await service.list_memories(Principal(user_id="bob", role="member"))
+    result = await service.list_memories()
 
-    assert [item.content for item in alice.items] == ["alice 的偏好"]
-    assert [item.content for item in bob.items] == ["bob 的偏好"]
-
-
-async def test_admin_also_sees_only_own_memories(tmp_path):
-    """记忆是个人数据：管理员在本服务里同样只看自己那一份。"""
-    store = InMemoryStore()
-    await _seed(store, "alice", "/a.md", "alice 的偏好")
-    await _seed(store, "root", "/r.md", "root 的偏好")
-    service = _service(tmp_path, store, auth_mode="apikey")
-
-    result = await service.list_memories(Principal(user_id="root", role="admin"))
-
-    assert [item.content for item in result.items] == ["root 的偏好"]
-
-
-async def test_unauthenticated_principal_is_denied(tmp_path):
-    """鉴权开启而主体不可识别时必须拒绝，而不是返回别人的空清单。"""
-    store = InMemoryStore()
-    await _seed(store, ANONYMOUS_USER_ID, "/a.md", "匿名池")
-    service = _service(tmp_path, store, auth_mode="apikey")
-
-    with pytest.raises(PermissionDeniedError):
-        await service.list_memories(None)
-
-    with pytest.raises(PermissionDeniedError):
-        await service.delete_memory("/memories/a.md", None)
+    assert [item.content for item in result.items] == ["本机记忆"]
 
 
 async def test_disabled_mode_uses_anonymous_pool(tmp_path):

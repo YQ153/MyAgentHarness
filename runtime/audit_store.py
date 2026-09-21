@@ -18,6 +18,8 @@ from typing import Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
+
 logger = logging.getLogger(__name__)
 
 _MAX_LIMIT = 200
@@ -61,6 +63,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     outcome       TEXT NOT NULL,
     ip            TEXT,
     user_agent    TEXT,
+    trace_id      TEXT,
     details       TEXT,
     created_at    TEXT NOT NULL
 );
@@ -70,6 +73,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_actor_time
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_event_time
     ON audit_log (event_type, created_at DESC);
+"""
+
+_TRACE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_audit_log_trace
+    ON audit_log (trace_id, created_at DESC);
+"""
+"""trace_id 的索引。
+
+WHY 单独放在这里而不是写进 ``_SCHEMA``：``CREATE TABLE IF NOT EXISTS`` 对老库不做
+任何事，老库的 audit_log 里还没有 trace_id 这一列——索引若排在补列的 ALTER 之前，
+``executescript`` 会以「no such column」失败，**应用直接起不来**。顺序是
+「先补列、再建索引」，与 ``thread_store`` 里 owner_id 的迁移一致。
 """
 
 
@@ -93,12 +108,17 @@ class AuditStore:
         outcome: str,
         ip: str | None = None,
         user_agent: str | None = None,
+        trace_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
         """记录一条审计事件。
 
         WHY 独立方法而非直接 INSERT：所有审计字段统一落库，避免调用方漏写
         ``created_at``；同时 ``details`` 会自动 JSON 序列化。
+
+        WHY ``trace_id`` 由调用方传入而不是本方法自己去读上下文：``runtime`` 层
+        不得依赖 ``application``（分层契约 3），而上下文载体在应用层。IP/UA 走的是
+        同一条路径，这里保持一致，不为一列数据破一次分层。
         """
         if not event_type or not actor_id or not outcome:
             raise ValueError("event_type、actor_id、outcome 不能为空")
@@ -109,8 +129,9 @@ class AuditStore:
                 await self._conn.execute(
                     """
                     INSERT INTO audit_log
-                        (event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                         trace_id, details, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_type,
@@ -120,6 +141,7 @@ class AuditStore:
                         outcome,
                         ip,
                         user_agent,
+                        trace_id,
                         json.dumps(details, ensure_ascii=False, default=str) if details else None,
                         now,
                     ),
@@ -164,7 +186,8 @@ class AuditStore:
             raise ValueError("after_id 必须是不小于 0 的整数")
 
         sql = """
-            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at
+            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                   trace_id, details, created_at
             FROM audit_log
             WHERE created_at < ? AND id > ?
             ORDER BY id ASC
@@ -266,7 +289,8 @@ class AuditStore:
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         sql = f"""
-            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent, details, created_at
+            SELECT id, event_type, actor_id, target_id, action, outcome, ip, user_agent,
+                   trace_id, details, created_at
             FROM audit_log
             {where}
             ORDER BY created_at DESC, id DESC
@@ -281,26 +305,29 @@ class AuditStore:
         return [dict(row) for row in rows]
 
 
+async def _prepare_audit_store(conn: aiosqlite.Connection) -> AuditStore:
+    """建表、补列并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    try:
+        # WHY 需要这条迁移：``CREATE TABLE IF NOT EXISTS`` 不会给已存在的表补列，
+        # 而升级前的库里已经有审计数据。重复执行必然抛「列已存在」，忽略即可。
+        await conn.execute("ALTER TABLE audit_log ADD COLUMN trace_id TEXT;")
+    except Exception:
+        logger.debug("audit_log.trace_id 已存在，跳过迁移")
+    # WHY 索引必须排在补列之后：它是列上建的，顺序反了会让老库启动即失败。
+    await conn.executescript(_TRACE_INDEX)
+    await conn.commit()
+    return AuditStore(conn)
+
+
 @asynccontextmanager
 async def open_audit_store(db_path: Path) -> AsyncIterator[AuditStore]:
-    """以异步上下文的方式提供审计日志存储。"""
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
+    """以异步上下文的方式提供审计日志存储。
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-    try:
-        conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.executescript(_SCHEMA)
-        await conn.commit()
+    WHY 只剩两行：连接、PRAGMA、初始化异常的归因与关闭都在 ``open_sqlite_store`` 里。
+    """
+    async with open_sqlite_store(
+        db_path, label="审计日志表", prepare=_prepare_audit_store
+    ) as store:
         logger.info("审计日志表已就绪：%s", db_path)
-        yield AuditStore(conn)
-    except Exception:
-        logger.exception("审计日志表初始化失败：%s", db_path)
-        raise
-    finally:
-        if conn is not None:
-            await conn.close()
+        yield store

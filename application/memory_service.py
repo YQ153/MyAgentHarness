@@ -15,17 +15,14 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from agent.run_context import ANONYMOUS_USER_ID, memory_namespace
-from application.audit_context import audit_client_info
+from application.audit_context import LOCAL_ACTOR_ID, audit_client_info, audit_trace_id
 from application.dto import MemoryDeleteResult, MemoryItem, MemoryListResult
-from application.errors import PermissionDeniedError
-from application.ownership import UNAUTHENTICATED_OWNER, effective_owner_id
 
 if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
 
-    from application.principal import Principal
+    from application.ports import AuditLog
     from config import AppConfig
-    from runtime.audit_store import AuditStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +50,19 @@ WHY 截断：记忆本应是短条目，但模型完全可能把整篇文档写�
 """
 
 _END_OF_CONTENT = "\n…（已截断）"
+"""正文被截断时追加的提示后缀。
+
+WHY 必须让「截断」在正文里可见：调用方拿到的是被裁过的片段，而它与「当初就只记了
+这么多」在文本上无从区分；少了这个后缀，用户会把一次展示层截断当成记忆本身不完整。
+"""
 
 
 def to_store_key(path: str) -> str:
     """把对外路径（``/memories/x.md``）转换成存储层的键（``/x.md``）。
 
-    WHAT：``StoreBackend`` 挂载在 ``/memories/`` 下，且被 ``CompositeBackend``
-    剥掉了前缀，因此存储键是「去掉挂载点之后」的相对路径。
+    WHY 键要去掉挂载点：``StoreBackend`` 挂载在 ``/memories/`` 下，且被
+    ``CompositeBackend`` 剥掉了前缀，因此存储层认的是「去掉挂载点之后」的相对路径。
+    少这一步换算，查到的键永远不存在——表现为「面板里明明有这条记忆，按路径却读不出来」。
 
     WHY 同时接受 ``/x.md``：存储层的键就是这个形状，管理脚本或按存储口径
     排查时也会这么写；两种写法都收，避免调用方猜。
@@ -134,12 +137,12 @@ class MemoryService:
         config: AppConfig,
         *,
         store: BaseStore,
-        audit_store: AuditStore | None = None,
+        audit_store: AuditLog | None = None,
     ) -> None:
         """构造服务。
 
         Args:
-            config: 应用配置，决定鉴权模式与主体归属口径。
+            config: 应用配置。
             store: 长期记忆存储；与图共享同一实例，否则面板看到的与 Agent
                 写入的不是同一份数据。
             audit_store: 审计存储；``None`` 时不记录删除事件。
@@ -156,22 +159,18 @@ class MemoryService:
         self._store = store
         self._audit_store = audit_store
 
-        logger.info("记忆服务就绪：auth_mode=%s", config.auth_mode)
+        logger.info("记忆服务就绪：namespace=%s", memory_namespace(ANONYMOUS_USER_ID))
 
-    async def list_memories(self, principal: Principal | None = None) -> MemoryListResult:
-        """列出当前主体可见的长期记忆。
-
-        Args:
-            principal: 当前主体；``None`` 仅在调用方已完成鉴权时使用。
+    async def list_memories(self) -> MemoryListResult:
+        """列出本机可见的长期记忆。
 
         Returns:
             按路径排序的记忆清单；超出上限时 ``truncated`` 为 ``True``。
 
         Raises:
-            PermissionDeniedError: 已启用鉴权但主体不可识别。
             RuntimeError: 读取存储失败（调用方应映射为 500）。
         """
-        owner = self._owner(principal)
+        owner = ANONYMOUS_USER_ID
         namespace = memory_namespace(owner)
         try:
             # WHY 多取一条：分页接口用「比上限多一条」判断是否还有剩余，
@@ -206,11 +205,7 @@ class MemoryService:
         logger.debug("长期记忆清单完成：owner=%s 返回 %d 条", owner, len(items))
         return MemoryListResult(owner_id=owner, items=items, total=len(items), truncated=truncated)
 
-    async def delete_memory(
-        self,
-        path: str,
-        principal: Principal | None = None,
-    ) -> MemoryDeleteResult:
+    async def delete_memory(self, path: str) -> MemoryDeleteResult:
         """删除一条长期记忆。
 
         WHY 删除不存在的条目不算失败：这是一条幂等的「忘掉它」请求，界面在
@@ -219,18 +214,16 @@ class MemoryService:
 
         Args:
             path: 记忆路径，``/memories/x.md`` 与 ``/x.md`` 均可。
-            principal: 当前主体；``None`` 仅在调用方已完成鉴权时使用。
 
         Returns:
             删除结果；``deleted`` 为 ``False`` 表示该路径本就不存在。
 
         Raises:
             ValueError: 路径非法（调用方应映射为 400）。
-            PermissionDeniedError: 已启用鉴权但主体不可识别。
             RuntimeError: 存储操作失败（调用方应映射为 500）。
         """
         key = to_store_key(path)
-        owner = self._owner(principal)
+        owner = ANONYMOUS_USER_ID
         namespace = memory_namespace(owner)
         virtual = to_virtual_path(key)
 
@@ -251,31 +244,16 @@ class MemoryService:
             raise RuntimeError("删除长期记忆失败") from exc
 
         logger.info("已删除长期记忆：owner=%s path=%s", owner, virtual)
-        await self._audit(path=virtual, owner=owner, principal=principal)
+        await self._audit(path=virtual, owner=owner)
         return MemoryDeleteResult(path=virtual, deleted=True)
 
     # ------------------------------------------------------------------ 内部
-
-    def _owner(self, principal: Principal | None) -> str:
-        """返回本次操作归属的主体标识。
-
-        WHY 鉴权开启而主体不可识别时直接拒绝：记忆是主体私有数据，此时返回
-        空清单会把「你是谁」这个问题伪装成「你什么都没记住」，属于静默失败。
-        """
-        owner = effective_owner_id(self._config, principal)
-        if owner is None:
-            # 认证关闭：本地单用户，与会话归属同一口径（``RunHandle.memory_owner``）。
-            return ANONYMOUS_USER_ID
-        if owner == UNAUTHENTICATED_OWNER:
-            raise PermissionDeniedError("memory:read")
-        return owner
 
     async def _audit(
         self,
         *,
         path: str,
         owner: str,
-        principal: Principal | None,
     ) -> None:
         """记录一次记忆删除事件。
 
@@ -287,7 +265,7 @@ class MemoryService:
         """
         if self._audit_store is None:
             return
-        actor_id = principal.user_id if principal is not None else ANONYMOUS_USER_ID
+        actor_id = LOCAL_ACTOR_ID
         ip, ua = audit_client_info()
         try:
             await self._audit_store.log(
@@ -298,13 +276,17 @@ class MemoryService:
                 outcome="success",
                 ip=ip,
                 user_agent=ua,
+                # WHY 与 IP/UA 同一处读取：删除是破坏性动作，它属于哪次请求是留痕的
+                # 关键一半——只有「谁删的」「何时删的」而没有「哪次操作删的」，
+                # 一次批量删除会散成一堆互不相干的记录。
+                trace_id=audit_trace_id(),
                 details={"owner_id": owner},
             )
         except Exception:
             logger.exception("审计事件写入失败：event_type=memory_delete path=%s", path)
 
     def __repr__(self) -> str:  # pragma: no cover - 仅用于日志排错
-        return f"MemoryService(auth_mode={self._config.auth_mode})"
+        return f"MemoryService(namespace={memory_namespace(ANONYMOUS_USER_ID)})"
 
 
 __all__ = ["MEMORY_PATH_PREFIX", "MemoryService", "to_store_key", "to_virtual_path"]

@@ -56,6 +56,15 @@ class ModelSpec:
     base_url_default: str = ""
     """未设置 ``base_url_env`` 时使用的官方地址。"""
 
+    supports_vision: bool = False
+    """是否接受图片输入（多模态）。
+
+    WHY 由配置决定取值而不是写死在定义里：能力取决于**实际模型名**，而模型名是可
+    配置的——把一个纯文本模型填进 ``OPENAI_MODEL`` 后，写死的 ``True`` 会让上传
+    一路通过、直到构造消息时才失败。取值来源见 ``default_specs`` 的
+    ``config.vision_model_aliases``。
+    """
+
 
 def _resolve_base_url(spec: ModelSpec) -> str:
     """解析 API 地址并返回规范化结果。
@@ -147,12 +156,32 @@ class ModelRegistry:
     def default_name(self) -> str:
         return self._default
 
-    def describe(self) -> list[dict[str, str]]:
-        """返回模型的展示信息，不含密钥。"""
+    def describe(self) -> list[dict[str, object]]:
+        """返回模型的展示信息，不含密钥。
+
+        WHY 一并下发 ``supports_vision``：前端要据此决定「允不允许上传图片」，
+        而没有这个字段时它只能自己猜——猜错的表现是用户上传成功、发送时才被拒。
+        """
         return [
-            {"name": spec.name, "provider": spec.provider, "model": spec.model}
+            {
+                "name": spec.name,
+                "provider": spec.provider,
+                "model": spec.model,
+                "supports_vision": spec.supports_vision,
+            }
             for spec in sorted(self._specs.values(), key=lambda item: item.name)
         ]
+
+    def supports_vision(self, name: str | None = None) -> bool:
+        """判断某个别名（默认取默认模型）是否接受图片输入。
+
+        Raises:
+            KeyError: 别名未注册。
+        """
+        key = name or self._default
+        if key not in self._specs:
+            raise KeyError(f"未注册的模型 {key!r}，可选：{self.names()}")
+        return self._specs[key].supports_vision
 
     def get(self, name: str | None = None) -> BaseChatModel:
         """按别名取模型；``None`` 表示取默认模型。"""
@@ -353,6 +382,8 @@ def default_specs(config: AppConfig) -> list[ModelSpec]:
     if config is None:
         raise ValueError("config 不能为 None")
 
+    vision_aliases = set(config.vision_model_aliases)
+
     return [
         ModelSpec(
             name="deepseek-flash",
@@ -364,6 +395,7 @@ def default_specs(config: AppConfig) -> list[ModelSpec]:
             api_key_env="DEEPSEEK_API_KEY",
             base_url_env="DEEPSEEK_API_BASE",
             base_url_default=config.deepseek_api_base,
+            supports_vision="deepseek-flash" in vision_aliases,
         ),
         ModelSpec(
             name="openai",
@@ -375,6 +407,7 @@ def default_specs(config: AppConfig) -> list[ModelSpec]:
             api_key_env="OPENAI_API_KEY",
             base_url_env="OPENAI_API_BASE",
             base_url_default=config.openai_api_base,
+            supports_vision="openai" in vision_aliases,
         ),
         ModelSpec(
             name="anthropic",
@@ -386,6 +419,7 @@ def default_specs(config: AppConfig) -> list[ModelSpec]:
             api_key_env="ANTHROPIC_API_KEY",
             base_url_env="ANTHROPIC_API_BASE",
             base_url_default=config.anthropic_api_base,
+            supports_vision="anthropic" in vision_aliases,
         ),
         ModelSpec(
             name="ollama",
@@ -396,6 +430,7 @@ def default_specs(config: AppConfig) -> list[ModelSpec]:
             max_retries=config.llm_max_retries,
             base_url_env="OLLAMA_BASE_URL",
             base_url_default=config.ollama_base_url,
+            supports_vision="ollama" in vision_aliases,
         ),
     ]
 

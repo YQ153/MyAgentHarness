@@ -183,6 +183,114 @@ def test_load_custom_modules_from_register_hook(monkeypatch):
     assert registry.names() == ["from-hook"]
 
 
+# ------------------------------------------------------------------ 配置传入
+
+
+def test_load_custom_modules_passes_config_to_two_arg_hook(monkeypatch):
+    """WHY 覆盖这条：模块若看不到配置，就只能自己去读环境变量或重解析 ``.env``，
+    而这两条路都会绕开 ``config.py`` 这个唯一解析点。"""
+    registry = ToolRegistry()
+    seen: list[Any] = []
+
+    def register_tools(target: ToolRegistry, config: Any) -> None:
+        seen.append(config)
+        target.register(_echo_tool("configured"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "configured_tools",
+        _module("configured_tools", register_tools=register_tools),
+    )
+    sentinel = object()
+
+    load_custom_tool_modules(["configured_tools"], registry, config=sentinel)
+
+    assert seen == [sentinel]
+    assert registry.names() == ["configured"]
+
+
+def test_load_custom_modules_keeps_single_arg_hook_working_with_config(monkeypatch):
+    """向后兼容：既有模块写的是单参钩子，而装配侧现在会传配置——它不能被搞坏。
+
+    这是本次扩展最重要的回归点：扩展点必须加法演进，否则所有已部署的模块
+    都会在升级后变成「加载失败」。"""
+    registry = ToolRegistry()
+
+    def register_tools(target: ToolRegistry) -> None:
+        target.register(_echo_tool("legacy"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "legacy_tools",
+        _module("legacy_tools", register_tools=register_tools),
+    )
+
+    load_custom_tool_modules(["legacy_tools"], registry, config=object())
+
+    assert registry.names() == ["legacy"]
+
+
+def test_load_custom_modules_passes_config_to_variadic_hook(monkeypatch):
+    """``*args`` 形态的钩子同样应拿到配置：它接受位置参数，只是没写名字。"""
+    registry = ToolRegistry()
+    seen: list[Any] = []
+
+    def register_tools(*args: Any) -> None:
+        seen.append(args[1])
+        args[0].register(_echo_tool("variadic"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "variadic_tools",
+        _module("variadic_tools", register_tools=register_tools),
+    )
+    sentinel = object()
+
+    load_custom_tool_modules(["variadic_tools"], registry, config=sentinel)
+
+    assert seen == [sentinel]
+    assert registry.names() == ["variadic"]
+
+
+def test_load_custom_modules_defaults_config_to_none(monkeypatch):
+    """不传配置时钩子收到的是 ``None``，而不是因为缺参而加载失败。"""
+    registry = ToolRegistry()
+    seen: list[Any] = []
+
+    def register_tools(target: ToolRegistry, config: Any) -> None:
+        seen.append(config)
+        target.register(_echo_tool("no-config"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "no_config_tools",
+        _module("no_config_tools", register_tools=register_tools),
+    )
+
+    load_custom_tool_modules(["no_config_tools"], registry)
+
+    assert seen == [None]
+
+
+def test_load_custom_modules_can_register_nothing(monkeypatch):
+    """模块按条件不注册任何工具是合法结果（例如缺密钥就该整体缺席），不应报错。"""
+    registry = ToolRegistry()
+
+    def register_tools(target: ToolRegistry, config: Any) -> None:
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "conditional_tools",
+        _module("conditional_tools", register_tools=register_tools),
+    )
+
+    loaded = load_custom_tool_modules(["conditional_tools"], registry, config=object())
+
+    assert loaded == ["conditional_tools"]
+    assert registry.names() == []
+
+
 def test_load_custom_modules_raises_on_import_error():
     """WHY 断言异常类型：导入失败若被吞掉，用户只会看到「工具少了」。"""
     registry = ToolRegistry()
@@ -245,6 +353,27 @@ async def test_build_tool_bundle_loads_custom_module(tmp_path, monkeypatch):
     assert [tool.name for tool in bundle.tools] == ["translate"]
     assert bundle.custom_modules == ("bundle_tools",)
     assert bundle.server_of("translate") is None
+
+
+async def test_build_tool_bundle_passes_config_to_custom_module(tmp_path, monkeypatch):
+    """WHY 需要这条集成用例：扩展点支持了配置而装配侧忘了往下传，等于没扩展。"""
+    holder: dict[str, Any] = {}
+
+    def register_tools(target: ToolRegistry, config: Any) -> None:
+        holder["config"] = config
+        target.register(_echo_tool("web_search"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "webish_tools",
+        _module("webish_tools", register_tools=register_tools),
+    )
+    config = make_config(tmp_path, custom_tool_modules=["webish_tools"])
+
+    bundle = await build_tool_bundle(config)
+
+    assert holder["config"] is config
+    assert [tool.name for tool in bundle.tools] == ["web_search"]
 
 
 async def test_build_tool_bundle_rejects_none_config():

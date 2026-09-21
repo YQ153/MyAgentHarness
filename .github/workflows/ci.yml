@@ -111,6 +111,12 @@ jobs:
           --cov=config
           --cov=text_utils
           --cov=thread_utils
+          --cov=web_safety
+          --cov=web_tools
+          --cov=runtime.workspace_files
+          --cov=runtime.tool_outputs
+          --cov=application.workspace_service
+          --cov=interfaces.web.workspace_routes
           --cov-report=term
           --cov-report=xml
           --cov-fail-under=${{ matrix.coverage_fail_under }}

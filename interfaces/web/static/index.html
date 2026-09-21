@@ -15,9 +15,15 @@
       </div>
       <div class="controls">
         <select id="model-select" title="切换模型"></select>
-        <!-- 记忆入口对所有人可见：记忆按主体收敛，认证关闭时是本地那一份 -->
         <button id="memory-open" type="button">记忆</button>
-        <div id="auth-status" class="auth-status"></div>
+        <!-- 工作区面板：Agent 产出的文件都在这里，只读 -->
+        <button id="workspace-open" type="button">工作区</button>
+        <!-- 知识库面板：索引工作区文档供 Agent 检索 -->
+        <button id="knowledge-open" type="button">知识库</button>
+        <!-- 技能库面板：启停会影响之后新建的会话，具体见面板内说明 -->
+        <button id="skills-open" type="button">技能</button>
+        <!-- 审计日志：业务动作的留痕（工具调用 / 会话增删 / 记忆删除 / 审批决策），只读 -->
+        <button id="audit-open" type="button">审计</button>
       </div>
     </header>
 
@@ -28,6 +34,48 @@
           <span class="sidebar-title">会话</span>
           <button id="new-thread" type="button">新会话</button>
         </div>
+        <!--
+          工作空间选择器：只在**新建会话**（草稿态）出现。会话一旦产生第一条交互，它的
+          文件根就永久锁定（换项目请新建会话）。
+
+          两种结果都允许，且必须让用户看得见自己选的是哪一种：
+          - 选了工作空间 → Agent 的文件、附件与索引都落在那个项目目录里；
+          - 不选 → 应用为这条会话在 SESSIONS_ROOT 下建一个专属目录，只有它自己用。
+
+          任意目录都可选（产品规则），因此这里没有「可选清单」：要么用系统弹窗挑，
+          要么在网页里逐级浏览/直接粘贴路径。
+        -->
+        <div id="workspace-picker" class="workspace-picker" hidden>
+          <span class="workspace-picker-label">本次会话工作空间</span>
+          <span id="workspace-choice" class="workspace-choice"></span>
+          <div class="workspace-choice-actions">
+            <!--
+              系统文件夹选择弹窗：窗口出现在**运行服务端的那台机器**上（浏览器拿不到宿主的
+              绝对路径，只能由服务端进程自己弹）。容器 / 无桌面部署会返回 501，那时用
+              「浏览…」在网页里逐级挑。
+            -->
+            <button
+              id="workspace-pick"
+              type="button"
+              class="workspace-browse-btn"
+              title="打开系统文件夹选择对话框；窗口出现在运行服务端的那台机器上"
+            >选择文件夹…</button>
+            <button
+              id="workspace-browse"
+              type="button"
+              class="workspace-browse-btn"
+              title="在网页里逐级挑选或粘贴路径（服务端没有桌面时用这个）"
+            >浏览…</button>
+            <button
+              id="workspace-clear"
+              type="button"
+              class="workspace-browse-btn"
+              title="不绑定工作空间：这条会话使用应用为它创建的专属目录"
+            >不绑定</button>
+          </div>
+        </div>
+        <!-- 系统弹窗的进行中提示与失败原因（例如「这个部署没有图形环境」） -->
+        <p id="workspace-pick-status" class="workspace-picker-hint" hidden></p>
         <div class="thread-toolbar">
           <input
             id="thread-search"
@@ -48,63 +96,54 @@
     </div>
 
     <footer class="composer">
-      <textarea
-        id="input"
-        rows="1"
-        placeholder="输入任务，Enter 发送，Shift+Enter 换行"
-        autocomplete="off"
-      ></textarea>
-      <button id="stop" type="button" class="danger" hidden>停止</button>
-      <button id="send" type="button">发送</button>
+      <div id="attachment-strip" class="composer-attachments" hidden></div>
+      <div id="attachment-hint" class="composer-hint" hidden></div>
+      <div class="composer-row">
+        <button id="attach" type="button" class="icon-btn" title="添加图片">＋</button>
+        <!-- accept 只作引导：真正的类型判定在服务端白名单，改这里不构成放行 -->
+        <input
+          id="attach-input"
+          type="file"
+          accept="image/png,image/jpeg,image/webp,image/gif"
+          multiple
+          hidden
+        />
+        <textarea
+          id="input"
+          rows="1"
+          placeholder="输入任务，Enter 发送，Shift+Enter 换行"
+          autocomplete="off"
+        ></textarea>
+        <button id="stop" type="button" class="danger" hidden>停止</button>
+        <button id="send" type="button">发送</button>
+      </div>
     </footer>
   </div>
-  <!-- 管理面板：仅管理员可见 -->
-  <div id="admin-modal" class="modal" style="display:none;">
+  <!--
+    审计日志：业务动作的留痕。只读——写入由服务端在业务动作里完成，这里没有写入入口。
+  -->
+  <div id="audit-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
-    <div class="modal-content">
+    <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>管理面板</h3>
-        <button id="admin-close" type="button" class="icon-btn">&times;</button>
+        <h3>审计日志</h3>
+        <button id="audit-close" type="button" class="icon-btn">&times;</button>
       </div>
-      <div class="modal-tabs">
-        <button type="button" class="tab active" data-tab="apikeys">API Keys</button>
-        <button type="button" class="tab" data-tab="audit">审计日志</button>
+      <div class="audit-toolbar">
+        <button id="audit-refresh" type="button">刷新</button>
       </div>
-      <div id="tab-apikeys" class="tab-panel active">
-        <form id="apikey-form" class="apikey-form">
-          <label>角色</label>
-          <select id="apikey-role" required>
-            <option value="member" selected>member</option>
-            <option value="admin">admin</option>
-            <option value="viewer">viewer</option>
-          </select>
-          <label>作用域（空格分隔）</label>
-          <input id="apikey-scopes" type="text" placeholder="例如：thread:list thread:read" />
-          <label>描述</label>
-          <input id="apikey-desc" type="text" placeholder="CLI 用" />
-          <label>过期时间（可选，ISO8601）</label>
-          <input id="apikey-expires" type="text" placeholder="2026-12-31T23:59:59" />
-          <button type="submit" class="primary">创建 API Key</button>
-        </form>
-        <div id="apikey-list" class="apikey-list"></div>
-      </div>
-      <div id="tab-audit" class="tab-panel">
-        <div class="audit-toolbar">
-          <button id="audit-refresh" type="button">刷新</button>
-        </div>
-        <div class="audit-table-wrap">
-          <table id="audit-table" class="audit-table">
-            <thead>
-              <tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+      <div class="audit-table-wrap">
+        <table id="audit-table" class="audit-table">
+          <thead>
+            <tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </div>
   </div>
 
-  <!-- 长期记忆面板：数据来自 GET /api/memories，按主体收敛 -->
+  <!-- 长期记忆面板：数据来自 GET /api/memories -->
   <div id="memory-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
     <div class="modal-content">
@@ -125,23 +164,120 @@
     </div>
   </div>
 
-  <!-- API Key 复制弹窗 -->
-  <div id="apikey-popup" class="modal" style="display:none;">
+  <!--
+    工作区浏览：数据来自 GET /api/workspaces/browse（只列目录、每次一层）。
+    只在**新建会话**时用到——会话一旦发出首条消息，工作区就绑定且不可变更。
+  -->
+  <div id="workspace-browse-modal" class="modal" style="display:none;">
     <div class="modal-backdrop"></div>
-    <div class="modal-content modal-small">
+    <div class="modal-content">
       <div class="modal-header">
-        <h3>API Key 已创建</h3>
-        <button id="popup-close" type="button" class="icon-btn">&times;</button>
+        <h3>选择工作区</h3>
+        <button id="workspace-browse-close" type="button" class="icon-btn">&times;</button>
       </div>
-      <p class="hint">请立即复制，明文 key 只显示一次。</p>
-      <div class="apikey-value-wrap">
-        <input id="apikey-value" type="text" readonly />
-        <button id="apikey-copy" type="button">复制</button>
+      <p class="workspace-hint">
+        任意目录都可以选。选中的目录会成为这条会话的文件根——此后不再改变，换项目请新建会话。
+        也可以直接粘贴路径，或什么都不选（那条会话将使用应用为它创建的专属目录）。
+      </p>
+      <!-- 直接粘贴路径：逐级点进去在一个深目录上很啰嗦，而路径本来就常在手边 -->
+      <div class="workspace-browse-bar">
+        <input
+          id="workspace-browse-input"
+          type="text"
+          class="workspace-browse-input"
+          placeholder="也可以直接粘贴路径，回车前往"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="workspace-browse-go" type="button">前往</button>
       </div>
-      <p id="copy-msg" class="copy-msg"></p>
+      <div class="workspace-browse-bar">
+        <button id="workspace-browse-up" type="button">↑ 上一级</button>
+        <code id="workspace-browse-path"></code>
+      </div>
+      <div id="workspace-browse-list" class="workspace-browse-list"></div>
+      <div class="workspace-browse-actions">
+        <button id="workspace-browse-use" type="button">使用此目录</button>
+      </div>
     </div>
   </div>
 
+  <!-- 工作区文件面板：数据来自 GET /api/workspace/files 与 /file，只读 -->
+  <div id="workspace-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>工作区</h3>
+        <button id="workspace-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <!--
+        工作区路径由 GET /api/workspace/info 填充（按当前会话解析，草稿态按当前选择）。
+        工作区是会话级取值，每条会话可能不同——不显示它，用户在下面这棵树里看到的就只是
+        「一堆文件名」，无法确认那是哪个项目。
+      -->
+      <p id="workspace-path" class="workspace-path"></p>
+      <p class="workspace-hint">
+        Agent 的文件读写、命令产物都落在这个目录里。面板<b>只读</b>——要改动请通过对话让 Agent 做，
+        这样才会经过人工审批。
+      </p>
+      <div class="workspace-body">
+        <div class="workspace-tree" id="workspace-tree"></div>
+        <div class="workspace-preview" id="workspace-preview"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 知识库面板：数据来自 GET /api/knowledge -->
+  <div id="knowledge-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>知识库</h3>
+        <button id="knowledge-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="knowledge-hint">
+        索引工作区里的文本文档后，Agent 可通过 <code>search_documents</code> 检索到它们。
+        索引只<b>读</b>工作区文件；「移除」只清掉索引，<b>不会删除源文件</b>。
+      </p>
+      <div class="knowledge-toolbar">
+        <button id="knowledge-index" type="button" class="primary">索引工作区</button>
+        <button id="knowledge-refresh" type="button">刷新</button>
+      </div>
+      <div id="knowledge-caps" class="knowledge-caps"></div>
+      <div id="knowledge-list" class="knowledge-list"></div>
+    </div>
+  </div>
+
+  <!--
+    技能库面板：数据来自 GET /api/skills。
+    复用 knowledge-* 的样式类：两者都是「能力条 + 列表行」的同一种结构，为它另造一套
+    只会让两处的间距与断行规则慢慢漂开。
+  -->
+  <div id="skills-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>技能</h3>
+        <button id="skills-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="knowledge-hint">
+        技能是 Agent 会加载的指令包，放在工作区的 <code>skills/</code> 目录里。
+        启停<b>只对之后新建的会话生效</b>——已在进行的会话沿用它们启动时加载的那一份。
+        技能包本身的新增与修改请直接改文件系统：那条路径同样受人工审批约束。
+      </p>
+      <div class="knowledge-toolbar">
+        <button id="skills-refresh" type="button">刷新</button>
+      </div>
+      <div id="skills-caps" class="knowledge-caps"></div>
+      <div id="skills-list" class="knowledge-list"></div>
+    </div>
+  </div>
+
+  <!-- 必须在 app.js 之前：助手消息的渲染依赖它的全局 Markdown -->
+  <script src="/markdown.js"></script>
+  <!-- 必须在 app.js 之前：工作区面板的状态由它的全局 WorkspaceScope 构造（错序时
+       会话切换不会清掉上一条会话的目录缓存，且不报错） -->
+  <script src="/workspace_scope.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

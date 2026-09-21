@@ -14,6 +14,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from config import SandboxTier
+from runtime.sandbox.docker_runner import DockerSandboxRunner
 from runtime.sandbox.errors import SandboxUnavailableError
 from runtime.sandbox.models import SandboxPolicy
 from runtime.sandbox.process_runner import ProcessSandboxRunner
@@ -21,17 +22,34 @@ from runtime.sandbox.protocol import SandboxRunner
 from runtime.sandbox.wsl_runner import WslSandboxRunner
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from config import AppConfig
 
     from runtime.sandbox.models import SandboxPolicy
 
 logger = logging.getLogger(__name__)
 
-_IMPLEMENTED_TIERS: tuple[SandboxTier, ...] = (SandboxTier.WSL, SandboxTier.PROCESS)
+_IMPLEMENTED_TIERS: tuple[SandboxTier, ...] = (
+    SandboxTier.DOCKER,
+    SandboxTier.WSL,
+    SandboxTier.PROCESS,
+)
 """本期已实现的档位；其余档位按「未实现」显式报错。"""
 
 _AUTO_ORDER: tuple[SandboxTier, ...] = (SandboxTier.WSL, SandboxTier.PROCESS)
-"""``auto`` 档位的候选顺序：隔离强度从高到低。"""
+"""``auto`` 档位的候选顺序：隔离强度从高到低。
+
+**``docker`` 刻意不进这个列表**（与上面的 ``_IMPLEMENTED_TIERS`` 不同，那是两回事）：
+``auto`` 的既有候选之间，「命令能碰到什么」的差异是渐进的；而容器档位一次性改变三件事
+——网络被切断、宿主文件系统不可见、shell 从宿主方言变成 POSIX ``sh``。把它们带进 ``auto``
+会让升级本版本的用户在毫无预期的情况下遇到「我的构建命令突然连不上网」，而这属于**部署
+决定**，应当由使用者显式写下 ``SANDBOX_TIER=docker``。
+
+代价要说清楚：``auto`` 因此在装有 Docker 的机器上可能选到比实际可用的更弱的档位。这与
+「auto 一旦静默降级，用户会以为命令跑在更强的隔离里」是同一类问题，只是方向相反——
+故它连同本条说明一起写进 README 的档位对照表，而不是留在这里自证清白。
+"""
 
 
 def resolve_tier(requested: SandboxTier) -> tuple[SandboxTier, str]:
@@ -67,17 +85,20 @@ def resolve_tier(requested: SandboxTier) -> tuple[SandboxTier, str]:
     return requested, "显式指定"
 
 
-def build_sandbox_runner(config: AppConfig) -> SandboxRunner:
-    """按配置装配沙箱 runner。
+def build_sandbox_runner(config: AppConfig, *, workspace: Path) -> SandboxRunner:
+    """按配置与工作区装配沙箱 runner。
 
     Args:
         config: 应用配置，提供档位与资源策略参数。
+        workspace: 本次运行的工作区（容器档位的唯一挂载根）。工作区在会话级可选之后
+            不再是一个全局常量，必须由调用方显式给出——沿用「配置里那一个」会让
+            容器挂载到别的项目的目录上，而命令在容器里看起来完全正常。
 
     Returns:
         已通过可用性探测的 runner。
 
     Raises:
-        ValueError: ``config`` 为 ``None``。
+        ValueError: ``config`` 为 ``None`` 或 ``workspace`` 不是目录。
         SandboxUnavailableError: 档位未实现或环境不支持。
     """
     if config is None:
@@ -88,9 +109,9 @@ def build_sandbox_runner(config: AppConfig) -> SandboxRunner:
     tier, reason = resolve_tier(config.sandbox_tier)
 
     if tier is SandboxTier.AUTO:
-        runner, tier, reason = _select_auto_runner(policy, config)
+        runner, tier, reason = _select_auto_runner(policy, config, workspace)
     else:
-        runner = _create_runner(tier, policy, config)
+        runner = _create_runner(tier, policy, config, workspace)
         if not runner.probe():
             msg = f"沙箱档位 {tier.value!r} 在当前环境不可用（能力探测未通过）"
             logger.error(msg)
@@ -103,6 +124,7 @@ def build_sandbox_runner(config: AppConfig) -> SandboxRunner:
 def _select_auto_runner(
     policy: SandboxPolicy,
     config: AppConfig,
+    workspace: Path,
 ) -> tuple[SandboxRunner, SandboxTier, str]:
     """按隔离强度从高到低选出首个通过探测的档位。
 
@@ -115,7 +137,7 @@ def _select_auto_runner(
     """
     skipped: list[str] = []
     for candidate in _AUTO_ORDER:
-        runner = _create_runner(candidate, policy, config)
+        runner = _create_runner(candidate, policy, config, workspace)
         if runner.probe():
             reason = f"auto：{candidate.value} 通过能力探测，作为最强可用档位"
             if skipped:
@@ -129,12 +151,28 @@ def _select_auto_runner(
     raise SandboxUnavailableError(msg)
 
 
-def _create_runner(tier: SandboxTier, policy: SandboxPolicy, config: AppConfig) -> SandboxRunner:
+def _create_runner(
+    tier: SandboxTier, policy: SandboxPolicy, config: AppConfig, workspace: Path
+) -> SandboxRunner:
     """按档位创建 runner 实例。"""
     if tier == SandboxTier.PROCESS:
+        # WHY 进程档位不接工作区：它以每条命令的 ``cwd`` 为准（由 backend 传入），
+        # 一个实例可以服务任意工作区，按工作区各建一份只会多出无意义的对象。
         return ProcessSandboxRunner(policy)
     if tier == SandboxTier.WSL:
+        # 同上：WSL 通过 ``/mnt`` 访问宿主，工作区只体现在 ``cwd`` 上。
         return WslSandboxRunner(policy, distro=config.sandbox_wsl_distro)
+    if tier == SandboxTier.DOCKER:
+        # WHY 挂载根必须显式传入而不能取 ``config.workspace``：容器档位只挂载这一个
+        # 目录，而工作区在会话级可选之后已不是全局常量——沿用配置里那一个会让容器
+        # 挂到别的项目的目录上，命令在容器里看起来却完全正常。
+        return DockerSandboxRunner(
+            policy,
+            image=config.sandbox_docker_image,
+            workspace_root=workspace,
+            workspace_read_only=config.sandbox_docker_workspace_read_only,
+            user=config.sandbox_docker_user,
+        )
 
     msg = f"沙箱档位 {tier.value!r} 没有对应的 runner 实现"
     raise SandboxUnavailableError(msg)

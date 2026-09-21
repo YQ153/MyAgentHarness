@@ -17,8 +17,16 @@ from langgraph.types import Command
 logger = logging.getLogger(__name__)
 
 DecisionType = Literal["approve", "edit", "reject", "respond"]
+"""人工审批的决策类型；取值必须与 langchain ``HITLResponse`` 的约定一致。"""
 
 _VALID_DECISIONS: frozenset[str] = frozenset({"approve", "edit", "reject", "respond"})
+"""``DecisionType`` 的运行时镜像，供校验与错误提示遍历。
+
+WHY 需要第二份而不是直接用 ``DecisionType``：``Literal`` 只是类型检查期的取值集合，
+运行期无法枚举；而 ``normalize_decisions`` 既要校验成员，又要在报错时列出可选值。
+两处若各自手写一份名单，新增一种决策时必然漏改其中一处——表现为「类型说可以、
+运行期说不认识」。
+"""
 
 INTERRUPT_NODE = "__interrupt__"
 """LangGraph 用于承载中断信息的特殊 updates 键。

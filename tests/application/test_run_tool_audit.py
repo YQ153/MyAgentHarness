@@ -15,13 +15,13 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 
 from agent.mcp import MCPServerStatus
 from agent.tooling import ToolBundle
-from agent.tools import ToolDescriptor, ToolSource
-from application.principal import Principal
+from agent.tools import BUILTIN_TOOL_NAMES, ToolDescriptor, ToolSource
+from application.audit_context import LOCAL_ACTOR_ID
 from application.run_service import RunService
 from application.tool_catalog import ToolCatalog
 from tests.application.test_run_governance import RecordingAuditStore
 from tests.application.test_run_service import FakeGraphFactory, _drain
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 def _tool_call_chunk(name: str, args: str, index: int = 0) -> Any:
@@ -84,6 +84,8 @@ def _catalog(*, with_builtin_flag: bool = False) -> ToolCatalog:
                 ),
             ),
             mcp_statuses=(MCPServerStatus(name="srv", transport="stdio", ok=True, tool_count=1),),
+            # 替身与真实装配结果同形：内置工具名随 bundle 一起交出（见 Q9）
+            builtin_names=BUILTIN_TOOL_NAMES,
         )
     )
 
@@ -97,10 +99,12 @@ def _make_service(
     catalog: ToolCatalog | None = None,
     **config_overrides: Any,
 ) -> RunService:
+    config = make_config(tmp_path, **config_overrides)
     return RunService(
-        make_config(tmp_path, **config_overrides),
+        config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(graph),
+        workspaces=StubSessionRegistry(config),
         audit_store=audit,
         tool_catalog=catalog,
     )
@@ -196,11 +200,9 @@ async def test_tool_audit_also_records_actor(tmp_path, thread_store):
     graph = ToolCallingGraph(result=_tool_message("srv_weather", "晴"))
     service = _make_service(tmp_path, thread_store, graph, audit, catalog=_catalog())
 
-    await _drain(
-        await service.stream("t1", "上海天气", principal=Principal(user_id="alice", role="member"))
-    )
+    await _drain(await service.stream("t1", "上海天气"))
 
-    assert audit.of_type("tool_call")[0]["actor_id"] == "alice"
+    assert audit.of_type("tool_call")[0]["actor_id"] == LOCAL_ACTOR_ID
 
 
 async def test_tool_audit_survives_missing_catalog(tmp_path, thread_store):

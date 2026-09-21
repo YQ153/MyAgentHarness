@@ -18,10 +18,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from application.errors import SessionRootNotReadyError, SessionRootUnavailableError
 from application.thread_service import ThreadService
 from interfaces.web.routes import router
 from tests.application.test_audit_enrichment import FakeCheckpointer, FakeGraphFactory
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 
 def _record(thread_id: str, title: str, *, archived: bool = False, owner_id: str = "") -> dict[str, Any]:
@@ -43,6 +44,8 @@ class StubThreadStore:
     def __init__(self, records: list[dict[str, Any]] | None = None) -> None:
         self._records = {item["thread_id"]: item for item in (records or [])}
         self.list_calls: list[dict[str, Any]] = []
+        self.reject_tags = False
+        """置为 True 时 ``set_tags`` 抛 ValueError，模拟存储层的标签校验。"""
 
     async def get(self, thread_id: str) -> dict[str, Any] | None:
         return self._records.get(thread_id)
@@ -74,6 +77,18 @@ class StubThreadStore:
         self._records[thread_id] = updated
         return updated
 
+    async def set_tags(self, thread_id: str, tags: list[str] | None) -> dict[str, Any] | None:
+        if self.reject_tags:
+            raise ValueError("标签不能含逗号：含,逗号")
+        record = self._records.get(thread_id)
+        if record is None:
+            return None
+        # 替身只做「整体替换」这一件事：规范化与编解码由存储层负责，
+        # 而那正是 tests/runtime/test_thread_tags.py 在真实存储上覆盖的部分。
+        updated = {**record, "tags": list(tags or [])}
+        self._records[thread_id] = updated
+        return updated
+
 
 class FailingRenameStore(StubThreadStore):
     """``rename`` 必定失败的替身：用于验证 500 映射。"""
@@ -82,8 +97,16 @@ class FailingRenameStore(StubThreadStore):
         raise aiosqlite.OperationalError("database disk image is malformed")
 
 
-def _build_client(tmp_path, store: StubThreadStore | None) -> TestClient:
-    """构造只挂载业务路由的测试客户端。"""
+def _build_client(
+    tmp_path, store: StubThreadStore | None, *, workspaces: Any = None
+) -> TestClient:
+    """构造只挂载业务路由的测试客户端。
+
+    Args:
+        tmp_path: 临时目录（配置的数据目录）。
+        store: 会话存储替身；``None`` 表示让 ``app.state.threads`` 缺失（验 503）。
+        workspaces: 会话根注册表替身；``None`` 表示用标准的那个。
+    """
     app = FastAPI()
     config = make_config(tmp_path)
     app.state.config = config
@@ -95,6 +118,7 @@ def _build_client(tmp_path, store: StubThreadStore | None) -> TestClient:
             checkpointer=FakeCheckpointer(),
             thread_store=store,
             graph_factory=FakeGraphFactory(),
+            workspaces=workspaces if workspaces is not None else StubSessionRegistry(config),
         )
     )
     app.include_router(router)
@@ -128,6 +152,65 @@ def test_list_defaults_to_no_filter(tmp_path):
 
     assert store.list_calls[0]["query"] is None
     assert store.list_calls[0]["include_archived"] is False
+
+
+# ------------------------------------------------------------------ 标签
+
+
+def test_list_forwards_tag_filter(tmp_path):
+    """标签必须落到存储层，且与其它过滤条件同时生效。"""
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store)
+
+    response = client.get("/api/threads?tag=工作")
+
+    assert response.status_code == 200
+    assert store.list_calls[0]["tag"] == "工作"
+
+
+def test_patch_tags_only_keeps_archived_state(tmp_path):
+    """只传 tags 不得顺手把会话取消归档。
+
+    WHY 单列一条：这一版实现里最容易踩的坑——三个可更新字段若用 if/else 串起来，
+    「只给 tags」会落进归档分支，把 ``bool(None)`` 当成 False 写入，用户只想加个
+    标签，会话却从归档里冒了出来。
+    """
+    store = StubThreadStore([_record("t1", "会话", archived=True)])
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={"tags": ["重要"]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tags"] == ["重要"]
+    assert body["archived"] is True  # 未被 tags 请求改动
+
+
+def test_patch_rejects_empty_body(tmp_path):
+    """三个字段全不给应当回 400，而不是「成功但什么都没变」。"""
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={})
+
+    assert response.status_code == 400
+
+
+def test_patch_rejects_invalid_tags(tmp_path):
+    """标签不合法时回 400，且不写出半截状态。
+
+    WHY 让替身按存储层的规则抛错而不是替它做判断：规范化的唯一实现在
+    ``runtime.thread_store.normalize_tags``，在替身里再写一份等于制造第二份规则，
+    两份迟早分叉——而分叉的方向恰好是「路由测试说合法、真实存储说非法」。
+    这里只负责确认「存储层抛 ValueError 时，端点把它翻成 400」这一条。
+    """
+    store = StubThreadStore([_record("t1", "会话")])
+    store.reject_tags = True  # 替身据此模拟存储层的拒绝
+    client = _build_client(tmp_path, store)
+
+    response = client.patch("/api/threads/t1", json={"tags": ["含,逗号"]})
+
+    assert response.status_code == 400
 
 
 def test_list_response_carries_archive_fields(tmp_path):
@@ -238,3 +321,46 @@ def test_patch_storage_failure_returns_500(tmp_path):
 
     assert response.status_code == 500
     assert "重命名会话失败" in response.json()["detail"]
+
+
+# ------------------------------------------------------------------ 会话根
+
+
+class _BrokenRootRegistry(StubSessionRegistry):
+    """解析必定失败的注册表替身：按 ``error`` 抛指定的那一种。"""
+
+    def __init__(self, config: Any, error: Exception) -> None:
+        super().__init__(config)
+        self._error = error
+
+    async def resolve(self, **kwargs: Any) -> Any:
+        del kwargs
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # 根还没确定：这条会话尚未发出第一条消息（且没选工作空间）。
+        SessionRootNotReadyError("这条会话还没有专属目录：请先选择工作空间，或先发出第一条消息"),
+        # 根已确定但目录不见了：用户选定的项目目录被删掉/移动了。
+        SessionRootUnavailableError("/gone/project"),
+    ],
+    ids=["not-ready", "unavailable"],
+)
+def test_history_maps_root_failures_to_409(tmp_path, error):
+    """读历史时根不可用必须是 409（带可照做的文案），而不是 500。
+
+    WHY 单列（回归）：这两个失败以前都会掉进 ``except RuntimeError`` 那条兜底分支——
+    ``SessionRootUnavailableError`` 甚至是更糟的一种（``NotADirectoryError`` 是
+    ``OSError`` 而**不是** ``RuntimeError``，连兜底都接不住，直接冒到 ASGI 层）。用户点开
+    侧栏里自己的会话，看到的是一个与他操作毫无关系的 500，而他该做的是「先发一条消息」
+    或「把那个目录恢复回来」。
+    """
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store, workspaces=_BrokenRootRegistry(make_config(tmp_path), error))
+
+    response = client.get("/api/threads/t1")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == str(error)

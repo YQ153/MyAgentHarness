@@ -1,7 +1,7 @@
-"""RunService 的并发与权限语义回归测试。
+"""RunService 的并发与入口语义回归测试。
 
 WHY 用假图而不是真实 LangGraph 图：这些测试只关心「槽位互斥与释放、
-权限与所有权」的应用层语义；真图会引入模型初始化与检查点依赖，
+会话校验与记忆归属」的应用层语义；真图会引入模型初始化与检查点依赖，
 让测试变慢且受 API Key 牵制。
 """
 
@@ -9,23 +9,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from application.errors import (
-    OwnershipError,
-    PermissionDeniedError,
+    NotFoundError,
     ThreadBusyError,
 )
 from application.events import AgentEventType
 from agent.run_context import ANONYMOUS_USER_ID
-from application.principal import Principal
 from application.run_service import RunHandle, RunService
-from runtime.thread_store import ThreadMetaStore, open_thread_store
+from runtime.thread_store import ThreadMetaStore
 
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry
 
 
 # ------------------------------------------------------------------ 测试替身
@@ -71,28 +68,10 @@ class FakeGraphFactory:
     def __init__(self, graph: Any) -> None:
         self._graph = graph
 
-    def get(self, name: str | None = None) -> Any:
+    def get(self, name: str | None = None, *, scope: Any = None) -> Any:
         if name is not None and name != "deepseek-flash":
             raise KeyError(name)
         return self._graph
-
-
-class MissFirstGetStore(ThreadMetaStore):
-    """首次 ``get`` 返回 None 的存储替身。
-
-    WHY：复现「所有权校验时行尚未可见、登记时已被他人认领」的并发竞态，
-    验证 ``stream`` 登记后的复查能拦截认领冲突。
-    """
-
-    def __init__(self, conn: Any) -> None:
-        super().__init__(conn)
-        self._missed_once = False
-
-    async def get(self, thread_id: str) -> dict[str, Any] | None:
-        if not self._missed_once:
-            self._missed_once = True
-            return None
-        return await super().get(thread_id)
 
 
 def _make_service(
@@ -104,11 +83,8 @@ def _make_service(
         config,
         thread_store=store,
         graph_factory=FakeGraphFactory(graph or FakeGraph()),
+        workspaces=StubSessionRegistry(config),
     )
-
-
-def _principal(user_id: str, role: str = "member") -> Principal:
-    return Principal(user_id=user_id, role=role)
 
 
 async def _drain(events: AsyncIterator[Any]) -> list[Any]:
@@ -119,12 +95,21 @@ async def _drain(events: AsyncIterator[Any]) -> list[Any]:
 
 
 async def test_constructor_rejects_none_deps(test_config, thread_store):
+    """每一项必需依赖为 ``None`` 都要当场失败。
+
+    WHY 把 ``workspaces`` 也列进来：它是「本轮跑在哪个工作区」的唯一来源，缺了它
+    就必须要么报错、要么悄悄退回某个默认值——后者正是本次要消除的那类失败。
+    """
+    workspaces = StubSessionRegistry(test_config)
+    graph = FakeGraphFactory(FakeGraph())
     with pytest.raises(ValueError):
-        RunService(None, thread_store=thread_store, graph_factory=FakeGraphFactory(FakeGraph()))
+        RunService(None, thread_store=thread_store, graph_factory=graph, workspaces=workspaces)
     with pytest.raises(ValueError):
-        RunService(test_config, thread_store=None, graph_factory=FakeGraphFactory(FakeGraph()))
+        RunService(test_config, thread_store=None, graph_factory=graph, workspaces=workspaces)
     with pytest.raises(ValueError):
-        RunService(test_config, thread_store=thread_store, graph_factory=None)
+        RunService(test_config, thread_store=thread_store, graph_factory=None, workspaces=workspaces)
+    with pytest.raises(ValueError):
+        RunService(test_config, thread_store=thread_store, graph_factory=graph, workspaces=None)
 
 
 # ------------------------------------------------------------------ 输入校验
@@ -237,15 +222,18 @@ class ContextRecordingGraph:
         yield  # noqa: WPS328 不可达，仅为构造异步生成器
 
 
-async def test_stream_passes_memory_owner_into_graph_context(tmp_path, thread_store):
-    """归属必须随每轮运行进图：命名空间在图内算，缺了它记忆会落进匿名池。"""
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
+async def test_stream_passes_memory_owner_into_graph_context(test_config, thread_store):
+    """归属必须随每轮运行进图：命名空间在图内算，缺了它记忆会落进另一个池子。
+
+    WHY 断言与会话侧的兜底是同一个标识：两处一旦漂移，会得到「面板说没记住、
+    Agent 却照着做」这种现象——功能没坏，但两边看到的是两份事实。
+    """
     graph = ContextRecordingGraph()
-    service = _make_service(config, thread_store, graph)
+    service = _make_service(test_config, thread_store, graph)
 
-    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
+    await _drain(await service.stream("t1", "hello"))
 
-    assert graph.contexts[0].user_id == "alice"
+    assert graph.contexts[0].user_id == ANONYMOUS_USER_ID
 
 
 async def test_resume_passes_memory_owner_into_graph_context(test_config, thread_store):
@@ -259,8 +247,8 @@ async def test_resume_passes_memory_owner_into_graph_context(test_config, thread
     assert graph.contexts[-1].user_id == ANONYMOUS_USER_ID
 
 
-def test_memory_owner_falls_back_to_anonymous_in_disabled_mode():
-    """认证关闭时 owner_id 为空串，必须归一到匿名标识——否则 CLI 与 Web 各写一份。"""
+def test_memory_owner_falls_back_to_anonymous_for_empty_owner():
+    """``owner_id`` 为空串时必须归一到匿名标识——否则 CLI 与 Web 各写一个命名空间。"""
     handle = RunHandle(
         thread_id="t1",
         started_at=0.0,
@@ -282,105 +270,24 @@ def test_memory_owner_prefers_owner_id():
     assert handle.memory_owner == "alice"
 
 
-# ------------------------------------------------------------------ 权限与所有权
+# ------------------------------------------------------------------ 恢复运行
 
 
-async def test_apikey_mode_denies_missing_principal(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    with pytest.raises(PermissionDeniedError):
-        await service.stream("t1", "hello")
-
-
-async def test_viewer_role_cannot_run(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    with pytest.raises(PermissionDeniedError) as exc_info:
-        await service.stream("t1", "hello", principal=_principal("v", role="viewer"))
-    assert exc_info.value.permission == "thread:create"
-
-
-async def test_other_user_blocked_from_owned_thread(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    alice_events = await _drain(
-        await service.stream("t1", "alice was here", principal=_principal("alice"))
-    )
-    assert alice_events[-1].event == AgentEventType.DONE
-
-    with pytest.raises(OwnershipError):
-        await service.stream("t1", "bob tries", principal=_principal("bob"))
-
-
-async def test_admin_can_run_others_thread(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    await _drain(await service.stream("t1", "alice", principal=_principal("alice")))
+async def test_resume_completes_for_known_thread(test_config, thread_store):
+    """恢复路径的正面覆盖：会话存在时，一轮恢复必须以 DONE 收尾。"""
+    service = _make_service(test_config, thread_store)
+    await _drain(await service.stream("t1", "hello"))
 
     events = await _drain(
-        await service.stream("t1", "admin takes over", principal=_principal("root", role="admin"))
+        await service.resume("t1", {"decisions": [{"type": "approve"}]})
     )
-    assert events[-1].event == AgentEventType.DONE
-
-    # admin 运行不改变归属
-    record = await thread_store.get("t1")
-    assert record["owner_id"] == "alice"
-
-
-async def test_resume_requires_hitl_approve_permission(tmp_path, thread_store):
-    """WHY 覆盖 T3 的权限拆分：审批让此前被拦下的高危工具真正执行，
-    只持有 thread:create 的主体不得恢复运行。"""
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
-
-    payload = {"decisions": [{"type": "approve"}]}
-    with pytest.raises(PermissionDeniedError) as exc_info:
-        await service.resume("t1", payload, principal=_principal("v", role="viewer"))
-    assert exc_info.value.permission == "hitl:approve"
-
-
-async def test_resume_allowed_for_member(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
-
-    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
-
-    payload = {"decisions": [{"type": "approve"}]}
-    events = await _drain(await service.resume("t1", payload, principal=_principal("alice")))
 
     assert events[-1].event == AgentEventType.DONE
 
 
-async def test_resume_rejects_foreign_thread(tmp_path, thread_store):
-    config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-    service = _make_service(config, thread_store)
+async def test_resume_rejects_unknown_thread(test_config, thread_store):
+    """会话不存在时恢复必须报「会话不存在」，而不是凭空造一个会话出来。"""
+    service = _make_service(test_config, thread_store)
 
-    await _drain(await service.stream("t1", "hello", principal=_principal("alice")))
-
-    payload = {"decisions": [{"type": "approve"}]}
-    with pytest.raises(OwnershipError):
-        await service.resume("t1", payload, principal=_principal("bob"))
-
-
-async def test_concurrent_claim_conflict_detected(tmp_path):
-    """WHY 覆盖「校验时行不可见、登记时已被他人认领」的竞态：
-    此前 ``_record_turn`` 不返回记录，``stream`` 的登记后复查是死代码，
-    Bob 可以静默地在 Alice 的会话上继续运行。"""
-    db_path = tmp_path / "race.db"
-    async with open_thread_store(db_path) as base:
-        # 先让 Alice 直接在存储层认领会话（绕过服务，保证竞态可控）
-        await base.record_turn("shared", title_hint="alice", turn_delta=1, owner_id="alice")
-
-        # 借用内层连接构造竞态替身：必须与真实数据共享同一份数据
-        race_store = MissFirstGetStore(base._conn)
-        config = make_config(tmp_path, auth_mode="apikey", auth_session_secret="s" * 32)
-        service = _make_service(config, race_store)
-
-        with pytest.raises(OwnershipError):
-            await service.stream("shared", "bob sneaks in", principal=_principal("bob"))
+    with pytest.raises(NotFoundError):
+        await service.resume("missing", {"decisions": [{"type": "approve"}]})

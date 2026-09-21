@@ -40,7 +40,18 @@ from runtime.sandbox.process_runner import ProcessSandboxRunner  # noqa: E402
 from runtime.sandbox.wsl_runner import WslSandboxRunner  # noqa: E402
 
 config = AppConfig.load()
-print(f"[cfg] mode={config.execution_mode} tier={config.sandbox_tier} ws={config.workspace}")
+
+def _session_root(config: AppConfig, name: str = "smoke") -> pathlib.Path:
+    """取一个冒烟用的会话根（并建出来）。
+
+    WHY 不再读某个「启动默认工作区」：新模型下每个会话的根由它自己决定——用户选的工作
+    空间，或应用为它建的专属目录。冒烟脚本是一段「手工会话」，因此显式取一个专属目录。
+    """
+    root = config.session_dir(name)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+print(f"[cfg] mode={config.execution_mode} tier={config.sandbox_tier} ws={workspace}")
 
 auto_runner = build_sandbox_runner(config)
 print(f"[0 auto 选档] tier={auto_runner.tier.value} desc={auto_runner.describe()}")
@@ -52,10 +63,10 @@ print("\n--- Tier 0：进程沙箱 ---")
 runner = ProcessSandboxRunner(policy)
 print(f"[probe] available={runner.probe()} desc={runner.describe()}")
 
-r1 = runner.run(CommandRequest(command="echo hello-sandbox", cwd=config.workspace, timeout=10))
+r1 = runner.run(CommandRequest(command="echo hello-sandbox", cwd=workspace, timeout=10))
 print(f"[1 基本执行] stdout={r1.stdout!r} exit={r1.exit_code} timed_out={r1.timed_out}")
 
-r2 = runner.run(CommandRequest(command="set", cwd=config.workspace, timeout=10))
+r2 = runner.run(CommandRequest(command="set", cwd=workspace, timeout=10))
 env_lines = [line for line in r2.stdout.splitlines() if "=" in line]
 env_names = sorted(line.split("=", 1)[0].upper() for line in env_lines)
 leaked = [line for line in env_lines if "should-not-leak" in line.lower()]
@@ -66,14 +77,14 @@ print(f"            变量清单={env_names}")
 print(f"            PATH 已透传={any(n == 'PATH' for n in env_names)} 期望 True")
 
 r3 = runner.run(
-    CommandRequest(command="ping -n 20 127.0.0.1 >nul", cwd=config.workspace, timeout=3)
+    CommandRequest(command="ping -n 20 127.0.0.1 >nul", cwd=workspace, timeout=3)
 )
 print(f"[3 超时终止] timed_out={r3.timed_out} exit={r3.exit_code} 期望 True/124")
 
 r4 = runner.run(
     CommandRequest(
         command="for /l %i in (1,1,200) do @echo 0123456789abcdefghij",
-        cwd=config.workspace,
+        cwd=workspace,
         timeout=10,
         max_output_bytes=500,
     )
@@ -81,7 +92,7 @@ r4 = runner.run(
 print(f"[4 输出截断] truncated={r4.truncated} len={len(r4.stdout)} 期望 True/500")
 
 backend = SandboxedFilesystemBackend(
-    root_dir=str(config.workspace),
+    root_dir=str(workspace),
     runner=runner,
     timeout=config.sandbox_timeout,
     max_output_bytes=config.sandbox_max_output_bytes,
@@ -113,7 +124,7 @@ tight_runner = ProcessSandboxRunner(
 r11 = tight_runner.run(
     CommandRequest(
         command="for /l %i in (1,1,20) do @start /b cmd /c ping -n 3 127.0.0.1 >nul",
-        cwd=config.workspace,
+        cwd=workspace,
         timeout=20,
     )
 )
@@ -134,15 +145,15 @@ if not wsl_available:
     print("              WSL 不可用，跳过 Tier 1 其余验证项（auto 应已回落到 process）")
 else:
     w1 = wsl_runner.run(
-        CommandRequest(command="echo hello-wsl; uname -s", cwd=config.workspace, timeout=30)
+        CommandRequest(command="echo hello-wsl; uname -s", cwd=workspace, timeout=30)
     )
     print(f"[13 基本执行] stdout={w1.stdout.strip()!r} exit={w1.exit_code} 期望含 Linux")
 
-    w2 = wsl_runner.run(CommandRequest(command="pwd", cwd=config.workspace, timeout=30))
+    w2 = wsl_runner.run(CommandRequest(command="pwd", cwd=workspace, timeout=30))
     print(f"[14 工作目录换算] pwd={w2.stdout.strip()!r} 期望以 /mnt/ 开头")
-    print(f"                 工作区={config.workspace}")
+    print(f"                 工作区={workspace}")
 
-    w3 = wsl_runner.run(CommandRequest(command="env | sort", cwd=config.workspace, timeout=30))
+    w3 = wsl_runner.run(CommandRequest(command="env | sort", cwd=workspace, timeout=30))
     wsl_env_leaked = [
         line
         for line in w3.stdout.splitlines()
@@ -154,13 +165,13 @@ else:
     print(f"[15 环境清洗] 泄漏项={wsl_env_leaked} 期望 []")
     print(f"              变量清单={wsl_env_names}")
 
-    w4 = wsl_runner.run(CommandRequest(command="sleep 30", cwd=config.workspace, timeout=3))
+    w4 = wsl_runner.run(CommandRequest(command="sleep 30", cwd=workspace, timeout=3))
     print(f"[16 超时终止] timed_out={w4.timed_out} exit={w4.exit_code} 期望 True/124 或 137")
 
     w5 = wsl_runner.run(
         CommandRequest(
             command="for i in $(seq 1 300); do echo 0123456789abcdefghij; done",
-            cwd=config.workspace,
+            cwd=workspace,
             timeout=30,
             max_output_bytes=500,
         )
@@ -178,7 +189,7 @@ else:
     w6 = tight_wsl.run(
         CommandRequest(
             command="for i in $(seq 1 30); do (sleep 5 &); done; sleep 1; echo done",
-            cwd=config.workspace,
+            cwd=workspace,
             timeout=30,
         )
     )
@@ -190,12 +201,12 @@ else:
 
     # WHY 验证写入：cwd 换算对不对，最有说服力的证据不是 pwd 的输出，而是
     # 命令在「它以为的当前目录」里写下的文件，确实出现在宿主的 workspace 里。
-    probe_file = config.workspace / "_wsl_probe.txt"
+    probe_file = workspace / "_wsl_probe.txt"
     try:
         wsl_runner.run(
             CommandRequest(
                 command="echo written-by-wsl > _wsl_probe.txt",
-                cwd=config.workspace,
+                cwd=workspace,
                 timeout=30,
             )
         )
@@ -205,7 +216,7 @@ else:
         probe_file.unlink(missing_ok=True)
 
     wsl_backend = SandboxedFilesystemBackend(
-        root_dir=str(config.workspace),
+        root_dir=str(workspace),
         runner=wsl_runner,
         timeout=config.sandbox_timeout,
         max_output_bytes=config.sandbox_max_output_bytes,
@@ -222,8 +233,13 @@ explicit_runner = build_sandbox_runner(AppConfig.load())
 print(f"[21 显式 wsl 档位] tier={explicit_runner.tier.value} 期望 wsl")
 
 os.environ["SANDBOX_TIER"] = "docker"
+# WHY 用「一个不存在的镜像」而不是「一个没实现的档位」：四个档位都已实现，「未实现」
+# 这条分支不再可达；但当时要钉的性质——**档位不可用时报错，而不是就近降级到更弱的
+# 隔离**——仍然有效，只是现在只能靠探测失败来触发（T24 把它从「未实现」升级成了
+# 「已实现但探测失败时报错」）。
+os.environ["SANDBOX_DOCKER_IMAGE"] = "harness-nonexistent:latest"
 try:
     build_sandbox_runner(AppConfig.load())
-    print("[22 未实现档位] 期望抛错但成功返回，断言失败")
+    print("[22 档位不可用时不得降级] 期望抛错但成功返回，断言失败")
 except SandboxUnavailableError as exc:
-    print(f"[22 未实现档位] 正确报错：{str(exc)[:90]}")
+    print(f"[22 档位不可用时不得降级] 正确报错：{str(exc)[:90]}")

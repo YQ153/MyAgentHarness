@@ -10,9 +10,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from deepagents import FilesystemPermission
+from deepagents.middleware.filesystem import supports_execution
 from langchain.agents.middleware import InterruptOnConfig
 
 if TYPE_CHECKING:
+    from deepagents.backends.protocol import BackendProtocol
+
     from config import ExecutionMode, SandboxTier
 
 logger = logging.getLogger(__name__)
@@ -30,12 +33,25 @@ _SANDBOX_INTERRUPT_DESCRIPTIONS: dict[str, str] = {
         "与宿主之间隔着 utility VM 边界，但发行版是持久环境、且经 /mnt 仍能"
         "读写宿主文件，被写入的恶意脚本会活到下一次执行，请确认命令内容安全。"
     ),
-    "docker": "即将在容器（Tier 2）内执行 shell 命令，请确认命令内容安全。",
+    "docker": (
+        "即将在容器（Tier 2）内执行 shell 命令：命令只能看到容器镜像与挂载进来的"
+        "工作区，宿主其余路径在容器内不存在，进程随容器结束而消失；网络默认切断"
+        "（SANDBOX_NETWORK_MODE=host 时例外）。注意容器仍共享宿主内核，且一条 rm "
+        "就能删掉挂载进来的工作区——请确认命令内容安全。"
+    ),
 }
 """各沙箱档位的审批提示语。
 
 WHY 提示语要写清隔离强度：审批的价值取决于人能否做出正确判断，而正确判断
 的前提是知道「拒绝这道命令的代价是什么，放行的风险又是什么」。
+
+WHY ``docker`` 那条必须重写而不是沿用「在容器内执行」一句：审批者要判断的是
+「放行之后可能发生什么」，而这取决于容器给了什么约束。只写「在容器内」等于没说
+——他既不知道该命令能否联网，也不知道工作区的文件会不会被改动。「容器」两个字
+在直觉上比实际更安全，这种偏差恰好会在最需要审慎的一刻把人推向放行。
+
+WHY 同时写明「挡不住什么」：把 ``rm 能删掉工作区`` 与 ``共享宿主内核`` 摆在同一句里，
+是因为审批者最容易的误判是「在容器里跑所以随便」。
 """
 
 _DEFAULT_SANDBOX_DESCRIPTION = _SANDBOX_INTERRUPT_DESCRIPTIONS["process"]
@@ -58,16 +74,32 @@ WHY 用黑名单而非白名单：虚拟根目录已经把可见范围限制在�
 """
 
 
-def build_permissions() -> list[FilesystemPermission]:
+def build_permissions(backend: BackendProtocol | None = None) -> list[FilesystemPermission]:
     """构造文件系统权限规则。
 
     规则按声明顺序匹配，首个命中即生效，因此**窄而严的规则必须写在宽而松的
     规则之前**。
 
-    注意：这里的路径是虚拟文件系统路径（相对于 backend 的根目录），
-    不是宿主机绝对路径。
+    WHY 必须按 backend 能力裁剪：工具级权限只作用于 ``ls`` / ``read_file`` /
+    ``write_file`` 这些**工具**，而 ``execute`` 走的是 shell——一条 ``cat .env``
+    能绕过全部路径规则。deepagents 因此在「可执行 backend + 权限规则」组合上
+    直接抛 ``NotImplementedError``（拒绝假装权限仍然生效），而不是放行一条纸面
+    防线。可执行 backend 下只能返回空列表，把凭据防护交给 ``execute`` 的人工
+    审批（``build_interrupt_on``）与沙箱隔离本身；该取舍会被显式告警，**不做
+    静默降级**。
+
+    Args:
+        backend: 已装配的 backend。``None`` 表示调用方自行保证不会执行命令
+            （例如纯配置校验），按「不执行命令」处理并返回完整规则。
+
+    Note:
+        能力判定看的是 ``backend`` 的**默认后端**——``supports_execution`` 对
+        ``CompositeBackend`` 会下钻到 ``default``，与生产装配同形。
+
+    Returns:
+        权限规则列表；backend 具备命令执行能力时为空列表。
     """
-    return [
+    rules = [
         # 1. 窄规则：敏感文件一律拒绝
         FilesystemPermission(
             operations=[_OPERATION_READ, _OPERATION_WRITE],
@@ -87,6 +119,17 @@ def build_permissions() -> list[FilesystemPermission]:
             mode="allow",
         ),
     ]
+
+    if backend is None or not supports_execution(backend):
+        return rules
+
+    logger.warning(
+        "backend 具备命令执行能力：已停用工具级文件权限规则（含 %d 条敏感路径拒绝）。"
+        "execute 经 shell 执行，无法被路径规则约束，deepagents 拒绝该组合；"
+        "凭据防护改由 execute 的人工审批与沙箱隔离承担。",
+        len(_SECRET_PATTERNS),
+    )
+    return []
 
 
 def build_interrupt_on(

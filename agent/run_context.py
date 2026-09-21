@@ -21,20 +21,21 @@ import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 ANONYMOUS_USER_ID = "__anonymous__"
-"""未启用鉴权时的记忆归属标识。
+"""记忆归属的兜底标识（本应用全部记忆都落在它这一个命名空间下）。
 
-WHY 要有兜底主体而不是用空串：``StoreBackend`` 也可以在图外被调用（管理
-接口直接读写、测试直接驱动 backend），此时拿不到运行时；若用空串，命名空间
-组件会被 deepagents 判为非法并抛错，表现为「记忆功能整体不可用」。统一落到
-本标识后，本地单用户场景仍是同一个记忆池，语义与"一个人一台机器"一致。
+WHY 要有兜底主体而不是用空串：``StoreBackend`` 也可以在图外被调用（面板直接
+读写、测试直接驱动 backend），此时拿不到运行时；若用空串，命名空间组件会被
+deepagents 判为非法并抛错，表现为「记忆功能整体不可用」。
 
-``application.principal.ANONYMOUS_PRINCIPAL`` 复用本常量，避免两处各写一份
-字面量后悄悄漂移成两个池子。
+WHY 需要它是**唯一**的取值来源：会话侧（``RunHandle.memory_owner``）与面板侧
+（``MemoryService``）必须算出同一个命名空间，否则会出现「面板说没记住、Agent
+却照着做」——两边都不报错，只是看的不是同一份数据。
 """
 
 MEMORY_NAMESPACE_ROOT = "memories"
@@ -49,7 +50,7 @@ _NAMESPACE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 
 与 deepagents ``StoreBackend._validate_namespace`` 的规则保持一致：它会在
 每次读写时校验命名空间，含非法字符则抛 ``ValueError``——而那条路径是工具
-调用，报错表现为「Agent 写不了记忆」，与真实原因（某个 OIDC ``sub`` 里有个
+    调用，报错表现为「Agent 写不了记忆」，与真实原因（某个标识里有个
 ``|``）相距甚远。对齐方式见 ``tests/agent/test_memory_namespace.py``：用例
 直接拿 deepagents 的校验函数验证本模块的输出。
 """
@@ -65,15 +66,29 @@ class AgentRunContext:
 
     Attributes:
         user_id: 本轮运行的主体标识，决定长期记忆的命名空间。
+        workspace: 本轮运行的工作区绝对路径；空串表示「未声明」。
     """
 
     user_id: str = ANONYMOUS_USER_ID
+    workspace: str = ""
+    """本轮运行的工作区绝对路径。
+
+    WHY 要把它也带进图里：工作区在会话级可选之后，**按工作区隔离**的能力就不止文件
+    后端一个——知识库为每个工作区各存一份索引。而知识库工具是在图内被调用的，它
+    只能从这里得知「这一次该查哪个工作区的索引」；不给它，工具就会去查启动时那一个，
+    表现为「检索到的文档不是这个项目的」。
+
+    WHY 与 ``user_id`` 共用同一条通道（``Runtime.context``）而不是另起一个
+    ``ContextVar``：后者会把「这次跑在哪个工作区」变成看不见的全局状态，任何绕过
+    服务层直接调图的代码都会静默落到另一个工作区——与 ``user_id`` 那一段是同一个
+    理由，不是两个。
+    """
 
     def __post_init__(self) -> None:
-        """校验并归一主体标识。
+        """校验并归一主体标识与工作区路径。
 
         Raises:
-            ValueError: ``user_id`` 不是非空字符串。
+            ValueError: ``user_id`` 不是非空字符串，或 ``workspace`` 不是字符串。
         """
         if not isinstance(self.user_id, str) or not self.user_id.strip():
             raise ValueError(
@@ -81,6 +96,16 @@ class AgentRunContext:
             )
         if self.user_id != self.user_id.strip():
             object.__setattr__(self, "user_id", self.user_id.strip())
+        if not isinstance(self.workspace, str):
+            raise ValueError(
+                f"workspace 必须是字符串（路径），实际：{type(self.workspace).__name__}"
+            )
+        if self.workspace.strip():
+            # WHY 归一为绝对路径：知识库按「解析后的路径」做缓存键，写进来的若是相对
+            # 路径，同一个工作区会因 CWD 不同而被当成两个，索引被白白建两遍。
+            object.__setattr__(self, "workspace", str(Path(self.workspace).expanduser().resolve()))
+        elif self.workspace:
+            object.__setattr__(self, "workspace", "")
 
 
 @lru_cache(maxsize=1024)
@@ -123,6 +148,27 @@ def memory_owner_of(runtime: Any) -> str:
 def namespace_of_runtime(runtime: Any) -> tuple[str, str]:
     """``StoreBackend`` 的命名空间工厂：运行时 → 命名空间。"""
     return memory_namespace(memory_owner_of(runtime))
+
+
+def workspace_of(runtime: Any) -> str:
+    """从图运行时里取出本轮运行的工作区路径；取不到时返回空串。
+
+    WHY 全程用 ``getattr`` 兜底：与 :func:`memory_owner_of` 同一理由——图外直接调用
+    工具/Nodes 时拿不到运行时。此处**不设默认工作区**：调用方（知识库工具）拿到空串
+    必须自己决定怎么办（回落或如实报错），而不是由这里悄悄替它选一个目录。
+    替它选，就等于把「查了错的索引」变成一次静默的成功。
+
+    Args:
+        runtime: LangGraph 传入的 ``Runtime``；图外调用时为 ``None``。
+
+    Returns:
+        工作区绝对路径；运行时未携带时返回空串。
+    """
+    workspace = getattr(getattr(runtime, "context", None), "workspace", None)
+    if isinstance(workspace, str) and workspace.strip():
+        return workspace
+    logger.debug("运行时未携带工作区路径")
+    return ""
 
 
 def _namespace_component(user_id: str | None) -> str:
@@ -168,4 +214,5 @@ __all__ = [
     "memory_namespace",
     "memory_owner_of",
     "namespace_of_runtime",
+    "workspace_of",
 ]

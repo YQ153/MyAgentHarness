@@ -17,15 +17,16 @@ from fastapi.staticfiles import StaticFiles
 from bootstrap.core import build_app_context
 from bootstrap.web import (
     build_audit_retention_worker,
-    build_http_client,
-    build_rate_limiter,
     build_run_governance_worker,
 )
 from config import AppConfig
-from interfaces.web.auth import router as auth_router
+from interfaces.web.attachment_routes import router as attachment_router
 from interfaces.web.health import router as health_router
+from interfaces.web.knowledge_routes import router as knowledge_router
 from interfaces.web.request_context import RequestContextMiddleware
 from interfaces.web.routes import router
+from interfaces.web.skill_routes import router as skill_router
+from interfaces.web.workspace_routes import router as workspace_router
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +44,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     config: AppConfig = app.state.config
 
     async with build_app_context(config) as context:
-        # WHY http_client 与 rate_limiter 不放进 AppContext：它们只有 Web 形态
-        # 需要，放进共享上下文会让 CLI 承担无谓的构造开销。
-        http_client = build_http_client()
-        rate_limiter = build_rate_limiter(config)
-
-        # WHY 清理过期 device flow 记录：CLI 轮询产生的过期 code 若不清理，
-        # 该表会随服务运行时长单调增长。
-        try:
-            await context.device_flow_store.cleanup()
-        except Exception:
-            logger.exception("device flow 过期记录清理失败，不影响服务启动")
-
-        # WHY 整个启动段都包在 try/finally 里：http_client 与后台任务都在
-        # yield 之前创建，若构造阶段抛错而不进 finally，这两者会连同已装配的
-        # 连接一起泄漏。
+        # WHY 整个启动段都包在 try/finally 里：后台任务在 yield 之前创建，
+        # 若构造阶段抛错而不进 finally，它们会连同已装配的连接一起泄漏。
         retention_worker = None
         governance_worker = None
         try:
@@ -81,12 +69,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             # 路由层通过 ``app.state`` 取依赖；这里把 AppContext 的内容铺开，
             # 保持既有路由代码不变。
+            # WHY 凡是路由会读的依赖都必须在这里铺开：漏掉一项时，宽容的读取点
+            # （``getattr(state, name, None)``）会静默降级，而严格的读取点
+            # （``state.audit_store``）会在真机上直接 500。
+            # 这条约束由 tests/interfaces/web/test_app_state_contract.py 静态兜住。
+            app.state.audit_store = context.audit_store
             app.state.context = context
-            app.state.http_client = http_client
-            app.state.rate_limiter = rate_limiter
-            app.state.api_key_store = context.api_key_store
-            app.state.device_flow_store = context.device_flow_store
             app.state.threads = context.threads
+            # WHY 只挂注册表、不挂它按启动默认值装配的那四类服务：工作区在会话级可选
+            # 之后，「文件面板 / 附件 / 技能视图 / 知识库」都是**按会话**各有一份的。
+            # 把默认工作区那一份摆在这里，等于给后续代码留了一条「顺手用全局那个」的
+            # 捷径——而它的症状是「B 会话的面板显示 A 项目的文件」，两边都不报错。
+            # 一律经 ``workspaces.services_for(...)`` 取，取错就是 AttributeError。
+            app.state.workspaces = context.workspaces
             app.state.runs = context.runs
             app.state.catalog = context.catalog
             app.state.health = context.health
@@ -94,7 +89,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.tools = context.tools
             app.state.memories = context.memories
 
-            logger.info("Web 服务启动完成：auth_mode=%s", config.auth_mode)
+            logger.info("Web 服务启动完成：host=%s", config.host)
             yield
         finally:
             # WHY 先停后台任务再关连接：清理任务持有 audit_store 连接，
@@ -111,7 +106,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await retention_worker.stop()
                 except Exception:
                     logger.exception("审计保留清理任务停止失败")
-            await http_client.aclose()
+            # WHY 这里不再关闭其它共享资源：本行原先调用一个关闭 OIDC httpx 客户端的
+            # 辅助函数，OIDC 移除后那个客户端与函数一起消失了，调用点却留了下来——
+            # 结果是**进程退出必失败**（NameError），而日志会把它显示成「Web 服务已停止」
+            # 之前的一堆存储初始化失败，把排查引向无关方向。两个后台任务已在上面显式
+            # 收尾，它们与各存储的连接由 ``build_app_context`` 退出时统一关闭（在本次
+            # finally 之后发生）。若将来新增需要显式关闭的资源，请在此**就地**关闭并
+            # 写明理由，不要引入一个跨模块的“统一清理”间接层。
             logger.info("Web 服务已停止")
 
 
@@ -147,8 +148,11 @@ def create_app(config: AppConfig) -> FastAPI:
     # 启动阶段（业务路由尚未就绪）探活请求仍能被应答，而不是被后面的
     # 静态挂载吞成 404。
     app.include_router(health_router)
-    app.include_router(auth_router)
     app.include_router(router)
+    app.include_router(workspace_router)
+    app.include_router(attachment_router)
+    app.include_router(knowledge_router)
+    app.include_router(skill_router)
 
     if _STATIC_DIR.is_dir():
         # WHY 静态挂载必须放在路由注册之后：挂载 "/" 会吞掉之后注册的所有

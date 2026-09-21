@@ -492,7 +492,7 @@ def main() -> int:
     config = AppConfig.load()
     print(
         f"[cfg] mode={config.execution_mode.value} tier={config.sandbox_tier.value} "
-        f"timeout={args.timeout}s workspace={config.workspace}"
+        f"timeout={args.timeout}s sessions_root={config.resolved_sessions_root}"
     )
 
     try:

@@ -22,10 +22,12 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from runtime.sqlite_lifecycle import open_sqlite_store
 from text_utils import build_title, collapse_whitespace
 from thread_utils import normalize_thread_id
 
@@ -88,10 +90,29 @@ CREATE TABLE IF NOT EXISTS thread_meta (
     updated_at    TEXT NOT NULL,
     turn_count    INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
-    archived_at   TEXT NOT NULL DEFAULT ''
+    archived_at   TEXT NOT NULL DEFAULT '',
+    tags          TEXT NOT NULL DEFAULT '',
+    workspace     TEXT NOT NULL DEFAULT '',
+    workspace_bound INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
+-- 分支表：一次分叉等于「把旧分支的头冻结下来 + 登记一个新分支」。
+-- WHY 有必要自己存：上游检查点的头指针会跟着最新的一次运行走（切换分支的代价为零，
+-- 但「有哪些分支」上游不给），也只认「按 id 取某个检查点」这一种读法。所以分支清单
+-- 只能由我们自己维护——主键取 (thread_id, branch_id)，分支 id 因此是会话内唯一的。
+CREATE TABLE IF NOT EXISTS thread_branches (
+    thread_id         TEXT NOT NULL,
+    branch_id         TEXT NOT NULL,
+    head_checkpoint   TEXT NOT NULL DEFAULT '',
+    parent_branch_id  TEXT NOT NULL DEFAULT '',
+    origin            TEXT NOT NULL DEFAULT '',
+    label             TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (thread_id, branch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_branches_thread
+    ON thread_branches (thread_id, created_at);
 """
 
 _MIGRATIONS = [
@@ -116,9 +137,103 @@ _MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_thread_meta_archived_updated
         ON thread_meta (archived, updated_at DESC, thread_id DESC);
     """,
+    # 当前分支游标：空串表示「根分支」。老库升级后为空串，与升级前「只有一条分支」
+    # 的可见性完全一致，不需要额外回填。
+    """
+    ALTER TABLE thread_meta ADD COLUMN current_branch TEXT NOT NULL DEFAULT '';
+    """,
+    # 标签：以「前后都带逗号」的规范形式存一个字符串（见 normalize_tags）。
+    # WHY 不建关联表：标签要按「会话」整体读写，单列足够表达；而过滤走 LIKE，
+    # 关联表带来的收益（可索引）在 LIKE 模式下用不上，只多一层 JOIN 与生命周期管理。
+    """
+    ALTER TABLE thread_meta ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+    """,
+    # 会话的**文件根**（用户绑定的工作空间，或应用为它创建的专属目录）；空串表示
+    # 「尚未确定」——它只在会话还没有产生过任何交互时出现，第一轮交互会把它写死。
+    """
+    ALTER TABLE thread_meta ADD COLUMN workspace TEXT NOT NULL DEFAULT '';
+    """,
+    # 这个根是「用户显式选的工作空间」（1）还是「应用为它建的专属目录」（0）。
+    # WHY 单独存一列而不是从路径形状推断：界面要靠它区分文案（「工作空间：…」还是
+    # 「会话专属目录：…」），而路径本身不携带这个信息——用户完全可以把工作空间选在
+    # sessions 目录里面。
+    """
+    ALTER TABLE thread_meta ADD COLUMN workspace_bound INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
-_COLUMNS = "thread_id, owner_id, title, created_at, updated_at, turn_count, archived, archived_at"
+_COLUMNS = (
+    "thread_id, owner_id, title, created_at, updated_at, turn_count, "
+    "archived, archived_at, current_branch, tags, workspace, workspace_bound"
+)
+
+_MAX_TAG_CHARS = 32
+"""单个标签的字符上限。"""
+
+_MAX_TAGS = 10
+"""一条会话允许的标签数量上限。
+
+WHY 两个上限都要有：标签会整串存在一个字段里并参与 LIKE 过滤，无上限时
+一个会话就能把这一列撑成正文——而它本来是给清单分类用的。
+"""
+
+
+def normalize_tags(tags: list[str] | None) -> list[str]:
+    """规整标签列表：去空白、去重、校验长度与数量，并保持原顺序。
+
+    WHY 放在存储层并公开：与 ``normalize_search_query`` 同理——标签的存储形式
+    （规范串）与过滤模式（``%,tag,%``）都由本模块决定，规范化必须与它们同源，
+    否则会出现「存进去的标签查不出来」这种只能靠猜的现象。
+
+    WHY 拒绝含逗号的标签：存储形式用逗号分隔，含逗号的标签会直接把一个标签
+    拆成两个——静默改变用户输入，且下次读出来才发现。
+
+    Args:
+        tags: 原始标签列表；``None`` 视为空列表。
+
+    Returns:
+        规范化后的标签列表（可能为空）。
+
+    Raises:
+        ValueError: 元素非字符串、含逗号、超长，或数量超限。
+    """
+    if tags is None:
+        return []
+    if not isinstance(tags, (list, tuple)):
+        raise ValueError(f"tags 必须是列表，实际：{type(tags).__name__}")
+
+    normalized: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError(f"标签必须是字符串，实际：{type(tag).__name__}")
+        text = collapse_whitespace(tag)
+        if not text:
+            continue
+        if "," in text:
+            raise ValueError(f"标签不能含逗号：{text}")
+        if len(text) > _MAX_TAG_CHARS:
+            raise ValueError(f"标签过长（{len(text)} > {_MAX_TAG_CHARS}）：{text}")
+        if text not in normalized:
+            normalized.append(text)
+
+    if len(normalized) > _MAX_TAGS:
+        raise ValueError(f"标签过多（{len(normalized)} > {_MAX_TAGS}）")
+    return normalized
+
+
+def tags_to_storage(tags: list[str]) -> str:
+    """把标签列表编成存储形式：前后各带一个逗号。
+
+    WHY 前后都要逗号：这样 ``LIKE '%,tag,%'`` 匹配的是**完整**标签，
+    ``tag`` 不会命中 ``mytag``——只靠单侧分隔符做不到这一点。
+    """
+    return f",{','.join(tags)}," if tags else ""
+
+
+def tags_from_storage(raw: object) -> list[str]:
+    """把存储形式解回标签列表。"""
+    text = str(raw or "")
+    return [part for part in text.split(",") if part]
 
 _LIKE_ESCAPE = "\\"
 """LIKE 通配符的转义字符。"""
@@ -142,12 +257,16 @@ def _build_filters(
     include_unowned: bool,
     query: str | None,
     include_archived: bool,
+    tag: str | None = None,
 ) -> tuple[str, list[Any]]:
     """把查询条件编译成 WHERE 子句与参数。
 
     WHY 抽成函数：``list_threads`` 与 ``count`` 必须用**完全相同**的过滤条件，
     否则分页元信息会与实际返回条数不符（表现为「还有下一页」但翻过去是空的）。
     此前 owner 条件已在两处各写一遍，归档与搜索再加进来就是四份。
+
+    WHY 标签过滤也加在这里而不是另开一个编译点：同一条约束——过滤条件一旦有第二份
+    实现，总数与条数就会在某个组合下分叉，而那种缺陷只在「翻页翻空」时暴露。
     """
     conditions: list[str] = []
     params: list[Any] = []
@@ -156,6 +275,12 @@ def _build_filters(
     # 这个功能等于没做。
     if not include_archived:
         conditions.append("archived = 0")
+
+    if tag:
+        # 规范形式前后都带逗号，故模式两侧都要逗号；标签同样要转义，
+        # 否则一个含 % 的标签会把整张表都匹配上。
+        conditions.append(f"tags LIKE ? ESCAPE '{_LIKE_ESCAPE}'")
+        params.append(f"%,{_escape_like(tag)},%")
 
     if owner_id is not None:
         if include_unowned:
@@ -192,6 +317,9 @@ def _row_to_record(row: Any) -> dict[str, Any]:
     """
     record = dict(row)
     record["archived"] = bool(record.get("archived"))
+    # WHY 在这里解码标签：存储层对外的口径是「列表」，编解码只发生在读写这一刻；
+    # 让上层自己 split 会把存储形式的细节泄漏到三个调用点，且每个都要记得处理空串。
+    record["tags"] = tags_from_storage(record.get("tags"))
     return record
 
 
@@ -204,6 +332,28 @@ def _normalize_title(title: str | None) -> str:
     因此阈值作为参数传入。
     """
     return build_title(title, _MAX_TITLE_CHARS)
+
+
+def _normalize_workspace(workspace: str | None) -> str:
+    """归一会话绑定的工作区路径。
+
+    WHAT：空值/空白 → 空串（表示「用启动默认值」）；否则展开为用户目录下的绝对路径。
+
+    WHY 在此归一而不是原样存：这一列是**路径相等性**的判据——「这个会话绑的是不是我
+    请求的那个工作区」全靠字符串比较。``./proj`` 与 ``C:\\proj`` 指向同一目录却字面
+    不同，会让同一条会话看起来「换了工作区」，进而被服务层判成冲突（或更糟：被放行
+    到另一个根）。存储层只做归一，不做校验（清单判定属于配置层）。
+
+    Raises:
+        ValueError: 取值不是字符串。
+    """
+    if workspace is None:
+        return ""
+    if not isinstance(workspace, str):
+        raise ValueError(f"workspace 必须是字符串，实际：{type(workspace).__name__}")
+    if not workspace.strip():
+        return ""
+    return str(Path(workspace).expanduser().resolve())
 
 
 class ThreadMetaStore:
@@ -257,6 +407,8 @@ class ThreadMetaStore:
         *,
         title: str = "",
         owner_id: str = "",
+        workspace: str = "",
+        workspace_bound: bool = False,
     ) -> dict[str, Any]:
         """登记一个新会话；已存在时保持原记录不变（幂等）。
 
@@ -264,6 +416,8 @@ class ThreadMetaStore:
             thread_id: 会话 ID。
             title: 初始标题，空串表示尚未命名。
             owner_id: 会话所有者标识；认证关闭时为空串。
+            workspace: 会话的文件根绝对路径；空串表示尚未确定（会话尚未产生交互）。
+            workspace_bound: 该根是否由用户显式选定。
 
         Returns:
             该会话的完整元数据字典。
@@ -275,17 +429,28 @@ class ThreadMetaStore:
         """
         normalized_id = self._validate_thread_id(thread_id)
         normalized_title = _normalize_title(title)
+        normalized_workspace = _normalize_workspace(workspace)
         now = _utc_now()
 
         async with self._lock:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    INSERT INTO thread_meta
+                        (thread_id, owner_id, title, created_at, updated_at,
+                         turn_count, workspace, workspace_bound)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                     ON CONFLICT(thread_id) DO NOTHING
                     """,
-                    (normalized_id, owner_id, normalized_title, now, now),
+                    (
+                        normalized_id,
+                        owner_id,
+                        normalized_title,
+                        now,
+                        now,
+                        normalized_workspace,
+                        int(workspace_bound),
+                    ),
                 ) as cursor:
                     inserted = cursor.rowcount > 0
                 await self._conn.commit()
@@ -296,7 +461,12 @@ class ThreadMetaStore:
         if not inserted:
             logger.warning("会话已登记，保持原记录：thread=%s", normalized_id)
         else:
-            logger.info("会话已登记：thread=%s", normalized_id)
+            logger.info(
+                "会话已登记：thread=%s root=%s bound=%s",
+                normalized_id,
+                normalized_workspace,
+                workspace_bound,
+            )
 
         record = await self.get(normalized_id)
         if record is None:
@@ -312,6 +482,8 @@ class ThreadMetaStore:
         title_hint: str | None = None,
         turn_delta: int = 1,
         owner_id: str = "",
+        workspace: str = "",
+        workspace_bound: bool = False,
     ) -> dict[str, Any] | None:
         """记录一轮对话：刷新活动时间、累加轮次，并在标题为空时补写标题。
 
@@ -319,11 +491,18 @@ class ThreadMetaStore:
         同时保证「未登记过的会话」（例如历史遗留数据）也能被自动补齐，
         而不是在列表里凭空消失。
 
+        WHY 顺带把「这条会话的文件根」一并写死（下面 SQL 里的 CASE 只在为空时生效）：
+        根一旦确定就不再改变，而**第一轮交互就是它确定的时刻**——这条规则与「会话创建
+        时可以选择工作空间」合起来，正好实现「选定后产生第一条交互即永久锁定」。放在这
+        条 UPSERT 里是顺带，不需要第二趟写入，也就没有「两趟之间失败」的中间态。
+
         Args:
             thread_id: 会话 ID。
             title_hint: 用于生成标题的原始文本；为 ``None`` 时不改动标题。
             turn_delta: 本轮新增的对话轮次，恢复执行传 0（同一次运行的延续）。
             owner_id: 新建会话时的所有者；已存在会话不会被覆盖所有者。
+            workspace: 本条会话的文件根绝对路径；**已有取值的会话不会被改写**。
+            workspace_bound: 该根是否由用户显式选定；同样只在首次写入时生效。
 
         Returns:
             更新后的元数据；``None`` 表示该会话此前未登记且本次未能写入。
@@ -339,14 +518,17 @@ class ThreadMetaStore:
             raise ValueError(f"turn_delta 必须在 0..{_MAX_TURN_DELTA} 之间，实际：{turn_delta}")
 
         normalized_title = _normalize_title(title_hint)
+        normalized_workspace = _normalize_workspace(workspace)
         now = _utc_now()
 
         async with self._lock:
             try:
                 async with self._conn.execute(
                     """
-                    INSERT INTO thread_meta (thread_id, owner_id, title, created_at, updated_at, turn_count)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO thread_meta
+                        (thread_id, owner_id, title, created_at, updated_at,
+                         turn_count, workspace, workspace_bound)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         turn_count = thread_meta.turn_count + ?,
@@ -358,6 +540,16 @@ class ThreadMetaStore:
                             WHEN thread_meta.owner_id = '' OR thread_meta.owner_id IS NULL
                                 THEN excluded.owner_id
                             ELSE thread_meta.owner_id
+                        END,
+                        workspace = CASE
+                            WHEN thread_meta.workspace = '' OR thread_meta.workspace IS NULL
+                                THEN excluded.workspace
+                            ELSE thread_meta.workspace
+                        END,
+                        workspace_bound = CASE
+                            WHEN thread_meta.workspace = '' OR thread_meta.workspace IS NULL
+                                THEN excluded.workspace_bound
+                            ELSE thread_meta.workspace_bound
                         END
                     """,
                     (
@@ -367,6 +559,8 @@ class ThreadMetaStore:
                         now,
                         now,
                         turn_delta,
+                        normalized_workspace,
+                        int(workspace_bound),
                         turn_delta,
                     ),
                 ) as cursor:
@@ -599,6 +793,7 @@ class ThreadMetaStore:
         limit: int = 50,
         offset: int = 0,
         query: str | None = None,
+        tag: str | None = None,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """按最近活动时间倒序列出会话。
@@ -629,6 +824,7 @@ class ThreadMetaStore:
             include_unowned=include_unowned,
             query=normalized_query,
             include_archived=include_archived,
+            tag=tag,
         )
         sql = f"""
             SELECT {_COLUMNS} FROM thread_meta
@@ -666,6 +862,7 @@ class ThreadMetaStore:
         owner_id: str | None = None,
         include_unowned: bool = False,
         query: str | None = None,
+        tag: str | None = None,
         include_archived: bool = False,
     ) -> int:
         """返回会话总数，用于分页元信息。
@@ -687,6 +884,7 @@ class ThreadMetaStore:
             include_unowned=include_unowned,
             query=normalized_query,
             include_archived=include_archived,
+            tag=tag,
         )
         sql = f"SELECT COUNT(1) FROM thread_meta {where}"
 
@@ -706,6 +904,242 @@ class ThreadMetaStore:
         return int(row[0])
 
 
+    async def set_tags(self, thread_id: str, tags: list[str] | None) -> dict[str, Any] | None:
+        """整体替换某会话的标签。
+
+        WHY 是「整体替换」而不是增删单个：界面上的标签是一次编辑后整体提交的，
+        逐个增删需要前端自己算差集，而差集算错的表现是「删不掉的标签」。
+        整体替换让服务端行为与用户看到的一致。
+
+        WHY 不改 ``updated_at``：与 ``rename`` 同理——打标签是清单整理，不是对话活动，
+        刷新时间会把会话清单的顺序搅乱。
+
+        Args:
+            thread_id: 会话 ID。
+            tags: 新标签列表；``None`` 或空列表表示清空。
+
+        Returns:
+            更新后的元数据；``None`` 表示会话不存在（调用方应判定为 404）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法或标签不合法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        normalized_tags = normalize_tags(tags)
+
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET tags = ? WHERE thread_id = ?",
+                    (tags_to_storage(normalized_tags), normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("设置会话标签失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("设置标签未命中任何行：thread=%s", normalized_id)
+            return None
+        logger.info("会话标签已更新：thread=%s tags=%s", normalized_id, normalized_tags)
+        return await self.get(normalized_id)
+
+    async def set_branch_head(self, thread_id: str, branch_id: str, head_checkpoint: str) -> None:
+        """冻结某条分支的头检查点；分支不存在时顺带把根分支补登记。
+
+        WHY 只更新头而不整体 UPSERT：冻结发生在「即将离开这条分支」的时刻，这一动作
+        只应改头，不该把既有的 origin / label / parent 覆盖掉——那些字段描述的是这条
+        分支从哪来，与它此刻停在哪无关。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+            head_checkpoint: 冻结下来的检查点 id。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO thread_branches
+                        (thread_id, branch_id, head_checkpoint, parent_branch_id,
+                         origin, label, created_at)
+                    VALUES (?, ?, ?, '', 'root', '', ?)
+                    ON CONFLICT (thread_id, branch_id) DO UPDATE SET
+                        head_checkpoint = excluded.head_checkpoint
+                    """,
+                    (normalized_id, branch_id, head_checkpoint, _utc_now()),
+                )
+                await self._conn.commit()
+            except Exception:
+                logger.exception(
+                    "冻结分支头失败：thread=%s branch=%s", normalized_id, branch_id
+                )
+                raise
+
+    async def upsert_branch(
+        self,
+        thread_id: str,
+        branch_id: str,
+        *,
+        parent_branch_id: str = "",
+        origin: str = "",
+        label: str = "",
+    ) -> dict[str, Any]:
+        """登记（或更新）一条分支，头检查点留空表示「它就是当前分支」。
+
+        WHY 用 UPSERT 而不是「已存在就报错」：同一轮分叉在重试时会被重复登记，
+        幂等比把调用方逼去「先查再写」更好——后者中间正好是一个并发窗口。
+
+        WHY 覆盖写时不动 ``created_at``：它是这条分支「从哪一刻起存在」的凭据，
+        重试不该把它往后推，否则分支清单的排序会随重试次数漂移。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+            parent_branch_id: 从哪条分支分叉而来。
+            origin: 来源（root / edit / regenerate）。
+            label: 界面展示用的简短说明。
+
+        Returns:
+            写入后的分支记录；仅当会话行不存在时可能为 ``None``。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO thread_branches
+                        (thread_id, branch_id, head_checkpoint, parent_branch_id,
+                         origin, label, created_at)
+                    VALUES (?, ?, '', ?, ?, ?, ?)
+                    ON CONFLICT (thread_id, branch_id) DO UPDATE SET
+                        parent_branch_id = excluded.parent_branch_id,
+                        origin = excluded.origin,
+                        label = excluded.label
+                    """,
+                    (normalized_id, branch_id, parent_branch_id, origin, label, _utc_now()),
+                )
+                await self._conn.commit()
+            except Exception:
+                logger.exception(
+                    "登记分支失败：thread=%s branch=%s", normalized_id, branch_id
+                )
+                raise
+
+        record = await self.get_branch(normalized_id, branch_id)
+        if record is None:
+            logger.warning("登记分支后回读未命中：thread=%s branch=%s", normalized_id, branch_id)
+            return {}
+        return record
+
+    async def get_branch(self, thread_id: str, branch_id: str) -> dict[str, Any] | None:
+        """读取一条分支记录；不存在返回 ``None``。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            async with self._conn.execute(
+                """
+                SELECT branch_id, head_checkpoint, parent_branch_id, origin, label, created_at
+                FROM thread_branches WHERE thread_id = ? AND branch_id = ?
+                """,
+                (normalized_id, branch_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list_branches(self, thread_id: str) -> list[dict[str, Any]]:
+        """列出某会话的全部分支，按创建时间升序（根分支在前的稳定顺序）。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            async with self._conn.execute(
+                """
+                SELECT branch_id, head_checkpoint, parent_branch_id, origin, label, created_at
+                FROM thread_branches WHERE thread_id = ?
+                ORDER BY created_at ASC, branch_id ASC
+                """,
+                (normalized_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def set_current_branch(self, thread_id: str, branch_id: str) -> bool:
+        """把某条分支设为当前分支。
+
+        WHY 当前分支必须落库而不是留在内存：它是「下一次运行接在哪条分支之后」的
+        唯一依据，只存在进程里会让重启后接错分支——表现出来是「用户切了分支，
+        回来一看回复接在了另一条上」。
+
+        Args:
+            thread_id: 会话 ID。
+            branch_id: 分支标识；空串表示根分支。
+
+        Returns:
+            是否命中并更新了一行；``False`` 表示会话不存在。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        normalized_id = self._validate_thread_id(thread_id)
+        async with self._lock:
+            try:
+                async with self._conn.execute(
+                    "UPDATE thread_meta SET current_branch = ? WHERE thread_id = ?",
+                    (branch_id, normalized_id),
+                ) as cursor:
+                    updated = cursor.rowcount > 0
+                await self._conn.commit()
+            except Exception:
+                logger.exception("设置当前分支失败：thread=%s", normalized_id)
+                raise
+
+        if not updated:
+            logger.warning("设置当前分支未命中任何行：thread=%s", normalized_id)
+        return updated
+
+    async def current_branch(self, thread_id: str) -> str:
+        """读当前分支标识；空串表示根分支，会话不存在时同样返回空串。
+
+        Raises:
+            ValueError: ``thread_id`` 非法。
+        """
+        record = await self.get(thread_id)
+        return (record or {}).get("current_branch", "") or ""
+
+
+async def _prepare_thread_store(conn: aiosqlite.Connection) -> ThreadMetaStore:
+    """建表、跑幂等迁移并返回存储门面；由 ``open_sqlite_store`` 在初始化阶段调用。"""
+    await conn.executescript(_SCHEMA)
+    for migration in _MIGRATIONS:
+        try:
+            await conn.executescript(migration)
+        except Exception as exc:
+            # WHY 只记日志不中断：SQLite 对已有列/索引的 ALTER 会抛错，而幂等迁移
+            # 不需要回滚。WHY 要记下来而不是 ``pass``：真的写坏了（磁盘满、库损坏）
+            # 与「重复应用」在这里长得一样，静默跳过会让前者彻底无声——需要排查时
+            # 把级别调到 DEBUG 就能看到是哪一个迁移、什么错。
+            logger.debug("会话元数据表迁移跳过（多为重复应用）：%s", exc)
+    await conn.commit()
+    return ThreadMetaStore(conn)
+
+
 @asynccontextmanager
 async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
     """以异步上下文的方式提供会话元数据存储，退出时关闭连接。
@@ -723,40 +1157,8 @@ async def open_thread_store(db_path: Path) -> AsyncIterator[ThreadMetaStore]:
         ValueError: ``db_path`` 为 ``None``。
         aiosqlite.Error: 建表或 PRAGMA 设置失败时原样向上抛出。
     """
-    if db_path is None:
-        raise ValueError("db_path 不能为 None")
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn: aiosqlite.Connection | None = None
-
-    try:
-        conn = await aiosqlite.connect(str(db_path))
-        # WHY 设为 Row：让 fetchone/fetchall 直接可按列名取值，
-        # 避免下游用魔法下标（row[3]）读字段，字段顺序一变就会静默错位。
-        conn.row_factory = aiosqlite.Row
-
-        # WHY 重复设置 WAL：它是库级持久属性、通常已由检查点侧开启，
-        # 但本模块不应假设初始化顺序，显式声明才能保证独立启用时行为一致。
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        # WHY busy_timeout：检查点写入频繁，与本表写入可能同时发生；
-        # 默认行为是立即返回 "database is locked"，等待几秒远比报错合理。
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.executescript(_SCHEMA)
-        for migration in _MIGRATIONS:
-            try:
-                await conn.executescript(migration)
-            except Exception:
-                # WHY 忽略重复迁移错误：SQLite 对已有列/索引的 ALTER 会抛错，
-                # 但幂等迁移不需要回滚；非重复错误会在外层被记录。
-                pass
-        await conn.commit()
-
+    async with open_sqlite_store(
+        db_path, label="会话元数据表", prepare=_prepare_thread_store
+    ) as store:
         logger.info("会话元数据表已就绪：%s", db_path)
-        yield ThreadMetaStore(conn)
-    except Exception:
-        logger.exception("会话元数据表初始化失败：%s", db_path)
-        raise
-    finally:
-        if conn is not None:
-            await conn.close()
-            logger.info("会话元数据连接已关闭：%s", db_path)
+        yield store

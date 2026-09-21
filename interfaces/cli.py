@@ -9,18 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import secrets
-import time
-import webbrowser
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
-import httpx
 
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
-from application.ports import APIKeyRepository
-from application.principal import Principal
 from bootstrap.core import build_app_context
 
 if TYPE_CHECKING:
@@ -56,6 +49,10 @@ def render_event(event: AgentEvent) -> None:
         status = payload.get("status") or ""
         suffix = " (已截断)" if payload.get("truncated") else ""
         print(f"[结果] {payload.get('name', '')} {status}{suffix}", flush=True)
+        # 被截断时给出留存位置：命令行里没有文件面板，路径就是唯一的回取入口
+        ref = payload.get("full_output_ref")
+        if ref:
+            print(f"       完整输出：workspace{ref}", flush=True)
     elif event.event is AgentEventType.TODOS:
         _render_todos(list(payload.get("items") or []))
     elif event.event is AgentEventType.STEP:
@@ -147,154 +144,25 @@ def ask_human(payload: dict[str, Any]) -> dict[str, Any]:
     return {"decisions": decisions}
 
 
-async def _validate_api_key_for_cli(
-    config: AppConfig,
-    api_key: str,
-    *,
-    api_key_store: APIKeyRepository | None = None,
-) -> Principal:
-    """校验单个 API Key，返回 Principal；校验失败直接抛异常。"""
-    # WHY 优先校验环境变量里的 dev key：保留最小可用的单 key 快速入口，
-    # 生产环境应把 AUTH_API_KEY_DEV 置空，强制走数据库存储。
-    dev_key = config.auth_api_key_dev
-    if dev_key and secrets.compare_digest(api_key, dev_key):
-        return Principal(
-            user_id="apikey:dev",
-            display_name="dev",
-            role="admin",
-            auth_method="apikey",
-        )
-    if api_key_store is not None:
-        record = await api_key_store.validate(api_key)
-        if record is not None:
-            return Principal(
-                user_id=f"apikey:{record['key_id']}",
-                display_name=f"API Key {record.get('key_prefix', '')}...",
-                role=record["role"],
-                scopes=frozenset((record.get("scopes") or "").split()),
-                auth_method="apikey",
-            )
-    raise ValueError("HARNESS_API_KEY 无效")
-
-
-async def _authenticate_oidc_device_flow(config: AppConfig) -> str:
-    """通过 OIDC Device Flow 为 CLI 换取 API Key。
-
-    流程：
-    1. CLI 调用 Web 的 ``/auth/device/authorize`` 获得 user_code。
-    2. 提示用户在浏览器中打开验证地址并输入 user_code。
-    3. 按 interval 轮询 ``/auth/device/token``，直到用户批准或超时。
-    4. 返回的 access_token 即 API Key。
-
-    Raises:
-        ValueError: 认证失败或超时。
-    """
-    base_url = config.oidc_device_flow_base_url.rstrip("/")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{base_url}/auth/device/authorize")
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.exception("Device flow 授权请求失败")
-            raise ValueError(f"无法连接认证服务：{exc}") from exc
-
-        auth_info = resp.json()
-        user_code = auth_info.get("user_code", "")
-        verification_uri = auth_info.get(
-            "verification_uri_complete",
-            auth_info.get("verification_uri", f"{base_url}/auth/device/activate"),
-        )
-        device_code = auth_info.get("device_code", "")
-        interval = auth_info.get("interval", config.device_flow_poll_interval_seconds)
-        expires_in = auth_info.get("expires_in", config.device_flow_expires_in_seconds)
-
-        print(f"\n请在浏览器中打开以下地址完成登录：")
-        print(f"  {verification_uri}")
-        print(f"用户授权码：{user_code}\n")
-
-        # WHY 尝试自动打开浏览器：降低 CLI 使用门槛；失败也不影响继续轮询
-        try:
-            webbrowser.open(verification_uri)
-        except Exception:
-            logger.debug("自动打开浏览器失败，已提示用户手动访问")
-
-        deadline = time.monotonic() + expires_in
-        while time.monotonic() < deadline:
-            await asyncio.sleep(interval)
-            try:
-                token_resp = await client.post(
-                    f"{base_url}/auth/device/token",
-                    json={"device_code": device_code},
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("Device flow 轮询失败：%s", exc)
-                continue
-
-            if token_resp.status_code == 200:
-                payload = token_resp.json()
-                access_token = payload.get("access_token")
-                if not access_token:
-                    raise ValueError("Device flow 返回的 access_token 为空")
-                print("认证成功，已获得 API Key。\n")
-                return access_token
-
-            if token_resp.status_code == 400:
-                detail = ""
-                try:
-                    detail = token_resp.json().get("detail", "")
-                except Exception:
-                    pass
-                # authorization_pending 属于正常未批准状态，继续轮询
-                if detail != "authorization_pending":
-                    raise ValueError(f"Device flow 失败：{detail}")
-            # 其它状态码继续轮询
-
-    raise ValueError("Device flow 超时，请重新运行 CLI 并再次批准")
-
-
-async def _build_cli_principal(
-    config: AppConfig,
-    *,
-    api_key_store: APIKeyRepository | None = None,
-) -> Principal | None:
-    """根据 CLI 参数/环境变量构造认证主体。
-
-    - disabled：返回 ``None``，走匿名兼容路径。
-    - apikey：必须提供 API Key（``HARNESS_API_KEY``），校验后返回对应主体。
-    - oidc：优先使用 ``HARNESS_API_KEY``；未设置时走 OIDC Device Flow。
-    """
-    if config.auth_mode == "disabled":
-        return None
-
-    api_key = os.environ.get("HARNESS_API_KEY", "").strip()
-    if config.auth_mode == "apikey":
-        if not api_key:
-            raise ValueError(
-                "auth_mode=apikey 时，请设置环境变量 HARNESS_API_KEY 后启动 CLI"
-            )
-        return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-
-    if config.auth_mode == "oidc":
-        if api_key:
-            return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-        # WHY Device Flow：CLI 无法跑浏览器做授权码回调，通过后端托管的
-        # device flow 让用户在浏览器里点一次批准，CLI 轮询拿到 API Key。
-        api_key = await _authenticate_oidc_device_flow(config)
-        os.environ["HARNESS_API_KEY"] = api_key
-        return await _validate_api_key_for_cli(config, api_key, api_key_store=api_key_store)
-
-    return None
-
-
 async def _run_turn(
     runs: RunService,
     thread_id: str,
     user_input: str,
     *,
-    principal: Principal | None = None,
     model_name: str | None = None,
+    workspace: str | None = None,
 ) -> None:
-    """执行一轮输入，并在需要时循环处理多次中断。"""
+    """执行一轮输入，并在需要时循环处理多次中断。
+
+    Args:
+        runs: 运行服务。
+        thread_id: 会话 ID。
+        user_input: 本轮输入。
+        model_name: 模型别名。
+        workspace: 本次启动给出的工作空间（``--workspace``）；``None`` 表示不绑定，
+            这条 CLI 会话将使用应用为它创建的专属目录。**只在首轮生效**——第一轮之后
+            根就锁定了，服务端会拒绝与它不同的取值。
+    """
     pending_payload: dict[str, Any] | None = None
 
     async def consume(events: Any) -> None:
@@ -307,7 +175,12 @@ async def _run_turn(
 
     # WHY 先 await 拿到事件流再消费：``stream`` 是普通协程，参数校验与模型
     # 初始化都在这一步完成，错误能在进入渲染之前抛出，而不是混在事件流里。
-    events = await runs.stream(thread_id, user_input, principal=principal, model_name=model_name)
+    events = await runs.stream(
+        thread_id,
+        user_input,
+        model_name=model_name,
+        workspace=workspace,
+    )
     await consume(events)
 
     while pending_payload is not None:
@@ -315,16 +188,22 @@ async def _run_turn(
         pending_payload = None
         # WHY 恢复时同样带上 model_name：中断与恢复是同一次运行的两个半程，
         # 走不同模型会让缓存里多出一个实例，也会让成本与行为出现不可预期偏差。
-        resumed = await runs.resume(thread_id, decision, principal=principal, model_name=model_name)
+        # WHY 不再带 workspace：根在第一轮就锁定了，恢复时再传只是重复一个已生效的事实。
+        resumed = await runs.resume(thread_id, decision, model_name=model_name)
         await consume(resumed)
 
 
-async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
+async def run_cli(
+    config: AppConfig, *, model_name: str | None = None, workspace: str | None = None
+) -> int:
     """CLI 主循环。
 
     Args:
         config: 应用配置。
         model_name: 本次会话使用的模型别名；``None`` 表示用配置里的默认模型。
+        workspace: 这条 CLI 会话绑定的工作空间（``--workspace``）；``None`` 表示不绑定，
+            它将使用应用为它自动创建的专属目录。CLI 与 Web 的差别就在这里：一个 CLI 进程
+            就是一条会话，因此「选择工作空间」发生在启动那一刻，而不是在界面里选。
 
     Returns:
         进程退出码：0 正常，1 运行期异常，2 参数错误。
@@ -339,9 +218,6 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
     # 装配逻辑集中在 bootstrap，两种形态不会出现「一方有审计、另一方没有」
     # 这类难以通过功能测试发现的行为分叉。
     async with build_app_context(config) as context:
-        principal = await _build_cli_principal(
-            config, api_key_store=context.api_key_store
-        )
         threads = context.threads
         runs = context.runs
         catalog = context.catalog
@@ -357,7 +233,12 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
         thread_id = threads.new_thread_id()
 
         print("通用 Agent 已启动，输入 exit 退出。")
-        print(f"工作区：{config.workspace}")
+        # WHY 打印「这条会话的根」而不是某个配置值：不绑定工作空间时它的专属目录由会话
+        # ID 派生（此刻已经拿到 ID），用户需要知道自己的文件到底落在哪里。
+        if workspace:
+            print(f"工作空间：{Path(workspace).expanduser().resolve()}")
+        else:
+            print(f"工作空间：未绑定（本会话专属目录：{config.session_dir(thread_id)}）")
         print(f"执行档位：{config.execution_mode.value}")
         print(f"当前模型：{resolved_model}")
         print(f"会话 ID：{thread_id}")
@@ -377,7 +258,13 @@ async def run_cli(config: AppConfig, *, model_name: str | None = None) -> int:
                 if user_input.lower() in _EXIT_COMMANDS:
                     break
 
-                await _run_turn(runs, thread_id, user_input, principal=principal, model_name=model_name)
+                await _run_turn(
+                runs,
+                thread_id,
+                user_input,
+                model_name=model_name,
+                workspace=workspace,
+            )
         except ThreadBusyError as exc:
             # WHY 单独提示而不是当成崩溃：CLI 顺序执行本不该并发，出现说明
             # 上一轮的事件流没有被消费完，属于可恢复的状态问题。

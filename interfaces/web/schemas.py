@@ -47,12 +47,42 @@ class ThreadUpdateRequest(BaseModel):
 
     title: str | None = Field(default=None, description="新标题；None 表示不改标题")
     archived: bool | None = Field(default=None, description="归档状态；None 表示不改归档")
+    tags: list[str] | None = Field(
+        default=None, description="整体替换标签；None 表示不改标签，空列表表示清空"
+    )
 
 
 class ChatRequest(BaseModel):
     """发起一轮对话。"""
 
     content: str = Field(min_length=1, description="用户输入")
+    model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
+    attachment_ids: list[str] = Field(
+        default_factory=list,
+        description="随本轮发送的附件 ID（来自上传接口）；空列表表示纯文本",
+    )
+    workspace: str | None = Field(
+        default=None,
+        description=(
+            "本条会话要使用的工作区绝对路径；None 表示用启动默认值。"
+            "只在会话首条消息上生效——已绑定的会话给出不同取值会被拒绝（409）"
+        ),
+    )
+
+
+class RegenerateRequest(BaseModel):
+    """重新生成最后一轮助手回复。"""
+
+    model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
+
+
+class EditRequest(BaseModel):
+    """编辑指定轮次的用户消息并从该点分叉。"""
+
+    message_index: int = Field(
+        ge=0, description="目标消息在当前分支消息列表中的下标（0 基），必须指向用户消息"
+    )
+    content: str = Field(min_length=1, description="改写后的用户消息")
     model: str | None = Field(default=None, description="模型别名，None 表示默认模型")
 
 
@@ -77,6 +107,19 @@ class StopResponse(BaseModel):
         description="结果分类：requested（本次触发）/ "
         "already_stopping（此前已触发）/ not_running（当前无运行）"
     )
+
+
+class AttachmentDeleteResponse(BaseModel):
+    """删除附件的结果。
+
+    WHY 带 ``deleted`` 而不是直接 204：``deleted=false`` 表示「该附件本就不存在」，
+    与「删掉了」是两种不同的既成事实。用 204 抹平之后，前端无法区分「清理成功」
+    与「本来就没有」，而这恰恰是并发重试时最需要判断的一件事。
+    """
+
+    thread_id: str = Field(description="会话标识")
+    attachment_id: str = Field(description="被请求删除的附件标识")
+    deleted: bool = Field(description="是否确实删除了；false 表示该附件不存在")
 
 
 class HealthResponse(BaseModel):
@@ -117,15 +160,174 @@ class DeleteResponse(BaseModel):
     detail: str = Field(default="", description="失败原因摘要，成功时为空串")
 
 
+class KnowledgeCapabilities(BaseModel):
+    """知识库当前生效的能力与参数。
+
+    WHY 与清单一起下发：前端要据此决定「语义检索这一栏显不显示」以及「提示什么」。
+    让前端自己猜（或写死）会在换配置后给出与实际不符的说明。
+    """
+
+    vector_enabled: bool = Field(description="是否启用向量检索（取决于嵌入后端）")
+    embedding_backend: str | None = Field(default=None, description="嵌入后端标识；未启用为 null")
+    dims: int = Field(description="向量维度")
+    model: str = Field(default="", description="嵌入模型标识")
+    chunk_chars: int = Field(description="单个分块的目标字符数")
+    chunk_overlap_chars: int = Field(description="相邻分块的重叠字符数")
+    top_k: int = Field(description="检索返回的块数上限")
+
+
+class KnowledgeDocumentInfo(BaseModel):
+    """一份已索引的文档。"""
+
+    source_path: str = Field(description="源文件的工作区虚拟路径")
+    chunk_count: int = Field(description="该文档的分块数")
+    indexed_at: str = Field(description="最近一次索引时刻（ISO8601 UTC）")
+
+
+class KnowledgeStats(BaseModel):
+    """索引规模。"""
+
+    owner_id: str = Field(description="索引归属；认证关闭时为空串")
+    document_count: int
+    chunk_count: int
+    vector_count: int = Field(description="已写入的向量条数；未启用向量检索时为 0")
+    vector_enabled: bool
+    dims: int
+    model: str
+
+
+class KnowledgeListResponse(BaseModel):
+    """``GET /api/knowledge`` 的响应。"""
+
+    items: list[KnowledgeDocumentInfo]
+    stats: KnowledgeStats
+    capabilities: KnowledgeCapabilities
+
+
+class KnowledgeIndexRequest(BaseModel):
+    """``POST /api/knowledge`` 的请求体。"""
+
+    path: str | None = Field(
+        default=None, description="只索引这一份文档（工作区虚拟路径）；留空表示索引整个工作区"
+    )
+    force: bool = Field(default=False, description="为 true 时忽略内容指纹，强制重建")
+
+
+class KnowledgeIndexItem(BaseModel):
+    """逐份文档的索引结果。"""
+
+    source_path: str
+    status: str = Field(description="indexed / unchanged / empty / skipped")
+    chunk_count: int = Field(default=0)
+    vector_status: str = Field(default="", description="ok / disabled / failed / none / unchanged")
+    detail: str = Field(default="", description="跳过原因；非跳过时为空串")
+
+
+class KnowledgeIndexResponse(BaseModel):
+    """``POST /api/knowledge`` 的响应。"""
+
+    scanned: int = Field(description="扫描到的候选文件数")
+    indexed: int = Field(description="本次新索引（或强制重建）的文档数")
+    unchanged: int = Field(description="内容未变而跳过的文档数")
+    empty: int = Field(description="无可索引内容而跳过的文档数")
+    skipped: int = Field(description="因二进制 / 编码 / 超限而跳过的文档数")
+    items: list[KnowledgeIndexItem]
+
+
+class KnowledgeDeleteResponse(BaseModel):
+    """``DELETE /api/knowledge`` 的响应。"""
+
+    source_path: str
+    deleted: bool = Field(description="此前是否已索引（false 表示本来就没索引过）")
+
+
+class SkillInfo(BaseModel):
+    """一个已加载的技能。"""
+
+    name: str
+    description: str = ""
+    directory: str = Field(description="技能包所在目录的虚拟路径")
+    skill_md_path: str = Field(default="", description="``SKILL.md`` 的虚拟路径")
+    source: str = Field(default="", description="来自哪个技能来源目录")
+    enabled: bool = Field(description="是否参与加载；停用后不再注入模型上下文")
+    problems: list[str] = Field(
+        default_factory=list,
+        description="上游只告警不报错的问题（如 name 与目录名不符）；非空表示该技能形态可疑",
+    )
+
+
+class SkillUnloadable(BaseModel):
+    """候选目录里没能加载成技能的那一项。"""
+
+    directory: str = Field(description="目录的虚拟路径")
+    reason: str = Field(description="加载失败的原因")
+
+
+class SkillListResponse(BaseModel):
+    """``GET /api/skills`` 的响应。"""
+
+    scope: str = Field(description="状态作用域；当前固定为 global（技能集全应用共享）")
+    items: list[SkillInfo]
+    unloadable: list[SkillUnloadable] = Field(
+        default_factory=list,
+        description="被跳过 / 解析失败的候选目录——上游对它们只写日志，不报出来就无从排查",
+    )
+    load_errors: list[str] = Field(
+        default_factory=list, description="来源目录整体读取失败的原因（如目录不可读）"
+    )
+    view_path: str = Field(default="", description="物化视图目录的绝对路径")
+    view_exists: bool = Field(
+        default=False, description="视图是否存在；为 false 时建图会退回「全部技能」并告警"
+    )
+    graph_sources: list[str] = Field(
+        default_factory=list, description="下一次装配 Agent 时实际使用的技能来源目录"
+    )
+    view_warning: str = Field(
+        default="", description="视图不可用时的降级说明；非空即表示启停当前不生效"
+    )
+
+
+class SkillToggleRequest(BaseModel):
+    """``PATCH /api/skills/{name}`` 的请求体。"""
+
+    enabled: bool = Field(description="true 启用、false 停用")
+
+
+class SkillToggleResponse(BaseModel):
+    """``PATCH /api/skills/{name}`` 的响应。"""
+
+    name: str
+    enabled: bool
+    scope: str
+    updated_at: str = Field(default="", description="本次状态的写入时间（UTC ISO 8601）")
+    view: dict[str, Any] = Field(
+        default_factory=dict, description="本次重建后的视图摘要（enabled_skills / skipped）"
+    )
+
+
 __all__ = [
+    "AttachmentDeleteResponse",
     "ChatRequest",
     "DecisionPayload",
     "DeleteResponse",
     "EditedAction",
     "HealthResponse",
     "HistoryMessage",
+    "KnowledgeCapabilities",
+    "KnowledgeDeleteResponse",
+    "KnowledgeDocumentInfo",
+    "KnowledgeIndexItem",
+    "KnowledgeIndexRequest",
+    "KnowledgeIndexResponse",
+    "KnowledgeListResponse",
+    "KnowledgeStats",
     "ModelInfo",
     "ResumeRequest",
+    "SkillInfo",
+    "SkillListResponse",
+    "SkillToggleRequest",
+    "SkillToggleResponse",
+    "SkillUnloadable",
     "StopResponse",
     "ThreadListResponse",
     "ThreadResponse",

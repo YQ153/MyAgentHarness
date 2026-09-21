@@ -27,12 +27,15 @@ def _config_from_env(tmp_path: Path) -> AppConfig:
     WHY 不用 ``make_config``：它会显式传 ``skill_dirs``，而显式入参优先级高于
     环境变量——用它验证环境变量解析等于什么都没测到（断言拿到的是默认值，而
     测试还以为自己覆盖了环境变量）。
+
+    工作区目录在这里先建出来：``AppConfig`` 在构造期就校验它存在。
     """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
     return AppConfig(
         _env_file=tmp_path / "does-not-exist.env",
-        auth_mode="disabled",
-        workspace=tmp_path / "workspace",
-        memory_file=tmp_path / "workspace" / "AGENTS.md",
+        workspace=workspace,
+        memory_file=workspace / "AGENTS.md",
         db_path=tmp_path / "agent.db",
     )
 

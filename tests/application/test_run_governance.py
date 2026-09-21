@@ -22,7 +22,7 @@ from application.run_service import (
     RunService,
 )
 from tests.application.test_run_service import FakeGraph, FakeGraphFactory, SlowGraph, _drain
-from tests.conftest import make_config
+from tests.conftest import StubSessionRegistry, make_config
 
 # WHY 阈值取整数秒：配置的 ``run_max_seconds`` / ``hitl_pending_ttl_seconds``
 # 是整数秒，测试用 1 秒而不是 0.05 秒，是为了不为了测试方便去放宽生产配置的
@@ -53,10 +53,12 @@ def _make_service(
     **config_overrides: Any,
 ) -> RunService:
     """构造带审计替身的运行服务；``run_max_seconds`` 等阈值由用例给出。"""
+    config = make_config(tmp_path, **config_overrides)
     return RunService(
-        make_config(tmp_path, **config_overrides),
+        config,
         thread_store=thread_store,
         graph_factory=FakeGraphFactory(graph or SlowGraph(delay=10.0)),
+        workspaces=StubSessionRegistry(config),
         audit_store=audit_store,
     )
 

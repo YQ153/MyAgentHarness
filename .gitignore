@@ -18,7 +18,10 @@ venv/
 # 运行时数据：检查点数据库与会话状态
 .data/
 
-# 工作区：保留记忆模板与技能目录，忽略其余运行产物
+# 工作区：仓库里这一份只是**本机示例工作区**（示例记忆模板 + 示例用户技能），
+# 忽略其余运行产物（`.attachments/`、`_tool_outputs/`、`.skills-active/`）。
+# `workspace/` 只是仓库里的示例目录（会话的工作空间由用户在界面上任意选择，配置里不再有
+# WORKSPACE 这种默认值），因此把它的内容排除在版本控制之外，只保留两个可参考的样板。
 workspace/*
 !workspace/AGENTS.md
 !workspace/skills/

@@ -15,6 +15,7 @@ contextvars 是标准库能力，分工因此变成：接口层负责绑定，�
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -36,6 +37,30 @@ WHY 截断而非拒收：UA 只是审计的辅助定位信息，截断不影响�
 而拒收会让一次正常的业务请求因为头过大而失败。
 """
 
+MAX_TRACE_ID_CHARS = 64
+"""trace_id 的字符上限。
+
+WHY 与 IP 一样设上限：trace_id 可能来自客户端自带的 ``X-Request-Id``，
+无上限的值会被原样写进日志与审计表。
+"""
+
+_TRACE_DISALLOWED = re.compile(r"[^A-Za-z0-9._:\-]")
+"""trace_id 中不允许出现的字符。
+
+WHY 必须过滤而不是只截断：它会被拼进日志行，含换行或制表符的值能凭空多造出
+一条日志记录，让「按 trace 查日志」这条路径被污染。白名单比黑名单可靠——
+未列出的字符一律替换掉，不必去枚举所有危险字符。
+"""
+
+LOCAL_ACTOR_ID = "local"
+"""审计记录里 ``actor_id`` 的固定取值。
+
+WHY 还要一个主体标识：审计表按 ``actor_id`` 检索与归档，留空会让「谁做的」这一列
+永远是空的，也让「同一主体在别处做了什么」这类查询无从下手。本应用不再区分用户，
+所有操作都来自本机操作者，因此定义为一个常量而不是让各服务各写一份字面量——
+各写一份迟早会出现两种写法（``local`` / ``anonymous``），而它们在检索时不是同一个值。
+"""
+
 
 @dataclass(frozen=True)
 class RequestContext:
@@ -44,10 +69,12 @@ class RequestContext:
     Attributes:
         ip: 客户端 IP；未知时为空串（落库为 ``NULL``）。
         user_agent: 客户端 User-Agent；未知时为空串。
+        trace_id: 本次请求的链路标识；未知时为空串（落库为 ``NULL``）。
     """
 
     ip: str = ""
     user_agent: str = ""
+    trace_id: str = ""
 
 
 _EMPTY_CONTEXT = RequestContext()
@@ -80,6 +107,16 @@ def _clamp(value: object, limit: int, field: str) -> str:
     return text
 
 
+def _clamp_trace_id(value: object) -> str:
+    """规整 trace_id：非字符串视为缺失，非法字符替换为下划线并截断。
+
+    Raises:
+        无。任何异常输入都退化为空串，因为它只用于标识，不该让请求失败。
+    """
+    text = _clamp(value, MAX_TRACE_ID_CHARS, "trace_id")
+    return _TRACE_DISALLOWED.sub("_", text)
+
+
 def current_request_context() -> RequestContext:
     """返回当前协程绑定的请求上下文；未绑定时返回空上下文。
 
@@ -89,7 +126,12 @@ def current_request_context() -> RequestContext:
     return _REQUEST_CONTEXT.get()
 
 
-def bind_request_context(*, ip: str | None = None, user_agent: str | None = None) -> Token:
+def bind_request_context(
+    *,
+    ip: str | None = None,
+    user_agent: str | None = None,
+    trace_id: str | None = None,
+) -> Token:
     """为当前协程绑定请求上下文。
 
     WHY 返回 ``Token`` 而不是提供 ``clear()``：``Token`` 只能由绑定者持有，
@@ -99,6 +141,7 @@ def bind_request_context(*, ip: str | None = None, user_agent: str | None = None
     Args:
         ip: 客户端 IP；``None`` 或空串视为未知。
         user_agent: 客户端 User-Agent；``None`` 或空串视为未知。
+        trace_id: 本次请求的链路标识；``None`` 或空串视为未知。
 
     Returns:
         用于 ``reset_request_context`` 的令牌。
@@ -106,6 +149,7 @@ def bind_request_context(*, ip: str | None = None, user_agent: str | None = None
     context = RequestContext(
         ip=_clamp(ip, MAX_IP_CHARS, "ip"),
         user_agent=_clamp(user_agent, MAX_USER_AGENT_CHARS, "user_agent"),
+        trace_id=_clamp_trace_id(trace_id),
     )
     return _REQUEST_CONTEXT.set(context)
 
@@ -158,11 +202,26 @@ def audit_client_info() -> tuple[str | None, str | None]:
     return (context.ip or None, context.user_agent or None)
 
 
+def audit_trace_id() -> str | None:
+    """返回可直接写入审计记录的 ``trace_id``。
+
+    WHY 与 ``audit_client_info`` 同一取舍：空串转 ``None``，让「未知」在库里有
+    一个统一表示，``WHERE trace_id IS NULL`` 这类查询才成立。
+
+    Returns:
+        链路标识；未绑定时为 ``None``（CLI 与后台任务属于这种情况）。
+    """
+    return current_request_context().trace_id or None
+
+
 __all__ = [
+    "LOCAL_ACTOR_ID",
     "MAX_IP_CHARS",
+    "MAX_TRACE_ID_CHARS",
     "MAX_USER_AGENT_CHARS",
     "RequestContext",
     "audit_client_info",
+    "audit_trace_id",
     "bind_request_context",
     "current_request_context",
     "request_context",
