@@ -28,7 +28,7 @@ _VALID_GROUP_BY = ("model", "thread", "day")
 
 
 class UsageService:
-    """按用户 / 会话 / 时间窗聚合 token 用量。"""
+    """按模型 / 会话 / 时间窗聚合 token 用量。"""
 
     def __init__(
         self,
