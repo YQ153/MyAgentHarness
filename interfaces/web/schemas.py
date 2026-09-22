@@ -68,6 +68,14 @@ class ChatRequest(BaseModel):
             "只在会话首条消息上生效——已绑定的会话给出不同取值会被拒绝（409）"
         ),
     )
+    preset: str | None = Field(
+        default=None,
+        description=(
+            "本条会话要使用的**场景预设 ID**（见 GET /api/presets）；None / 空串表示不限定。"
+            "同样只在会话首条消息上生效，且同一个工作空间只允许一个场景——"
+            "给出与该会话已锁定场景不同的取值会被拒绝（409）"
+        ),
+    )
 
 
 class RegenerateRequest(BaseModel):
@@ -249,7 +257,18 @@ class SkillInfo(BaseModel):
     directory: str = Field(description="技能包所在目录的虚拟路径")
     skill_md_path: str = Field(default="", description="``SKILL.md`` 的虚拟路径")
     source: str = Field(default="", description="来自哪个技能来源目录")
+    category: str = Field(
+        default="",
+        description=(
+            "技能分类：general（通用，随应用交付）/ preset（场景预设）/ "
+            "user（用户放在工作区里的）/ custom（SKILL_DIRS 显式指定的目录）"
+        ),
+    )
     enabled: bool = Field(description="是否参与加载；停用后不再注入模型上下文")
+    in_preset: bool = Field(
+        default=True,
+        description="是否属于本条会话的场景白名单；false 表示它不会进入本次的技能视图",
+    )
     problems: list[str] = Field(
         default_factory=list,
         description="上游只告警不报错的问题（如 name 与目录名不符）；非空表示该技能形态可疑",
@@ -263,10 +282,50 @@ class SkillUnloadable(BaseModel):
     reason: str = Field(description="加载失败的原因")
 
 
+class PresetInfo(BaseModel):
+    """一个可用的场景预设（``skills/presets/<id>/preset.toml``）。"""
+
+    id: str = Field(description="场景 ID（取自预设目录名）")
+    title: str = Field(description="界面上显示的场景名")
+    description: str = Field(default="", description="一句话说明这个场景适合什么任务")
+    skills: list[str] = Field(
+        default_factory=list,
+        description="技能名白名单；空列表表示不限定（接受全部技能）",
+    )
+
+
+class PresetIssue(BaseModel):
+    """没能加载的场景目录。"""
+
+    directory: str = Field(description="场景目录的绝对路径")
+    reason: str = Field(description="不可用的原因（面向配置作者）")
+
+
+class PresetListResponse(BaseModel):
+    """``GET /api/presets`` 的响应。"""
+
+    items: list[PresetInfo] = Field(default_factory=list)
+    problems: list[PresetIssue] = Field(
+        default_factory=list,
+        description="写坏的 preset.toml；不报出来时该场景只会从下拉里静默消失",
+    )
+
+
 class SkillListResponse(BaseModel):
     """``GET /api/skills`` 的响应。"""
 
     scope: str = Field(description="状态作用域；当前固定为 global（技能集全应用共享）")
+    preset: PresetInfo | None = Field(
+        default=None, description="本条会话绑定的场景；null 表示不限定（接受全部技能）"
+    )
+    preset_id: str = Field(default="", description="本条会话绑定的场景 ID（原样回显，便于排错）")
+    preset_problems: list[PresetIssue] = Field(
+        default_factory=list, description="没能加载的场景目录"
+    )
+    missing_skills: list[str] = Field(
+        default_factory=list,
+        description="场景白名单里写了、但当前来源中找不到的技能名——非空即说明场景能力不完整",
+    )
     items: list[SkillInfo]
     unloadable: list[SkillUnloadable] = Field(
         default_factory=list,
@@ -322,6 +381,9 @@ __all__ = [
     "KnowledgeListResponse",
     "KnowledgeStats",
     "ModelInfo",
+    "PresetInfo",
+    "PresetIssue",
+    "PresetListResponse",
     "ResumeRequest",
     "SkillInfo",
     "SkillListResponse",

@@ -1,0 +1,8 @@
+# 场景预设：文档写作
+#
+# 字段与校验规则见 runtime/skill_presets.py。`skills` 是**技能名白名单**：名字从全部
+# 来源解析（内置 skills/builtin、本场景目录 skills/presets/writing/、用户工作区的
+# .harness/skills/），同名时优先级 用户 > 预设 > 内置。
+title = "文档写作"
+description = "面向文档与写作任务：Markdown 规范整理、文档转换"
+skills = ["markdown-style", "doc-to-markdown"]

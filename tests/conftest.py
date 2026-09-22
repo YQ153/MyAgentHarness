@@ -135,19 +135,19 @@ class StubSessionRegistry:
         self._skills = skills
         self._knowledge = knowledge
 
-    def managed_root(self, thread_id: str) -> SessionRoot:
+    def managed_root(self, thread_id: str, *, preset: str = "") -> SessionRoot:
         """某条会话的专属根（与服务端同口径）。"""
-        return SessionRoot(self._config, self._config.session_dir(thread_id))
+        return SessionRoot(self._config, self._config.session_dir(thread_id), preset)
 
-    def user_root(self, value: str | Path) -> SessionRoot:
+    def user_root(self, value: str | Path, *, preset: str = "") -> SessionRoot:
         """用户工作空间根（与服务端同口径：要求目录已存在）。"""
         from application.session_registry import resolve_user_path
 
-        return SessionRoot(self._config, resolve_user_path(value))
+        return SessionRoot(self._config, resolve_user_path(value), preset)
 
-    def from_stored(self, stored: str) -> SessionRoot:
+    def from_stored(self, stored: str, *, preset: str = "") -> SessionRoot:
         """库里的根还原（与服务端同口径）。"""
-        return SessionRoot(self._config, Path(stored))
+        return SessionRoot(self._config, Path(stored), preset)
 
     def pick_folder(self, initial: str | None = None) -> Any:
         """系统文件夹选择弹窗（与服务端同口径，直接复用同一个函数）。
@@ -173,32 +173,40 @@ class StubSessionRegistry:
         thread_id: str | None = None,
         record: dict | None = None,
         allow_missing: bool = False,
+        preset: str | None = None,
     ) -> SessionRoot:
         """只做解析、不装配任何服务（语义与服务端逐条对齐）。"""
-        from application.errors import SessionRootNotReadyError
+        from application.errors import SessionPresetLockedError, SessionRootNotReadyError
 
         has_value = requested is not None and str(requested).strip() != ""
+        wanted_preset = (preset or "").strip()
         if thread_id is None:
             if not has_value:
                 raise SessionRootNotReadyError("替身：没有会话也没有工作空间")
-            return self.user_root(str(requested))
+            return self.user_root(str(requested), preset=wanted_preset)
 
         current = record
         if current is None:
             current = {}
         stored = str(current.get("workspace") or "")
+        stored_preset = str(current.get("preset") or "")
         if stored:
-            locked = self.from_stored(stored)
+            locked = self.from_stored(stored, preset=stored_preset or wanted_preset)
             if has_value and str(self.user_root(str(requested)).root) != str(locked.root):
                 from application.errors import SessionRootLockedError
 
                 raise SessionRootLockedError(thread_id, str(locked.root), str(requested))
+            # 与服务端同口径：库里已锁定的场景优先；给出不同取值即冲突。
+            if stored_preset and wanted_preset and stored_preset != wanted_preset:
+                raise SessionPresetLockedError(
+                    f"会话 {thread_id}", stored_preset, wanted_preset
+                )
             return locked
         if has_value:
-            return self.user_root(str(requested))
+            return self.user_root(str(requested), preset=wanted_preset)
         if allow_missing and not current:
-            return self.managed_root(thread_id)
-        return self.managed_root(thread_id)
+            return self.managed_root(thread_id, preset=wanted_preset)
+        return self.managed_root(thread_id, preset=wanted_preset)
 
     async def describe(
         self,
@@ -206,12 +214,13 @@ class StubSessionRegistry:
         thread_id: str | None = None,
         requested: str | None = None,
         allow_missing: bool = True,
+        preset: str | None = None,
     ) -> Any:
         """根信息（与服务端同口径的最小实现）。"""
         from application.dto import WorkspaceInfo
 
         root = await self.resolve(
-            requested=requested, thread_id=thread_id, allow_missing=allow_missing
+            requested=requested, thread_id=thread_id, allow_missing=allow_missing, preset=preset
         )
         has_value = requested is not None and str(requested).strip() != ""
         if not root.root.is_dir():
@@ -230,12 +239,17 @@ class StubSessionRegistry:
         thread_id: str | None = None,
         record: dict | None = None,
         allow_missing: bool = False,
+        preset: str | None = None,
     ) -> Any:
         """把注入的那几个服务按会话根原样交出来。"""
         from application.session_registry import SessionServices
 
         root = await self.resolve(
-            requested=requested, thread_id=thread_id, record=record, allow_missing=allow_missing
+            requested=requested,
+            thread_id=thread_id,
+            record=record,
+            allow_missing=allow_missing,
+            preset=preset,
         )
         return SessionServices(
             root=root,
@@ -246,8 +260,15 @@ class StubSessionRegistry:
         )
 
     async def services(self, root: SessionRoot) -> Any:
-        """这些用例不该装配会话服务——真装配了说明用例选错了替身。"""
-        raise AssertionError(f"StubSessionRegistry 不装配服务：root={root.root}")
+        """不装配任何服务：替身没有技能视图可对齐，按契约接住这次调用即可。
+
+        WHY 需要这个空实现、而不是继续抛 ``AssertionError``：运行链路在取图之前会调一次
+        ``services()``，把技能视图对齐到本次的（工作空间 + 场景）——正式实现里那是「预设
+        技能到底进不进上下文」的落点。替身没有视图，这次调用的效果就是「什么都不用做」；
+        继续抛错只会让所有用替身的运行用例失败，而失败原因与它们要验的东西无关。
+        """
+        del root
+        return None
 
 
 @pytest.fixture

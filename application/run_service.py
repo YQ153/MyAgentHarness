@@ -276,6 +276,7 @@ class RunService:
         *,
         model_name: str | None = None,
         workspace: str | None = None,
+        preset: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """发起一轮对话。
 
@@ -295,6 +296,9 @@ class RunService:
                 将使用应用为它自动创建的专属目录。取值**只在首条消息上生效**：一旦会话
                 产生过交互，它的文件根就锁定了，再给出不同的取值会被拒绝
                 （见 ``SessionRootLockedError``）。
+            preset: 会话的**场景预设 ID**；``None`` / 空串表示不限定（接受全部技能）。
+                与 ``workspace`` 同样**只在首条消息上生效**，且同一个工作空间只允许一个
+                场景（视图按根物化，两个场景会互相覆盖，见 ``SessionPresetLockedError``）。
 
         Returns:
             产出统一事件的异步迭代器。
@@ -305,6 +309,7 @@ class RunService:
             KeyError: 模型别名未注册。
             NotFoundError: 会话不存在。
             SessionRootLockedError: ``workspace`` 与该会话已锁定的文件根不一致。
+            SessionPresetLockedError: ``preset`` 与该会话已锁定的场景不一致。
             RuntimeError: 模型初始化或装配失败。
         """
         # WHY 限流排在任何「查这个会话存不存在」的动作之前：否则被限流的一方能从
@@ -321,8 +326,16 @@ class RunService:
         # 都在装配那一刻烧死，而根是会话级取值——顺序反了就会拿到「上一个根」的图，
         # 运行过程毫无异常，文件却写进了另一个项目。
         scope = await self._workspaces.resolve(
-            requested=workspace, thread_id=normalized, record=record
+            requested=workspace, thread_id=normalized, record=record, preset=preset
         )
+
+        # WHY 在取图之前把该根的技能视图对齐到 ``scope``：图里烧进去的技能来源是挂载出来的
+        # ``/.skills-active``，而这份视图按**工作空间 + 场景**物化、由 ``services()`` 重建。
+        # 场景是在首条消息这一刻才确定的，而这个根可能已经被「场景还没定下来」的草稿态请求
+        # （面板、附件解析）先装配过一次；不在取图前对齐，图就会照着那份旧视图运行——预设
+        # 里的技能一个都进不了上下文，而日志上一切正常（视图重建的 INFO 只在装配时打印）。
+        # 重复调用是廉价的：场景相同直接命中缓存，不重建。
+        await self._workspaces.services(scope)
 
         # WHY 新一轮用户输入会作废此前悬着的审批请求：用户既已改口，那个
         # 审批卡就不再代表当前意图；留着它只会让「待审批数」无限增长。
@@ -357,6 +370,10 @@ class RunService:
             turn_delta=1,
             workspace=str(scope.root),
             workspace_bound=bool(workspace and str(workspace).strip()),
+            # WHY 写 ``scope.preset`` 而不是请求里的 preset：解析层已经把「库里的值」与
+            # 「本次请求的值」合并成了唯一结论（补选也在那里处理），这里再信一次请求参数
+            # 就等于留了第二个真相。
+            preset=scope.preset,
         )
 
         await self._audit(
@@ -1243,6 +1260,7 @@ class RunService:
         turn_delta: int,
         workspace: str = "",
         workspace_bound: bool = False,
+        preset: str = "",
     ) -> dict[str, Any] | None:
         """把本轮对话登记到元数据表，并返回登记后的元数据。
 
@@ -1261,6 +1279,10 @@ class RunService:
                 # 锁定」的落点。
                 workspace=workspace,
                 workspace_bound=workspace_bound,
+                # WHY 场景一起写：它决定技能视图里放哪些技能，而视图按**根**物化——
+                # 场景必须在「根确定」的同一刻定下来，否则同一工作空间的两条会话会各自
+                # 按不同场景重建视图，互相覆盖。
+                preset=preset,
             )
         except Exception:
             logger.exception("会话活动记录失败：thread=%s", thread_id)

@@ -21,9 +21,10 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from application.errors import NotFoundError
-from application.skill_service import SkillService
-from interfaces.web.deps import resolve_scoped_services
+from application.skill_service import SkillService, list_presets
+from interfaces.web.deps import require_state, resolve_scoped_services
 from interfaces.web.schemas import (
+    PresetListResponse,
     SkillListResponse,
     SkillToggleRequest,
     SkillToggleResponse,
@@ -41,20 +42,62 @@ async def get_skills(
         default=None,
         description="仅在该会话尚未绑定时生效（草稿态预览就是这种情况）",
     ),
+    preset: str | None = Query(
+        default=None,
+        description="场景预设 ID；草稿态下按它预览技能集，已锁定会话以库里的场景为准",
+    ),
 ) -> SkillService:
     """取出**该会话工作区**的技能库服务。
 
-    WHY 按会话解析：物化视图（``/.skills-active``）与用户技能目录都是按工作区各一份的
-    衍生物。用全局那一个会让面板显示 A 工作区的技能集，而 Agent 在 B 工作区里按另一份
-    做事——两边都不报错，用户看到的却是两套事实。
+    WHY 按会话解析：物化视图（``/.skills-active``）、用户技能目录与**场景预设**都是按工作区
+    各一份的衍生物。用全局那一个会让面板显示 A 工作区的技能集，而 Agent 在 B 工作区里按
+    另一份做事——两边都不报错，用户看到的却是两套事实。
 
     WHY 还要一个 ``workspace`` 参数：草稿态下这条会话还没登记，而用户可能已经选了别的
     工作区；不认这个取值，面板展示的技能集与即将使用的那份就是两回事。
 
+    WHY 还要一个 ``preset`` 参数：同理——用户在界面上选了场景、还没发第一条消息时，面板
+    就应当按**该场景**展示技能集；否则"选了场景"这件事在面板上完全看不出来。
+
     WHY ``allow_missing``：同上，新会话在首条消息之前还没登记。
     """
-    bundle = await resolve_scoped_services(request, thread_id=thread_id, requested=workspace)
+    bundle = await resolve_scoped_services(
+        request, thread_id=thread_id, requested=workspace, preset=preset
+    )
     return bundle.skills
+
+
+@router.get("/api/presets", response_model=PresetListResponse)
+async def list_preset_catalog(request: Request) -> PresetListResponse:
+    """列出可用的**场景预设**（供新建会话时选择）。
+
+    WHY 不需要会话上下文：场景清单是产品能力公示（磁盘上有哪些 ``preset.toml``），与会话、
+    工作区都无关。要求"先有会话才能看场景"会让「新建会话时选场景」变成循环依赖。
+
+    WHY 与 ``GET /api/skills`` 分开：技能清单回答「这个工作空间里现在有什么」（按会话解析），
+    场景清单回答「产品交付了哪些场景」（全局一份）。混在一个响应里，两者的作用域会含糊。
+
+    ``problems`` 里是写坏的 ``preset.toml``——不报出来的话，那个场景只会从下拉里静默消失，
+    而配置作者完全没有线索。
+    """
+    config = require_state(request, "config", "应用配置")
+    catalog = list_presets(config)
+    return PresetListResponse.model_validate(
+        {
+            "items": [
+                {
+                    "id": preset.preset_id,
+                    "title": preset.title,
+                    "description": preset.description,
+                    "skills": list(preset.skills),
+                }
+                for preset in catalog.presets
+            ],
+            "problems": [
+                {"directory": item.directory, "reason": item.reason} for item in catalog.problems
+            ],
+        }
+    )
 
 
 @router.get("/api/skills", response_model=SkillListResponse)
@@ -77,12 +120,18 @@ async def list_skills(
 async def toggle_skill(
     name: str,
     payload: SkillToggleRequest,
+    request: Request,
     service: SkillService = Depends(get_skills),
 ) -> SkillToggleResponse:
     """启用或停用一个技能，并立即重建物化视图。
 
     为何必须重建视图：建图的技能来源指向那份派生产物，只改数据库不重建视图的表现是
     「我停用了它，Agent 还在用」——且两者都不会报错。
+
+    WHY 顺带重建**所有已装配根**的视图：``set_enabled`` 只能重建它自己那个根的视图（它手上
+    只有本会话的 scope），而技能启停是**全局**的、视图却按工作区各一份。漏掉这一步的表现是
+    「在 A 工作区停用了某技能，切到 B 工作区它还在」——尤其是多场景并存时，B 工作区正是另一
+    个场景的会话。
 
     启停**对已在进行的会话无效**：技能索引在每个会话第一次运行时加载一次并写进会话状态，
     那些会话会沿用已加载的那份；新建会话才按新状态加载。
@@ -98,5 +147,15 @@ async def toggle_skill(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    # WHY 这里的失败只记日志、不改变响应：启停本身已经落库（那是唯一真相），其余根的视图
+    # 会在它们下一次装配或下一次启停时收敛。把一次成功的启停变成 500，只会让用户重试——
+    # 而重试并不能更快地修好别处的视图。
+    registry = getattr(request.app.state, "workspaces", None)
+    if registry is not None:
+        try:
+            await registry.refresh_views()
+        except Exception:  # noqa: BLE001 - 旁路动作，不能反过来否决主流程
+            logger.exception("重建其余工作空间的技能视图失败：skill=%s", name)
 
     return SkillToggleResponse.model_validate(result)

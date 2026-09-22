@@ -40,6 +40,7 @@ from application.attachment_service import AttachmentService
 from application.dto import DirectoryEntry, DirectoryListing, WorkspaceInfo
 from application.errors import (
     NotFoundError,
+    SessionPresetLockedError,
     SessionRootLockedError,
     SessionRootNotReadyError,
     SessionRootUnavailableError,
@@ -309,13 +310,13 @@ class SessionRegistry:
 
     # ------------------------------------------------------------------ 解析
 
-    def managed_root(self, thread_id: str) -> SessionRoot:
+    def managed_root(self, thread_id: str, *, preset: str = "") -> SessionRoot:
         """返回某条**未绑定工作空间**的会话的专属根（不创建目录）。"""
         from config import SessionRoot
 
-        return SessionRoot(self._config, self._config.session_dir(thread_id))
+        return SessionRoot(self._config, self._config.session_dir(thread_id), preset)
 
-    def user_root(self, value: str | Path) -> SessionRoot:
+    def user_root(self, value: str | Path, *, preset: str = "") -> SessionRoot:
         """返回用户指定的工作空间根。
 
         Raises:
@@ -323,13 +324,30 @@ class SessionRegistry:
         """
         from config import SessionRoot
 
-        return SessionRoot(self._config, resolve_user_path(value))
+        return SessionRoot(self._config, resolve_user_path(value), preset)
 
-    def _requested_root(self, requested: str | None) -> SessionRoot | None:
+    def _requested_root(
+        self, requested: str | None, *, preset: str = ""
+    ) -> SessionRoot | None:
         """把请求里的取值解析成根；未给出（或空白）时返回 ``None``。"""
         if requested is None or (isinstance(requested, str) and not requested.strip()):
             return None
-        return self.user_root(requested)
+        return self.user_root(requested, preset=preset)
+
+    def _check_preset(self, thread_id: str, stored: str, requested: str | None) -> None:
+        """校验本次请求给的场景与库里已锁定的场景一致。
+
+        WHY 与文件根分开校验、而不是复用 ``SessionRootLockedError``：两者的处置都是「新建
+        会话」，但冲突对象不同（目录 vs 场景）。混成一条提示会让用户去改工作空间路径，然后
+        发现还是失败。
+
+        WHY 允许「补选」：库里为空表示这条会话还没选过场景（首轮没选），此时给出场景是被允许
+        的——场景只决定技能集，不会让已有产物失联，与文件根那种「换了就找不到文件」的风险
+        不同。
+        """
+        wanted = (requested or "").strip()
+        if stored and wanted and stored != wanted:
+            raise SessionPresetLockedError(f"会话 {thread_id}", stored, wanted)
 
     def _ready(self, root: SessionRoot, *, owned: bool) -> SessionRoot:
         """把「应用自己建的根」按需建出来，把「用户的根不见了」如实报成错误。
@@ -375,6 +393,7 @@ class SessionRegistry:
         thread_id: str | None = None,
         record: dict | None = None,
         allow_missing: bool = False,
+        preset: str | None = None,
     ) -> SessionRoot:
         """解析本次请求应使用的会话根。
 
@@ -408,12 +427,13 @@ class SessionRegistry:
             NotFoundError: 给了 ``thread_id`` 但该会话不存在（且 ``allow_missing=False``）。
             ValueError: ``requested`` 指向的目录不存在或不是目录。
             SessionRootLockedError: ``requested`` 与该会话已锁定的根不一致。
+            SessionPresetLockedError: ``preset`` 与该会话已锁定的场景不一致。
             SessionRootNotReadyError: 本次请求**既没有会话 ID 也没有工作空间**
                 （草稿态面板），因此无从给出一个根。
             SessionRootUnavailableError: 会话的根已确定，但目录不可用。
         """
         if thread_id is None:
-            root = self._requested_root(requested)
+            root = self._requested_root(requested, preset=preset or "")
             if root is None:
                 raise SessionRootNotReadyError(
                     "这次请求还没有文件根：既没有指定会话，也没有给出工作空间。"
@@ -427,7 +447,7 @@ class SessionRegistry:
         if current is None:
             if not allow_missing:
                 raise NotFoundError("会话", thread_id)
-            root = self._requested_root(requested)
+            root = self._requested_root(requested, preset=preset or "")
             if root is not None:
                 return self._ready(root, owned=False)
             # 会话尚未登记，但**号已经发出去了**（前端在首次发送前先申请 ID），它将要使用的
@@ -437,34 +457,48 @@ class SessionRegistry:
             # WHY 不能在这里说「还没有根」：这条路径正是「不选工作空间」的正常走法——首条
             # 消息的附件构造与运行前的根解析都会经过它，于是那句 409 会以「发送失败」的
             # 形式出现，而它给的下一步（「请先发出第一条消息」）照着做也出不去。
-            return self._ready(self.managed_root(thread_id), owned=True)
+            return self._ready(self.managed_root(thread_id, preset=preset or ""), owned=True)
 
         stored = str(current.get("workspace") or "")
+        stored_preset = str(current.get("preset") or "")
         if stored:
-            locked = self.from_stored(stored)
-            root = self._requested_root(requested)
+            # WHY 场景取自**库**而不是本次请求：场景与根一起锁定，此后这条会话的技能集
+            # 只由库里的取值决定——否则「换一条会话打开同一个工作空间」会带着另一个场景
+            # 重建视图，把前一条会话的技能集覆盖掉。
+            #
+            # WHY 库里为空时采用本次请求：那是「首轮没选场景、之后补选」这条正常路径
+            # （``_check_preset`` 只在两边都非空且不同时报冲突）。取库里的空串会让补选
+            # 永远不生效——表现为「我明明选了场景，Agent 还是那套技能」。
+            effective_preset = stored_preset or (preset or "").strip()
+            locked = self.from_stored(stored, preset=effective_preset)
+            root = self._requested_root(requested, preset=preset or "")
             if root is not None and str(root.root) != str(locked.root):
                 raise SessionRootLockedError(thread_id, str(locked.root), str(root.root))
+            self._check_preset(thread_id, stored_preset, preset)
             # 锁定的根是不是「应用自己建的」由建它时的选择决定，事后无法从路径推断：
             # 用户完全可以把工作空间选在 SESSIONS_ROOT 里面。
             return self._ready(locked, owned=not bool(current.get("workspace_bound")))
 
         # 还没有根：本次请求给的（或它的专属目录）就是它将要锁定的那一个。
-        chosen = self._requested_root(requested)
+        self._check_preset(thread_id, stored_preset, preset)
+        chosen = self._requested_root(requested, preset=preset or "")
         if chosen is not None:
             return self._ready(chosen, owned=False)
-        return self._ready(self.managed_root(thread_id), owned=True)
+        return self._ready(self.managed_root(thread_id, preset=preset or ""), owned=True)
 
-    def from_stored(self, stored: str) -> SessionRoot:
+    def from_stored(self, stored: str, *, preset: str = "") -> SessionRoot:
         """把库里存的根还原成 :class:`SessionRoot`（**不**做存在性校验）。
 
         WHY 不校验：那是这条会话此前实际用过的目录。目录被删掉时应当让调用方看到
         「目录不存在」这种具体错误（文件面板会给出），而不是在这里被拒绝解析——
         拒绝会让用户连自己的历史会话都打不开。
+
+        WHY 连场景一起还原：场景与根在同一条记录里锁定；只还原 root 会让技能视图按
+        「不限定」重建，表现为「历史会话一打开，技能集就变了」。
         """
         from config import SessionRoot
 
-        return SessionRoot(self._config, Path(stored))
+        return SessionRoot(self._config, Path(stored), preset)
 
     async def describe(
         self,
@@ -517,10 +551,11 @@ class SessionRegistry:
             root: 目标会话根。
 
         Returns:
-            该根的服务集合（同一个根恒返回同一个对象）。
+            该根的服务集合（场景兼容时复用同一个对象；场景由「未定」变为具体时会重建）。
 
         Raises:
             ValueError: ``root`` 为 ``None``。
+            SessionPresetLockedError: 两边都是**具体**场景且不同（同一个工作空间只能有一个）。
             OSError: 目录创建或技能视图重建失败。
         """
         if root is None:
@@ -528,24 +563,51 @@ class SessionRegistry:
         key = str(root.root)
 
         cached = self._cache.get(key)
-        if cached is not None:
+        if cached is not None and self._preset_allows_reuse(cached.root, root):
             return cached
 
         async with self._lock:
             # 双检：并发首次命中时，等锁期间可能已被另一个协程装配好
             cached = self._cache.get(key)
-            if cached is not None:
+            if cached is not None and self._preset_allows_reuse(cached.root, root):
                 return cached
             bundle = await self._assemble(root)
             self._cache[key] = bundle
             return bundle
 
+    def _preset_allows_reuse(self, cached: SessionRoot, root: SessionRoot) -> bool:
+        """已装配的服务能否直接复用（返回 ``False`` = 按 ``root`` 重建技能视图）。
+
+        WHY 不能只判「场景是否相等」：技能视图按**工作空间**物化，而场景在此之前可能还没
+        定下来——草稿态的面板与附件解析都会先按「不限定」装配一次（首条消息的附件那一步就
+        会调 ``resolve_scoped_services``）。把那次临时装配当成一条既定事实，用户第一次提交
+        场景就会撞 409，而他什么都没做错。三种情形：
+
+        1. 场景相同 → 复用（幂等；客户端每轮都带同一个值很常见）；
+        2. 已装配的那份是「不限定」→ **不复用**（重建）：它只是"场景还没定下来"时的临时装配，
+           不是事实；重建顺带把视图对齐到刚确定的场景——少了这一步，预设里的技能一个都
+           进不了该会话的上下文，而日志上看不出任何异常；
+        3. 本次请求是「不限定」而库里已有具体场景 → **复用**（连同它那个场景）：这个工作空间的
+           视图已经是那个场景的，重建会把正在用它的会话的技能集换掉（技能索引每会话只加载
+           一次，换了不报错、只是行为变了）。
+
+        两边都是具体场景且不同时**报错而不是重建**：视图按根一份，重建等于把另一条会话的
+        技能集换掉——那正是 ``SessionPresetLockedError`` 要挡的事。
+        """
+        if cached.preset == root.preset:
+            return True
+        if not cached.preset:
+            return False
+        if not root.preset:
+            return True
+        raise SessionPresetLockedError(f"工作空间 {root.root}", cached.preset, root.preset)
+
     async def _assemble(self, root: SessionRoot) -> SessionServices:
         """真正装配一个根（调用方必须已持有 ``_lock``）。"""
         root.ensure_directories()
-        # WHY 在这里建根外存储（技能库 / 技能视图 / 工具留存）：它们是**应用自己的目录**，
-        # 已经搬出工作区（``<数据目录>/roots/<根标识>/…``），所以「往用户项目里写东西」
-        # 这件事只发生在装配这一刻、而且只发生在我们的存储目录里。
+        # WHY 在这里建存储目录（技能库 / 技能视图 / 工具留存）：它们物理上就在工作区内的
+        # ``.harness/`` 下（2026-09-22 起），所以「往用户项目里写东西」只发生在这个目录里
+        # ——它由面板隐藏、经只读路由 ``/.harness`` 暴露，用户在自己的仓库里不会撞见半成品。
         root.ensure_storage()
 
         skills = SkillService(self._config, scope=root, store=self._skill_store)
@@ -578,6 +640,7 @@ class SessionRegistry:
         thread_id: str | None = None,
         record: dict | None = None,
         allow_missing: bool = False,
+        preset: str | None = None,
     ) -> SessionServices:
         """解析并装配一步到位，供各接口端点使用。
 
@@ -585,10 +648,15 @@ class SessionRegistry:
             NotFoundError: 给了 ``thread_id`` 但该会话不存在（且 ``allow_missing=False``）。
             ValueError: ``requested`` 指向的目录不存在或不是目录。
             SessionRootLockedError: ``requested`` 与该会话已锁定的根不一致。
+            SessionPresetLockedError: ``preset`` 与该会话已锁定的场景不一致。
             SessionRootNotReadyError: 会话还没有根，且没有给出可用取值。
         """
         root = await self.resolve(
-            requested=requested, thread_id=thread_id, record=record, allow_missing=allow_missing
+            requested=requested,
+            thread_id=thread_id,
+            record=record,
+            allow_missing=allow_missing,
+            preset=preset,
         )
         return await self.services(root)
 

@@ -74,12 +74,24 @@ WHY 用 ``__file__`` 定位而不是 ``./``：按进程工作目录解析的默�
 启动进程」时指向一个不存在的路径，而表现是内置资产凭空消失，没有任何报错。
 """
 
-BUILTIN_SKILLS_DIR: Path = _APP_ROOT / "skills-builtin"
-"""随应用交付的内置技能目录。
+BUILTIN_SKILLS_DIR: Path = _APP_ROOT / "skills" / "builtin"
+"""随应用交付的**通用技能**目录（工作区之外，经 ``/skills-builtin`` 只读挂载）。
+
+WHY 收进 ``skills/`` 这一层（2026-09-22 改）：技能现在分三类——通用（本目录）、场景预设
+（``skills/presets/<场景>/``）、用户（工作区内 ``.harness/skills/``）。三者同处一棵
+``skills/`` 树下，读代码的人一眼能看清「技能从哪来」；而原先那个与预设目录毫无关系的
+顶层 ``skills-builtin/`` 做不到这一点。
 
 WHY 不在用户工作区内：工作区由用户显式指定（可能是任意项目目录），把随产品交付的
 资产写进别人的项目里既越界，也会在用户换一个工作区之后失效——而失效形态只是几行
 WARNING，功能上是「内置技能装了却用不上」。
+"""
+
+PRESET_SKILLS_DIR: Path = _APP_ROOT / "skills" / "presets"
+"""**场景预设技能**目录：每个一级子目录是一个场景（含 ``preset.toml`` 与可选技能包）。
+
+WHY 与通用技能分开目录：场景是「一组技能 + 一句说明」的打包，而通用技能是每个场景都能
+用的底座。混在同一个目录里，「哪些随产品交付、哪些属于某个场景」就只能靠命名约定去猜。
 """
 
 _MEMORY_FILE_NAME = "AGENTS.md"
@@ -109,11 +121,45 @@ _SKILL_VIEW_STORE_DIR_NAME = "skills-active"
 _TOOL_OUTPUTS_STORE_DIR_NAME = "tool-outputs"
 """工具输出留存子目录名（同上）。"""
 
+HARNESS_DIR_NAME = ".harness"
+"""应用数据在**工作区内**的目录名：技能库 / 技能视图 / 工具留存 / 知识库索引。
+
+WHY 统一收在一个点目录里而不是散成三个名字（2026-09-22 改）：这些内容与工作空间强绑定
+（技能是「这个项目常用的套路」、留存是「这个项目的运行记录」），跟着项目走才能让换机器、
+换工作空间之后行为一致。收在一个目录下，文件面板只需隐藏一个名字，用户要在版本控制里
+忽略它也只需写一行 ``.harness/``。
+
+代价是**有意接受**的：工作区是用户的仓库，应用会往里写这个目录（2026-09-21 曾为此把它
+搬到数据目录，本次按「内容应随项目走」的取舍搬回）。因此配套两条约束：面板默认隐藏它
+（``WorkspaceService``），Agent 侧经只读路由 ``/.harness/`` 暴露、改不动。
+"""
+
+_KNOWLEDGE_DB_NAME = "knowledge.db"
+"""知识库索引文件名（位于 ``.harness/`` 下）。
+
+WHY 用固定名字、不再带根标识（2026-09-22 改）：旧布局里几十个根共用同一个数据目录，
+只能靠 ``knowledge-<根标识>.db`` 区分；现在每个根各有一个 ``.harness/``，撞名不可能
+发生。固定名字还让「重建索引 = 删掉这个文件」成为一句能对用户说清的话。
+"""
+
 VIRTUAL_SKILLS = "/skills"
 """技能库在虚拟文件系统里的挂载点（Agent 只读）。"""
 
 VIRTUAL_BUILTIN_SKILLS = "/skills-builtin"
-"""随应用交付的内置技能在虚拟文件系统里的挂载点（Agent 只读）。"""
+"""**通用技能**在虚拟文件系统里的挂载点（Agent 只读）。
+
+WHY 名字保留 ``builtin`` 而不是跟着目录一起改：它是**图的技能来源与挂载表**共同使用的
+契约（缓存下来的图持有这个字符串），改名会让已缓存的图指向不存在的路径；而目录搬家只是
+宿主侧的事，不影响对外路径。
+"""
+
+VIRTUAL_PRESET_SKILLS = "/skills-presets"
+"""**场景预设技能**在虚拟文件系统里的挂载前缀（Agent 只读）。
+
+WHY 是前缀而不是一个固定挂载点：预设技能按场景分目录（``skills/presets/<场景>/``），只有
+**当前场景**的那一个目录才是来源——挂整个 ``presets`` 目录会让所有场景的技能一起被发现
+（表现为「选了 A 场景，B 场景的技能也在」）。挂载时在其后接场景 ID。
+"""
 
 VIRTUAL_SKILL_VIEW = "/.skills-active"
 """技能视图在虚拟文件系统里的挂载点：**建图时的技能来源就是它**。
@@ -127,6 +173,15 @@ VIRTUAL_TOOL_OUTPUTS = "/_tool_outputs"
 
 WHY 名字带下划线：与技能视图同理——它是系统的旁路留存，不是任务成果；消息与日志里出现
 ``/_tool_outputs/...`` 时，读者应当立刻知道那是「可回取的完整输出」而不是用户文件。
+"""
+
+VIRTUAL_HARNESS = "/.harness"
+"""``.harness`` 在虚拟文件系统里的挂载点（只读）。
+
+WHY 必须单独挂它：``/skills`` / ``/.skills-active`` / ``/_tool_outputs`` 三条只读路由各自
+只覆盖自己的前缀，而 Agent 仍可经工作区内的真实路径 ``/.harness/skills/...`` 走到同一批
+文件——那条路走 default backend，是可写的。把整个 ``.harness`` 也挂成只读，才真正堵住
+这个绕行口（服务端自己用宿主路径写，不受只读挂载影响）。
 """
 
 _USER_SKILLS_DIR_NAME = "skills"
@@ -505,17 +560,26 @@ class AppConfig(BaseSettings):
     每个会话的子目录名就是它的会话 ID（见 ``session_dir``）。
     """
 
+    presets_dir: Path | None = None
+    """**场景预设目录**；``None`` 表示用随应用交付的 ``<应用目录>/skills/presets``。
+
+    WHY 允许覆盖：预设是产品资产，但部署里可能需要换成团队自己的场景集（与 ``SKILL_DIRS``
+    同一动机）；而测试也需要一个隔离目录才能验证「按场景过滤」这条路径——不可注入的常量会
+    让那段逻辑只能靠集成环境去碰，而它决定"某个场景到底有哪些技能"。
+    """
+
     skill_dirs: Annotated[list[Path], NoDecode] = Field(default_factory=list)
     """技能目录（按顺序查找）。**空列表表示按工作区派生**，见 ``SessionRoot``。
 
     **顺序有语义：越靠后优先级越高**（上游 ``SkillsMiddleware`` 的规则是同名技能由后面的
-    来源覆盖前面的）。因此内置目录排在**前面**（低优先级），用户才能用同名技能覆盖内置的
-    那一个；顺序反过来会让内置技能永远赢，而「我改了却不生效」不会有任何报错。
+    来源覆盖前面的）。因此三类默认来源排成「通用 → 预设 → 用户」：用户在工作空间里放的
+    同名技能覆盖场景预设与通用技能；顺序反过来会让产品自带的技能永远赢，而「我改了却不
+    生效」不会有任何报错。
 
-    为空时每个根派生两项：随应用交付的 ``BUILTIN_SKILLS_DIR``（应用目录里），以及该根的
-    技能库 ``SessionRoot.skills_store``（在**根外存储**里，不在工作区内）。两项都在工作区
-    之外，因此都由 ``read_only_mounts`` 挂上虚拟路径——backend 只认虚拟路径，不挂载就会
-    「一个都读不到且没有任何告警」。
+    为空时每个根派生三项：``BUILTIN_SKILLS_DIR``（通用技能）、``PRESET_SKILLS_DIR``
+    （场景预设技能）与该根的用户技能库 ``SessionRoot.skills_store``（在**工作区内**的
+    ``.harness/skills/``）。前两项在应用目录里，因此必须由 ``read_only_mounts`` 挂上虚拟
+    路径——backend 只认虚拟路径，不挂载就会「一个都读不到且没有任何告警」。
 
     WHY 一旦显式配置就**对所有工作区生效**（不再按工作区分叉）：显式给的是绝对路径，
     它表达的是「技能包放在这些固定位置」，与当前是哪个工作区无关。
@@ -1020,7 +1084,7 @@ class AppConfig(BaseSettings):
     每一次本地排障都先过一道格式转换。结构化是「上线时需要」的能力，不是默认形态。
     """
 
-    @field_validator("memory_file", "db_path", "sessions_root", mode="after")
+    @field_validator("memory_file", "db_path", "sessions_root", "presets_dir", mode="after")
     @classmethod
     def _expand_path(cls, value: Path | None) -> Path | None:
         """展开用户目录并转绝对路径；``None`` 表示「未配置，稍后派生」。
@@ -1264,14 +1328,27 @@ class AppConfig(BaseSettings):
 
     @property
     def roots_store_root(self) -> Path:
-        """根外存储的父目录：``<数据目录>/roots``。
+        """**旧版**根外存储的父目录：``<数据目录>/roots``。
 
-        WHY 派生而不是再加一项配置：它必须与数据目录**同卷**——否则「备份/搬迁只搬数据
-        目录」这句话就不成立（技能库与工具留存会留在原地），而多一个配置项只会多一种
-        「配到别的盘」的机会。会话专属目录已经按同一口径跟着数据目录走
-        （``resolved_sessions_root``），这里保持一致。
+        WHY 还留着：2026-09-22 起技能库 / 技能视图 / 工具留存已经搬回工作区内的
+        ``.harness/``（见 ``SessionRoot.storage_dir``），但升级路径上必须能找到旧位置并把
+        数据搬过去（``SessionRoot.legacy_root_store_dir``）。这个属性**只服务于迁移**：
+        新代码不应再往它下面写任何东西。
+
+        WHY 仍由数据目录派生：它曾经要求与数据目录同卷，这样「备份/搬迁只搬数据目录」才
+        成立；保留同一派生规则，迁移来源的定位就与旧版本逐字一致。
         """
         return self.db_path.parent / _ROOTS_STORE_DIR_NAME
+
+    @property
+    def skill_presets_dir(self) -> Path:
+        """场景预设目录：配置给了就用它，否则 ``<应用目录>/skills/presets``。
+
+        WHY 由配置暴露、而不是让调用方各自 import 常量：预设目录是「技能从哪来」这一事实的
+        一半，而它同时被技能服务（建视图时按场景过滤）与面板（列出可选场景）读取。两处各写
+        一遍常量，一旦常量被改名或将来加了环境变量覆盖，两处就会看到不同的世界。
+        """
+        return self.presets_dir or PRESET_SKILLS_DIR
 
     def session_dir(self, thread_id: str) -> Path:
         """返回某个**未绑定工作空间**的会话的专属目录。
@@ -1566,13 +1643,26 @@ class SessionRoot:
     Attributes:
         config: 应用配置（提供上限、显式覆盖项等与根无关的取值）。
         root: 根目录的绝对路径。
+        preset: 本条会话所属的**场景预设 ID**；空串表示不限定（接受全部技能）。
     """
 
     config: AppConfig
     root: Path
+    preset: str = ""
+    """本条会话所属的**场景预设 ID**；空串表示「不限定」。
+
+    WHY 放在根对象上，而不是每次建视图时临时传：技能视图按根物化
+    （``.harness/skills-active``），而视图内容取决于场景白名单——把场景挂在根上，
+    「同一个根对应同一份视图」这条不变量才成立。反过来说，**一个工作空间只属于一个场景**：
+    两条不同场景的会话共用一个根时，后者的视图会覆盖前者，而运行中的会话只按自己首轮
+    加载的那份技能索引做事，两边都不会报错。
+
+    WHY 允许空串：既有会话与「不选场景」的用法都必须继续可用——空串意味着不做白名单
+    过滤（接受全部技能），这正是本次改造前的行为。
+    """
 
     def __post_init__(self) -> None:
-        """把根归一到绝对路径。
+        """把根归一到绝对路径，并归一场景 ID。
 
         WHY 这里**不**校验目录是否存在：会话专属目录在第一次用到它之前并不存在，而
         「存在性」这件事对用户绑定的工作空间必须严格（拼错的路径不能静默变成一个空
@@ -1580,12 +1670,21 @@ class SessionRoot:
         来的那一刻**——由应用层的解析函数负责（见 ``SessionRegistry.resolve``），
         而本对象只需保证「拿到的是一个绝对路径」，目录按需创建（``ensure_directories``）。
 
+        WHY 不校验「这个场景是否存在」：场景清单由 ``runtime.skill_presets`` 从文件系统
+        巡检得出，而根对象不该依赖那层扫描（它还会被知识库、测试等路径构造）。查不到的
+        场景由服务层按「不限定」处理并打日志——历史会话里记着已删除的场景 ID 时，让它
+        打不开历史才是更糟的选择。
+
         Raises:
-            ValueError: ``config`` 为 ``None``。
+            ValueError: ``config`` 为 ``None``，或 ``preset`` 不是字符串。
         """
         if self.config is None:
             raise ValueError("config 不能为 None")
         object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
+        if not isinstance(self.preset, str):
+            raise ValueError(f"preset 必须是字符串，实际：{type(self.preset).__name__}")
+        if self.preset != self.preset.strip():
+            object.__setattr__(self, "preset", self.preset.strip())
 
     # ------------------------------------------------------------------ 基本属性
 
@@ -1660,23 +1759,40 @@ class SessionRoot:
 
     @cached_property
     def storage_dir(self) -> Path:
-        """本根的**根外存储目录**：技能库、技能视图与工具留存都住在这里。
+        """本根的**存储目录**：技能库、技能视图、工具留存与知识库索引都住在这里。
 
-        WHY 把它们搬出工作区（2026-09-21 改）：工作区可能是**用户的仓库**，而这三个名字
-        是应用自己的数据——往别人的项目里写东西会污染他的版本控制，也会让「这次操作到底
-        动了什么」变得说不清。搬出来之后，工作区里只剩用户自己的文件与 Agent 的产物。
+        WHY 放回工作区内（2026-09-22 改）：这些内容与**这个工作空间**强绑定——技能是
+        「这个项目常用的套路」，留存是「这个项目的运行记录」——跟着项目走，换机器或换
+        工作空间之后行为才一致；放在数据目录下则表现为「换个工作空间就什么都要重配」。
+
+        WHY 集中成一个 ``.harness/``：文件面板只需隐藏一个名字；用户要在版本控制里忽略
+        它，也只需写一行 ``.gitignore``（应用不替用户改仓库里的文件）。
+
+        代价是明确的：工作区里会多出这个目录（2026-09-21 曾为同样理由把它搬到数据目录，
+        本次按「内容应随项目走」的取舍搬回）。这是**有意接受**的取舍，不是疏漏。
 
         WHY 位置由**根路径**派生、而不是按会话分：同一个工作空间可能承载多条会话，而
         「这个工作空间装了什么技能」本来就该共享（技能启停状态也是全应用一份，见
         ``runtime.skill_store``）。按会话分会让同一工作空间的第二条会话看不到第一条装好
         的技能——那正是「技能库」这个概念要消除的重复。
 
-        WHY 目录名 = 可读片段 + 短哈希：纯哈希在排障时无法对应回工作区（``roots/`` 下
-        十几个随机名），纯可读名会重名（两台机器上都有 ``Desktop``）。两者都要。
-
         Note:
             ``SessionRoot`` 是**按请求**构造的，所以这个缓存只活一次请求——换工作区
             会换对象，不会拿到别人的存储目录。
+        """
+        return self.root / HARNESS_DIR_NAME
+
+    @property
+    def legacy_root_store_dir(self) -> Path:
+        """**旧版**的根外存储目录（``<数据目录>/roots/<可读名>-<短哈希>``）。
+
+        WHY 还需要它：2026-09-22 之前技能库 / 技能视图 / 工具留存住在这里，升级时要把
+        它们搬回工作区内的 ``.harness/``。位置公式必须与旧版逐字一致——差一个字符就会
+        认为「没有旧数据」，而表现是用户的技能库凭空消失。
+
+        WHY 不当成 ``storage_dir`` 的兼容分支：``storage_dir`` 是**现行**布局的唯一出处
+        （面板、挂载、迁移都以它为准），在里面塞一条「旧位置」分支会让两个位置各自被一半
+        代码引用，而那种分叉不会报错。这里只作为**只读的迁移来源**存在。
         """
         digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:12]
         return self.config.roots_store_root / f"{_readable_dir_name(self.root)}-{digest}"
@@ -1696,9 +1812,22 @@ class SessionRoot:
         """工具输出留存目录（``<store>/<会话 ID>/NNNN-<工具>.txt``）。"""
         return self.storage_dir / _TOOL_OUTPUTS_STORE_DIR_NAME
 
+    @property
+    def knowledge_db(self) -> Path:
+        """本根的知识库索引文件（``.harness/knowledge.db``）。
+
+        WHY 跟着工作区走（2026-09-22 改）：索引的对象就是**这个工作区里的文档**（库里以
+        根内虚拟路径为键去重），因此它必须与项目同生共死——放在数据目录下会出现「项目删了、
+        索引还在」，而那份索引永远指不回去。
+
+        WHY 这是**唯一**的索引路径来源：``knowledge_runtime`` 与面板都从它取，避免两处各
+        拼一遍路径（那样的分叉不会报错，只会表现为「面板说已索引、检索却查不到」）。
+        """
+        return self.storage_dir / _KNOWLEDGE_DB_NAME
+
     @cached_property
     def read_only_mounts(self) -> list[VirtualMount]:
-        """本根要挂进虚拟文件系统的**全部**根外路径（只读）。
+        """本根要挂进虚拟文件系统的**全部**只读路径。
 
         WHY 收成一个列表、且与「技能来源」同源：图的技能来源与文件工具看到的路径都靠
         这些挂载才解析得到。分开给（一个给来源、一个给挂载）时，漏接一半的表现是
@@ -1706,7 +1835,10 @@ class SessionRoot:
         警告——没有任何错误会指向装配漏了一条路由。
 
         挂载清单：
-        - ``/skills/``：技能库（人工维护）；
+        - ``/.harness/``：应用数据目录（技能库 / 技能视图 / 工具留存）。2026-09-22 起
+          这些内容**物理上就在工作区内**，所以这条路由的作用只剩「只读」——没有它，Agent
+          可以经工作区路径直接改写自己的技能库（default backend 是可写的）；
+        - ``/skills/``：技能库（人工维护；与 ``/.harness/skills`` 是同一个目录）；
         - ``/.skills-active/``：技能视图（派生物，建图时的来源就是它）；
         - ``/_tool_outputs/``：工具输出留存（消息里只带引用，正文在这里）；
         - 内置技能与 ``SKILL_DIRS`` 指定的目录：它们位于应用目录或任意位置，同样必须
@@ -1714,6 +1846,14 @@ class SessionRoot:
           真的读得到，否则那句「等于全部启用」是假的。
         """
         planned: list[VirtualMount] = [
+            # 摆第一位只是习惯（前缀互不重叠，顺序不影响匹配）：它覆盖整个应用数据目录，
+            # 是「Agent 改不动自己的技能库/留存」这条约束的兜底。
+            VirtualMount(
+                prefix=f"{VIRTUAL_HARNESS}/",
+                host_path=self.storage_dir,
+                label="应用数据目录",
+                kind="dir",
+            ),
             VirtualMount(
                 prefix=f"{VIRTUAL_SKILL_VIEW}/",
                 host_path=self.skill_view_store,
@@ -1781,15 +1921,18 @@ class SessionRoot:
         return VIRTUAL_TOOL_OUTPUTS
 
     def ensure_storage(self) -> None:
-        """建好根外存储目录，并把旧位置（工作区里的 ``skills/``）的技能库搬过来。
+        """建好工作区内的 ``.harness/``，并把两代旧位置的技能库 / 留存搬进来。
 
         WHY 要迁移而不是「重新开始」：技能包是**用户放进来的东西**，静默丢掉等于让用户
         的技能凭空消失——而现场表现只是「Agent 忽然不会那些套路了」，没有任何报错指向
         这里。迁移是幂等的：新位置已有内容就不再动旧位置。
 
-        WHY 只迁技能库、不迁另外两个：技能视图是派生物（重建即可），工具留存是「最近若干
-        次工具输出」的缓存（``TOOL_OUTPUT_RETENTION_PER_THREAD`` 会自然淘汰），都不值得
-        为它们写迁移；技能包丢了却是真丢了。
+        要处理的两代旧布局：
+        1. **根外存储**（2026-09-21～09-22）：``<数据目录>/roots/<根标识>/{skills,tool-outputs}``；
+        2. **工作区内的 ``skills/``**（更早）：那时候技能库直接躺在项目根下。
+
+        WHY 只迁技能库与工具留存、不迁技能视图：视图是派生物，``rebuild_view`` 会按**当前
+        启停状态**重建；搬一份旧视图进来反而可能让「面板说停用、Agent 照用」同时成立。
 
         Raises:
             OSError: 目录创建失败（磁盘满、权限不足）。
@@ -1800,6 +1943,10 @@ class SessionRoot:
         # 重建失败」与「所有技能都停用」变得无法区分（前者会让技能静默消失且没有告警）。
         # 视图由 ``runtime.skill_view.rebuild_view`` 自己建（先建临时目录再整体替换）。
         self.tool_output_store.mkdir(parents=True, exist_ok=True)
+        # WHY 先搬根外存储、再处理更老的 ``<根>/skills``：前者是**最近一次布局**的数据，
+        # 后者更早；先把近的搬到位，老的那份才有机会命中「新位置已非空 → 两边都保留」的
+        # 保护，而不是反过来被后一步覆盖。
+        self._migrate_root_store_into_workspace()
         if self.config.skill_dirs:
             # 显式配置了技能目录：技能库**就是那些目录**，我们的存储里那份不被使用。
             # 此时既不建它、更不能把 ``<根>/skills`` 当「旧位置」搬走——那可能是用户自己
@@ -1808,8 +1955,86 @@ class SessionRoot:
         self.skills_store.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_skills()
 
+    def _migrate_root_store_into_workspace(self) -> None:
+        """把旧版**根外存储**里的技能库与工具留存搬回工作区内的 ``.harness/``。
+
+        WHY 逐个目录判断、而不是整体 rename 旧的根标识目录：旧目录里可能只有
+        ``tool-outputs``（用户从没放过技能包），整体搬会把一个「空的技能库」也算进来，
+        干扰后续对更老布局（``<根>/skills``）的判定。
+
+        WHY 出错继续搬下一个而不是中断：技能库与工具留存是两类独立数据，一类搬不动不该
+        让另一类也留在旧位置——两边都保留、并各打一条 ERROR 比「整体放弃」更容易收尾。
+        """
+        legacy = self.legacy_root_store_dir
+        if not legacy.is_dir():
+            return
+        if legacy.resolve() == self.storage_dir.resolve():
+            # 幂等保护：两个位置被配成同一个目录时，不能自己搬自己。
+            logger.debug("旧存储与新存储是同一个目录，跳过迁移：%s", legacy)
+            return
+
+        for name, target in (
+            (_SKILLS_STORE_DIR_NAME, self.skills_store),
+            (_TOOL_OUTPUTS_STORE_DIR_NAME, self.tool_output_store),
+        ):
+            source = legacy / name
+            if not source.is_dir():
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                existing = list(target.iterdir())
+            except OSError as exc:
+                logger.error("读取存储目录失败，旧位置保持原样：%s（%s）", target, exc)
+                continue
+            if existing:
+                logger.warning(
+                    "旧存储 %s 里还有内容，而新位置 %s 已非空：两边都保留，请自行合并",
+                    source,
+                    target,
+                )
+                continue
+            try:
+                # WHY 逐子项 move 而不是 move 整个目录：``target`` 已经建出来了（上面
+                # mkdir），对已存在的目录做整体 move 会把它搬成子目录，结果是多一层嵌套。
+                for child in list(source.iterdir()):
+                    shutil.move(str(child), str(target / child.name))
+                source.rmdir()
+            except OSError as exc:
+                logger.error(
+                    "迁移旧存储失败，旧位置仍保留（请手工搬到 %s）：%s（%s）",
+                    target,
+                    source,
+                    exc,
+                )
+                continue
+            logger.info("旧存储已搬回工作区：%s → %s", source, target)
+
+        try:
+            leftover = list(legacy.iterdir())
+        except OSError as exc:
+            logger.debug("读取旧存储根目录失败（无害）：%s（%s）", legacy, exc)
+            return
+        if leftover:
+            # 还有没搬的东西（例如 ``skills-active``——派生物，按当前启停状态重建）：
+            # 目录原样保留，下一次升级仍有机会继续迁移。
+            logger.info("旧存储根目录里仍有未迁移内容，保持原样：%s", legacy)
+            return
+        try:
+            legacy.rmdir()
+        except OSError as exc:
+            logger.debug("旧存储根目录已空但删除失败（无害）：%s（%s）", legacy, exc)
+
     def _migrate_legacy_skills(self) -> None:
-        """把工作区里的 ``skills/``（旧位置）搬进存储目录；只剩空目录时顺手清掉。"""
+        """把工作区根下的 ``skills/``（更早的布局）里的技能包搬进 ``.harness/skills``。
+
+        WHY 必须先确认它**确实是个技能库**：``skills`` 这个目录名太常见（前端、数据项目
+        都可能有），而历史上出现过「打开项目后应用把用户的目录搬走」——用户找不到自己的
+        东西，且全程没有任何提示。因此只有「里面存在含 ``SKILL.md`` 的子目录」时才迁移，
+        否则原样不动（它只是一个同名目录）。
+
+        WHY 只搬技能包子目录、不搬整个目录：目录里可能混着用户自己的其它文件；搬走它们
+        等于替用户做了一次他不知情的整理。搬完后若目录已空才顺手删掉。
+        """
         legacy = self.root / _USER_SKILLS_DIR_NAME
         if not legacy.is_dir():
             return
@@ -1820,12 +2045,17 @@ class SessionRoot:
             return
 
         if not children:
-            # WHY 空目录也删：它是旧版本由应用建出来的；留着会让用户看到「说搬走了却还在」，
-            # 而那个目录对他没有任何用途。
-            try:
-                legacy.rmdir()
-            except OSError as exc:
-                logger.debug("旧技能库是空目录，删除失败（无害）：%s（%s）", legacy, exc)
+            # WHY 空目录不动：旧版本确实会建出空目录，但用户也可能自己建了一个空的
+            # ``skills/``——「删掉用户自己建的目录」比「留下一个空目录」危险得多。
+            logger.debug("工作区里存在空的 skills/，不视为旧技能库，保持原样：%s", legacy)
+            return
+
+        packages = [child for child in children if (child / "SKILL.md").is_file()]
+        if not packages:
+            logger.info(
+                "工作区里的 %s 不含技能包（没有含 SKILL.md 的子目录），不视为旧技能库，保持原样",
+                legacy,
+            )
             return
 
         if self.skills_store.is_dir() and any(self.skills_store.iterdir()):
@@ -1837,9 +2067,8 @@ class SessionRoot:
             return
 
         try:
-            for child in children:
-                shutil.move(str(child), str(self.skills_store / child.name))
-            legacy.rmdir()
+            for package in packages:
+                shutil.move(str(package), str(self.skills_store / package.name))
         except OSError as exc:
             # WHY 出错就停手、且不动旧位置：搬一半会让技能分散在两处，而调用方无法判断
             # 哪边是全的——宁可让用户看到一个完整的旧目录。
@@ -1850,11 +2079,24 @@ class SessionRoot:
                 exc,
             )
             return
-        logger.info("旧技能库已搬到根外存储：%s → %s", legacy, self.skills_store)
+
+        try:
+            remaining = list(legacy.iterdir())
+        except OSError as exc:
+            logger.debug("读取旧技能库残留内容失败（无害）：%s（%s）", legacy, exc)
+            remaining = []
+        if remaining:
+            logger.info("旧技能库里还有非技能包内容，目录原样保留：%s", legacy)
+        else:
+            try:
+                legacy.rmdir()
+            except OSError as exc:
+                logger.debug("旧技能库目录已空但删除失败（无害）：%s（%s）", legacy, exc)
+        logger.info("旧技能包已搬进工作区存储：%s → %s", legacy, self.skills_store)
 
     @property
     def skill_dirs(self) -> list[Path]:
-        """本工作区生效的技能目录（宿主机路径）；技能库在根外存储里。"""
+        """本工作区生效的技能目录（宿主机路径）；技能库在工作区的 ``.harness/`` 下。"""
         return [source.host_dir for source in self.skill_dir_plan()]
 
     # ------------------------------------------------------------------ 目录准备
@@ -1865,36 +2107,62 @@ class SessionRoot:
         WHY 在工作区**被选中的那一刻**建，而不是启动时替所有候选目录建：后者会往
         用户还没用过的项目里写目录，而那是用户的仓库，不是我们的。
 
-        WHY 现在只建**根本身**：技能库、技能视图与工具留存都已经搬到根外存储
-        （``ensure_storage``），而长期记忆由人工维护（应用不替它建目录——那等于往工作区
-        之外悄悄写目录）。根内不再有任何「应用自己的目录」，所以这里只保证根存在。
+        WHY 只建**根本身**、不在这里建 ``.harness/``：应用数据的落点由
+        ``ensure_storage`` 负责，它与「技能视图是否需要重建」这类按需逻辑在同一处；
+        而长期记忆由人工维护（应用不替它建目录——那等于往别处悄悄写目录）。
         """
         self.root.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ 技能来源
 
     def skill_dir_plan(self) -> list[SkillSource]:
-        """技能目录 → 虚拟路径的完整规划（含根外与共享来源）。
+        """技能目录 → 虚拟路径的完整规划（三类来源，含工作区内与共享来源）。
 
-        WHY 虚拟路径不再由「是否在工作区内」推导：技能库已经搬到工作区之外，而内置技能
-        本来就在外面——两者的虚拟路径只能由**挂载表**决定（挂在哪，就按哪读）。按位置
-        推导（旧规则：工作区外取目录名）在两种来源共存时会给出与真实挂载点不一致的路径，
-        而症状是「面板里列得出来、Agent 却读不到」。
+        WHY 虚拟路径不能由「是否在工作区内」推导：用户技能库在**工作区内**
+        （``.harness/skills``），而通用技能与场景预设技能都在**应用目录**里（工作区之外）
+        ——三者只有一处共同口径，即**挂载表**（挂在哪，就按哪读）。按位置推导（旧规则：
+        工作区外取目录名）在多种来源共存时会给出与真实挂载点不一致的路径，而症状是
+        「面板里列得出来、Agent 却读不到」。
+
+        默认顺序（越靠后优先级越高，同名技能由后者覆盖前者）：
+
+        1. ``/skills-builtin``：通用技能（随应用交付，每个场景都能用）；
+        2. ``/skills-presets``：场景预设技能（随应用交付，按场景白名单过滤）；
+        3. ``/skills``：用户技能库（工作区内，用户可改）。
+
+        WHY 这样排：用户 > 场景 > 通用。用户在自己的工作空间里放的同名技能理应覆盖产品
+        自带的那一份，否则「我改了却不生效」不会有任何报错。
 
         Returns:
             来源列表，顺序即优先级（越靠后优先级越高）。
         """
         if self.config.skill_dirs:
             # 显式配置优先：用户说了算，虚拟路径取目录名（与 ``read_only_mounts`` 的挂载
-            # 前缀一致，见那里的 WHY）。
+            # 前缀一致，见那里的 WHY）。此时**不**叠加三类默认来源——否则「显式指定」只对
+            # 了一半：目录列出来了，产品的技能却仍混在里面。
             return [
                 SkillSource(host_dir=directory, virtual=f"/{directory.name}")
                 for directory in self.config.skill_dirs
             ]
-        return [
-            SkillSource(host_dir=BUILTIN_SKILLS_DIR, virtual=VIRTUAL_BUILTIN_SKILLS),
-            SkillSource(host_dir=self.skills_store, virtual=VIRTUAL_SKILLS),
+        plan: list[SkillSource] = [
+            SkillSource(host_dir=BUILTIN_SKILLS_DIR, virtual=VIRTUAL_BUILTIN_SKILLS)
         ]
+        # WHY 只把**当前场景**的目录作为来源，而不是整个 ``presets`` 目录：上游按「来源的
+        # 一级子目录」发现技能，因此来源必须正好是"装着技能包的那一层"。指向 ``presets``
+        # 会让所有场景的技能一起被发现——表现为「选了 A 场景，B 场景的技能也在」。
+        #
+        # WHY 取 ``config.skill_presets_dir`` 而不是直接引用常量：预设目录可被配置覆盖
+        # （部署换一套场景集、测试指向隔离目录）。来源用常量、过滤用配置值，会让「配置里指了
+        # 别的目录，技能却还是从默认目录来的」这种分叉无从解释。
+        if self.preset:
+            plan.append(
+                SkillSource(
+                    host_dir=self.config.skill_presets_dir / self.preset,
+                    virtual=f"{VIRTUAL_PRESET_SKILLS}/{self.preset}",
+                )
+            )
+        plan.append(SkillSource(host_dir=self.skills_store, virtual=VIRTUAL_SKILLS))
+        return plan
 
     def skill_sources(self) -> list[SkillSource]:
         """把**存在**的技能目录映射成「宿主机目录 + 虚拟路径」的来源列表。
@@ -1980,7 +2248,8 @@ class SessionRoot:
         return best
 
     def __repr__(self) -> str:  # pragma: no cover - 仅用于日志排错
-        return f"SessionRoot(root={self.root})"
+        preset = f", preset={self.preset}" if self.preset else ""
+        return f"SessionRoot(root={self.root}{preset})"
 
 
 @lru_cache(maxsize=1)

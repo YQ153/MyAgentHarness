@@ -327,17 +327,20 @@ async def test_service_recovers_after_close(tmp_path: Path) -> None:
     assert rebuilt.capabilities()["vector_enabled"] is False
 
 
-async def test_knowledge_db_sits_next_to_the_data_dir(tmp_path: Path) -> None:
-    """知识库文件落在数据目录下、与主库分开。
+async def test_knowledge_db_lives_in_the_workspace(tmp_path: Path) -> None:
+    """知识库文件落在工作区内的 ``.harness/`` 下（2026-09-22 改）。
 
-    WHY 分开：向量维度一变就要整库重建，独立文件让「删掉重来」是明确可执行的；而
-    ``vec0`` 是加载式扩展，写进主库会让「扩展不可用」与检查点库纠缠在一起。
+    WHY 跟着工作区走：索引的对象就是工作区里的文档（库里以根内虚拟路径为键去重），放在
+    项目里才能让「删项目 = 删索引」「备份项目带上索引」同时成立。
+
+    WHY 仍与主库分开：向量维度一变就要整库重建，独立文件让「删掉重来」是明确可执行的；
+    而 ``vec0`` 是加载式扩展，写进主库会让「扩展不可用」与检查点库纠缠在一起。
     """
     config = make_config(tmp_path)
-    await ensure_service(config, make_root(config).root)
+    root = make_root(config)
+    await ensure_service(config, root.root)
 
-    # 每个根一个库文件，文件名带上根的标识（没有例外）：两个项目的 /README.md 是
-    # 同一个键，共用一份索引会互相覆盖。
-    expected = tmp_path / f"knowledge-{knowledge_runtime.workspace_slug(make_root(config).root)}.db"
-    assert knowledge_runtime.knowledge_db_path(config, make_root(config).root) == expected
-    assert expected.is_file()
+    # 每个根各有一个 ``.harness/``，所以库名固定；而两个项目的 /README.md 是同一个键，
+    # 按根分库才能避免互相覆盖。
+    assert knowledge_runtime.knowledge_db_path(config, root.root) == root.knowledge_db
+    assert root.knowledge_db.is_file()

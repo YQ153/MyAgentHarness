@@ -66,13 +66,14 @@ WHY 特意选它：若检索只是关键词碰巧命中，这条查询不会命�
 
 async def _run(config: AppConfig) -> int:
     """装配 → 索引 → 检索，返回退出码。"""
-    _session_root(config, "smoke-knowledge").mkdir(parents=True, exist_ok=True)
-    (_session_root(config, "smoke-knowledge") / "login.md").write_text(_DOC, encoding="utf-8")
+    root = _session_root(config, "smoke-knowledge")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "login.md").write_text(_DOC, encoding="utf-8")
 
     print("[1/5] 经 build_app_context 装配（与 CLI / Web 启动同一条路径）")
     async with build_app_context(config) as context:
         capabilities = context.knowledge.capabilities()
-        print(f"      AppContext.knowledge 就位：{knowledge_db_path(config)}")
+        print(f"      AppContext.knowledge 就位：{knowledge_db_path(config, root)}")
         print(
             f"      向量检索={capabilities['vector_enabled']} "
             f"嵌入={capabilities['embedding_backend']}"

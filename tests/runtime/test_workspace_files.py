@@ -210,11 +210,11 @@ def test_looks_binary_by_content_not_suffix(workspace: Path):
 
 
 def test_mounts_resolve_a_virtual_path_to_its_host_directory(tmp_path: Path):
-    """带挂载表时，``/skills/...`` 解析到挂载目录而不是工作区内。
+    """带挂载表时，``/skills/...`` 按挂载表解析到宿主目录。
 
-    WHY 需要它：技能库、技能视图与工具留存已经搬出工作区（见 ``SessionRoot.storage_dir``），
-    面板要打开「完整输出」就必须按挂载表还原宿主路径——否则它会去工作区里找一个不存在的
-    文件，报 404。
+    WHY 需要它：技能库等内部产物物理上在 ``<工作区>/.harness/`` 下（2026-09-22 改），但
+    对外只经固定虚拟路径暴露；面板要打开「完整输出」就必须按挂载表还原宿主路径——否则它会
+    去工作区里找一个不存在的文件，报 404。
     """
     root = tmp_path / "workspace"
     root.mkdir()

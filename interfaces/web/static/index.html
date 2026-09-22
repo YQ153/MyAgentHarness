@@ -74,6 +74,19 @@
             >不绑定</button>
           </div>
         </div>
+        <!--
+          场景（预设）选择：与工作空间一样**只影响新建会话**——场景决定这条会话用哪些技能，
+          而技能索引在会话首轮加载一次（之后固定），所以它同样是「选完即锁」。已有会话时这里
+          不出现（要换场景请新建会话）。
+        -->
+        <div id="preset-picker" class="workspace-picker" hidden>
+          <span class="workspace-picker-label">本次会话场景</span>
+          <select
+            id="preset-select"
+            class="workspace-choice"
+            title="选择这条会话适用的技能场景；不同场景启用不同的技能集"
+          ></select>
+        </div>
         <!-- 系统弹窗的进行中提示与失败原因（例如「这个部署没有图形环境」） -->
         <p id="workspace-pick-status" class="workspace-picker-hint" hidden></p>
         <div class="thread-toolbar">

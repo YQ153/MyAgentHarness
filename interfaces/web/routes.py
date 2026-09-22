@@ -33,6 +33,7 @@ from application.errors import (
     InterruptExpiredError,
     NotFoundError,
     RunRejectedError,
+    SessionPresetLockedError,
     SessionRootLockedError,
     SessionRootNotReadyError,
     SessionRootUnavailableError,
@@ -566,8 +567,19 @@ async def run_agent(
     # WHY 附件服务在这里现取、而不是走 ``get_attachments`` 依赖：附件必须与运行落在
     # **同一个**工作区，而本次请求要用的工作区在 body 里（不是查询参数）。走依赖会读到
     # 另一个值——新会话的附件当场「不存在」，而它明明刚上传成功。
+    #
+    # WHY 连 ``preset`` 一起传（漏过一处，症状是「预设技能一个都不生效」）：这一步是**装配**
+    # 该根的地方（技能视图在这里按工作空间 + 场景重建），而图里的技能来源就是挂载出来的
+    # ``/.skills-active``。只传工作空间、不传场景，视图会按「不限定」建好；随后 ``stream``
+    # 带着场景去取图，图却照着那份「不限定」的视图运行——日志上一切正常（视图重建那条 INFO
+    # 只在这里打印），表现是场景形同虚设。
     attachments = (
-        await resolve_scoped_services(request, thread_id=normalized, requested=body.workspace)
+        await resolve_scoped_services(
+            request,
+            thread_id=normalized,
+            requested=body.workspace,
+            preset=body.preset,
+        )
     ).attachments
 
     try:
@@ -584,8 +596,14 @@ async def run_agent(
             content,
             model_name=body.model,
             workspace=body.workspace,
+            preset=body.preset,
         )
-    except (SessionRootLockedError, SessionRootNotReadyError, SessionRootUnavailableError) as exc:
+    except (
+        SessionPresetLockedError,
+        SessionRootLockedError,
+        SessionRootNotReadyError,
+        SessionRootUnavailableError,
+    ) as exc:
         # WHY 409：三种都是「状态不允许这次操作」——已锁定（这条会话的根定了）、还没
         # 就绪（这条会话还没有根）、不可用（根目录不见了）。重试本请求无用，客户端应改用
         # 原根、新建会话，或把那个目录恢复回来。

@@ -20,6 +20,7 @@ from application.workspace_service import (
     KIND_TOO_LARGE,
     WorkspaceService,
 )
+from config import HARNESS_DIR_NAME
 from runtime.tool_outputs import tool_output_path, write_tool_output
 from runtime.workspace_files import WorkspacePathError
 from tests.conftest import make_config, make_root
@@ -253,16 +254,20 @@ async def test_reads_a_file_that_lives_in_a_mount(tmp_path: Path):
     assert "完整输出正文" in (content.text or "")
 
 
-async def test_list_dir_never_exposes_the_internal_stores(tmp_path: Path):
-    """列举工作区根时不得出现那三个内部名字（技能库 / 技能视图 / 工具留存）。
+async def test_list_dir_never_exposes_the_harness_directory(tmp_path: Path):
+    """列举工作区根时不得出现 ``.harness``（应用数据目录）。
 
-    WHY 单列：它们现在是**挂载点**而不是根内目录，但这条约束与它们当年在根内时是同一个
-    ——面板是给用户看「我的项目里有什么」的，程序产物混进去只会让人以为是自己建的。
+    WHY 单列：应用数据（技能库 / 技能视图 / 工具留存 / 知识库索引）现在物理上就在工作区内
+    的 ``.harness/`` 下（2026-09-22 改），而面板列的就是真实目录——不隐藏的话，用户每次
+    打开面板都会先看到一屏「自己没建过的目录」，而技能视图每次重建还会刷新它的时间戳，
+    看起来像项目里有东西在不停变动。
     """
     service, _ = _service(tmp_path)
 
     listing = await service.list_dir("/")
 
-    assert {item.name for item in listing.entries}.isdisjoint(
-        {"skills", ".skills-active", "_tool_outputs"}
-    )
+    names = {item.name for item in listing.entries}
+
+    assert HARNESS_DIR_NAME not in names
+    # 这三个名字属于虚拟挂载点（位于 ``.harness/`` 之内），根层同样不该出现。
+    assert names.isdisjoint({"skills", ".skills-active", "_tool_outputs"})

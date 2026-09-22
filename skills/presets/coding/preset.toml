@@ -1,0 +1,8 @@
+# 场景预设：代码开发
+#
+# 字段与校验规则见 runtime/skill_presets.py。`skills` 是**技能名白名单**：名字从全部
+# 来源解析（内置 skills/builtin、本场景目录 skills/presets/coding/、用户工作区的
+# .harness/skills/），同名时优先级 用户 > 预设 > 内置。
+title = "代码开发"
+description = "面向编程任务：代码审查、项目脚手架、提交信息规范、文档转换"
+skills = ["code-review", "project-scaffold", "commit-message", "doc-to-markdown"]

@@ -306,13 +306,13 @@ def test_shipped_builtin_skills_parse_without_problems() -> None:
     WHY 同时断言名字与 ``problems``：只断言「能加载」会漏掉命名不规范这类上游只给告警的
     情况；而内置技能是我们自己写的，没有任何理由不规范。
     """
-    # WHY 用挂载而不是把来源放到工作区里：内置技能随应用交付（仓库根的
-    # ``skills-builtin/``），不在用户工作区之内——backend 的根是工作区，不挂一个虚拟
+    # WHY 用挂载而不是把来源放到工作区里：通用技能随应用交付（仓库根的
+    # ``skills/builtin/``），不在用户工作区之内——backend 的根是工作区，不挂一个虚拟
     # 路径它一个都读不到。这条用例顺带钉住「挂载表确实能让区外目录被读到」。
     inventory = inspect_skills(
         _REPO_ROOT / "workspace",
         ["/skills-builtin"],
-        mounts={"/skills-builtin/": _REPO_ROOT / "skills-builtin"},
+        mounts={"/skills-builtin/": _REPO_ROOT / "skills" / "builtin"},
     )
 
     assert inventory.names == ["code-review", "doc-to-markdown", "project-scaffold"]
@@ -322,16 +322,16 @@ def test_shipped_builtin_skills_parse_without_problems() -> None:
 
 
 def test_builtin_skills_have_unique_names_against_user_directory() -> None:
-    """内置目录与用户目录同时作为来源时，同名由**用户目录**生效（后者覆盖前者）。
+    """通用技能目录与用户目录同时作为来源时，同名由**用户目录**生效（后者覆盖前者）。
 
-    WHY：这条钉住的是「内置技能可以被用户按名覆盖」这个设计承诺。若哪天把两个目录的
+    WHY：这条钉住的是「通用技能可以被用户按名覆盖」这个设计承诺。若哪天把两个目录的
     顺序调反，内置的那份会永远赢，而用户「改了却不生效」不会有任何报错。
     """
-    # 顺序即优先级：内置在前（低），用户在后（高）。内置来源在工作区之外，故挂载。
+    # 顺序即优先级：通用在前（低），用户在后（高）。通用来源在工作区之外，故挂载。
     inventory = inspect_skills(
         _REPO_ROOT / "workspace",
         ["/skills-builtin", "/skills"],
-        mounts={"/skills-builtin/": _REPO_ROOT / "skills-builtin"},
+        mounts={"/skills-builtin/": _REPO_ROOT / "skills" / "builtin"},
     )
 
     sources = {package.name: package.source for package in inventory.packages}

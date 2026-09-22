@@ -22,13 +22,17 @@ WHY 嵌入后端仍然**全局共享一份**：子进程档位下它是一个常
 WHY 不做成导入期就构造的模块级单例：它需要 ``await``；而且构造失败应当落在**启动
 路径**上（能被看见、能拦住进程），而不是发生在某个模块被 import 的那一刻。
 
-数据库落在 ``<数据目录>/knowledge-<工作区标识>.db``，与检查点等库**分开**：
+数据库落在**工作区内**的 ``<工作区>/.harness/knowledge.db``（2026-09-22 改），与检查点等
+库**分开**：
 
+- 索引的对象是工作区里的文档（库里以根内虚拟路径为键去重），跟着项目走才能让「删项目 =
+  删索引」「备份项目带上索引」同时成立；放在数据目录下会出现「项目删了、索引还在」；
 - 向量维度或模型一变就必须整库重建，独立文件让「删掉重来」是一条明确可执行的指令；
 - ``vec0`` 是加载式扩展，把它写进主库会让「扩展在当前环境不可用」与「检查点库」
-  纠缠在一起——那两件事的处置方式完全不同；
-- **启动默认工作区沿用历史文件名 ``knowledge.db``**：升级不该让既有索引失效，而
-  「文件换了名字」在用户看来就是「我的索引全没了」。
+  纠缠在一起——那两件事的处置方式完全不同。
+
+升级路径：旧库在 ``<数据目录>/knowledge-<根标识>.db``，首次装配某个根时由
+``_migrate_legacy_db`` 搬进该根（``legacy_knowledge_db_path`` 保留旧公式用于定位）。
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import shutil
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -53,11 +58,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 KNOWLEDGE_DB_PREFIX = "knowledge-"
-"""库文件名前缀；完整文件名是前缀 + 文件根标识 + ``.db``。
+"""**旧版**知识库文件名前缀（完整形态是前缀 + 文件根标识 + ``.db``）。
 
-WHY 每个根一个文件、没有例外：库里以「根内的虚拟路径」为键去重，两个项目的
-``/README.md`` 是同一个键——共用一个库就会互相覆盖索引，「删除这份文档」还会删到另一个
-项目里的同名文件。文件名带上根的标识是唯一能保证这件事成立的做法。
+WHY 仍然保留：升级路径上要靠它与 :func:`workspace_slug` 定位旧库（见
+``legacy_knowledge_db_path``），排障脚本 ``scripts/inspect_thread.py`` 也会用它去数据目录
+里找历史库。新代码不应再按这个前缀拼库名——现行路径由 ``SessionRoot.knowledge_db`` 给出，
+库里以「根内的虚拟路径」为键去重（两个项目的 ``/README.md`` 是同一个键）。
 """
 
 _SLUG_ALLOWED = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -107,16 +113,18 @@ def workspace_slug(workspace: Path) -> str:
 
 
 def knowledge_db_path(config: AppConfig, workspace: Path) -> Path:
-    """返回某个文件根的知识库文件路径。
+    """返回某个文件根的知识库文件路径（``<工作区>/.harness/knowledge.db``）。
 
-    WHY 由 ``db_path`` 的父目录推导而不是新增一个配置项：数据目录是可配置的，而
-    知识库与其余持久化数据同处一块可写卷——容器部署时才不会出现「卷挂上了、知识库
-    却写进了镜像层」这种重启即丢失的问题。
+    WHY 落在工作区内（2026-09-22 改）：索引的对象就是工作区里的文档，库里以「根内虚拟
+    路径」为键去重（``UNIQUE(owner_id, source_path)``）。放在项目里，「删项目 = 删索引」与
+    「备份项目就带上索引」同时成立；放在数据目录下则会出现「项目删了、索引还在」，而那份
+    索引永远指不回去。
 
-    WHY 一个根一个文件，没有例外：库里以「根内的虚拟路径」为键去重，两个项目的
-    ``/README.md`` 是同一个键——共用一个库就会互相覆盖索引，「删除这份文档」还会删到
-    另一个项目的同名文件。文件名里带上根的标识（见 ``workspace_slug``）是唯一能保证
-    这件事成立的做法。
+    WHY 仍是一个根一个文件、没有例外：两个项目的 ``/README.md`` 是同一个键——共用一个库
+    就会互相覆盖索引，「删除这份文档」还会删到另一个项目的同名文件。
+
+    WHY 路径由 :class:`SessionRoot` 给出、而不在这里拼 ``.harness``：目录布局只有一处
+    出处，本模块只消费它的结论。
 
     Args:
         config: 应用配置。
@@ -129,9 +137,51 @@ def knowledge_db_path(config: AppConfig, workspace: Path) -> Path:
         raise ValueError("config 不能为 None")
     if workspace is None:
         raise ValueError("workspace 不能为 None：知识库按文件根隔离，缺了它就不知道该开哪个库")
-    data_dir = Path(config.db_path).parent
+    return SessionRoot(config, Path(workspace).expanduser().resolve()).knowledge_db
+
+
+def legacy_knowledge_db_path(config: AppConfig, workspace: Path) -> Path:
+    """**旧布局**（2026-09-22 之前）的知识库文件路径：``<数据目录>/knowledge-<根标识>.db``。
+
+    WHY 还需要这个公式：升级时要把旧库搬进工作区，而定位它必须与旧版本逐字一致——差一个
+    字符就会得到「没有旧库」，而表现是用户的索引凭空消失（需要重新嵌入一遍）。
+    """
+    if config is None:
+        raise ValueError("config 不能为 None")
+    if workspace is None:
+        raise ValueError("workspace 不能为 None")
     resolved = Path(workspace).expanduser().resolve()
-    return data_dir / f"{KNOWLEDGE_DB_PREFIX}{workspace_slug(resolved)}.db"
+    return Path(config.db_path).parent / f"{KNOWLEDGE_DB_PREFIX}{workspace_slug(resolved)}.db"
+
+
+def _migrate_legacy_db(config: AppConfig, workspace: Path, target: Path) -> None:
+    """把旧布局的知识库搬到新位置；幂等，且**不覆盖**已存在的新库。
+
+    WHY 迁移而不是重建：重建等于跑一次全量嵌入（分钟级、且要求嵌入后端可用），而用户并不
+    知道「升级会让我重新索引」。搬过去不丢任何东西，代价也只是一次文件 move。
+
+    WHY 新库已存在时不覆盖：两份库可能对应不同的维度或嵌入模型，静默覆盖会让「升级后检索
+    结果变了」成为一个没有线索的现象。两边都在时只告警，由用户决定删哪一份。
+    """
+    if target.exists():
+        return
+    legacy = legacy_knowledge_db_path(config, workspace)
+    if not legacy.is_file():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy), str(target))
+    except OSError as exc:
+        # 搬不动就停在原处并如实报错：静默继续会以「新位置有个空库」的形式收场，用户只会
+        # 看到「索引空了」，而日志里必须留下原因与手工修复的路径。
+        logger.error(
+            "旧知识库迁移失败，索引可能需要重建（请手工搬到 %s）：%s（%s）",
+            target,
+            legacy,
+            exc,
+        )
+        return
+    logger.info("旧知识库已搬进工作区：%s → %s", legacy, target)
 
 
 def _workspace_key(workspace: Path) -> str:
@@ -230,11 +280,15 @@ async def ensure_service(
 async def _assemble(config: AppConfig, key: str, scope: SessionRoot | None) -> KnowledgeService:
     """真正装配一个根的知识库（调用方必须已持有 ``_lock``）。"""
     embeddings = await _ensure_embeddings(config)
+    db_path = knowledge_db_path(config, Path(key))
+    # WHY 必须在开库之前迁移：一旦按新路径打开，创建逻辑会把「新位置没有库」当成全新库建表，
+    # 于是旧库还躺在数据目录里、用户看到的却是「索引空了」——没有任何报错指向真正的原因。
+    _migrate_legacy_db(config, Path(key), db_path)
     stack = AsyncExitStack()
     try:
         store = await stack.enter_async_context(
             open_knowledge_store(
-                knowledge_db_path(config, Path(key)),
+                db_path,
                 dims=config.embedding_dims,
                 model=config.embedding_model,
                 # WHY 用「有没有嵌入后端」决定要不要向量表，而不是另加一个开关：
@@ -259,7 +313,7 @@ async def _assemble(config: AppConfig, key: str, scope: SessionRoot | None) -> K
     logger.info(
         "知识库已装配：root=%s db=%s 向量=%s 嵌入=%s",
         key,
-        knowledge_db_path(config, Path(key)),
+        db_path,
         store.vector_enabled,
         embeddings.name if embeddings is not None else "none",
     )
@@ -315,6 +369,7 @@ __all__ = [
     "close_service",
     "ensure_service",
     "knowledge_db_path",
+    "legacy_knowledge_db_path",
     "peek_service",
     "workspace_slug",
 ]

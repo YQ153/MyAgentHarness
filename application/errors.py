@@ -142,6 +142,33 @@ class SessionRootLockedError(RuntimeError):
         self.requested = requested
 
 
+class SessionPresetLockedError(RuntimeError):
+    """某条会话（或某个工作空间）的**场景预设**已经锁定，本次请求给出的场景与它不一致。
+
+    WHY 必须拒绝而不是「以请求为准」：场景决定技能视图里放哪些技能，而视图按**工作空间**
+    物化（``.harness/skills-active``）且被图缓存持有——中途换场景会让运行中的会话与新会话
+    看到两套技能集，而两侧都不会报错（技能索引每会话只加载一次，错了不会自愈）。
+
+    WHY 与 :class:`SessionRootLockedError` 分开：两者的处置虽都是「新建会话」，但提示必须
+    点明冲突的是**场景**而不是目录——否则用户会去改工作空间路径，然后发现还是失败。
+
+    WHY 定位串叫 ``subject`` 而不是 ``thread_id``：这条冲突有两个来源——某条会话的请求带了
+    别的场景（``会话 <id>``），或某个工作空间已被别的会话占用（``工作空间 <路径>``，见
+    ``SessionRegistry._preset_allows_reuse``）。写死「会话」会让后一种把路径当会话 ID 报出来。
+
+    对应 HTTP 409 Conflict。
+    """
+
+    def __init__(self, subject: str, current: str, requested: str) -> None:
+        super().__init__(
+            f"{subject} 的场景已锁定为 {current or '(未指定)'}，本次请求给的却是 "
+            f"{requested or '(未指定)'}；同一个工作空间只属于一个场景，请新建一个会话"
+        )
+        self.subject = subject
+        self.current = current
+        self.requested = requested
+
+
 class SessionRootNotReadyError(RuntimeError):
     """这次请求给不出文件根：**既没有会话 ID，也没有工作空间**。
 

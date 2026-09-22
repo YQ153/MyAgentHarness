@@ -16,7 +16,7 @@ import pytest
 from fastapi import FastAPI
 
 from application.skill_service import SkillService
-from config import AppConfig
+from config import AppConfig, SessionRoot
 from interfaces.web.skill_routes import router
 from runtime.skill_store import open_skill_store
 from tests.conftest import StubSessionRegistry, make_config, make_root
@@ -61,7 +61,7 @@ def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> No
 
 
 def _view_names(config: AppConfig) -> set[str]:
-    """技能视图里当前有哪些技能（视图在**根外存储**里，见 ``SessionRoot.skill_view_store``）。"""
+    """技能视图里当前有哪些技能（视图在工作区的 ``.harness/`` 下，见 ``SessionRoot.skill_view_store``）。"""
     view = make_root(config).skill_view_store
     return {child.name for child in view.iterdir() if child.is_dir()} if view.is_dir() else set()
 
@@ -184,3 +184,81 @@ async def test_missing_body_field_is_rejected(api: tuple[httpx.AsyncClient, AppC
     response = await http.patch("/api/skills/code-review", params=_SESSION, json={})
 
     assert response.status_code == 422
+
+
+# --------------------------------------------------------------- 场景预设
+
+
+@pytest.fixture
+async def preset_api(tmp_path: Path) -> AsyncIterator[tuple[httpx.AsyncClient, AppConfig]]:
+    """带**隔离场景目录**与**已绑定场景的服务**的应用。
+
+    WHY 这里的服务直接按 ``preset="coding"`` 构造、而不是靠查询参数传进来：本文件的替身
+    （``StubSessionRegistry``）把服务整份注入，不会按请求里的根重建它。而"查询参数 → 解析出
+    带场景的根 → 冲突即 409"这条链路由 ``tests/application/test_preset_binding.py`` 在注册表
+    层覆盖——两条用例各管一段，合起来才是完整结论。
+    """
+    workspace = tmp_path / "workspace"
+    (workspace / "skills").mkdir(parents=True, exist_ok=True)
+    presets = tmp_path / "presets"
+    good = presets / "coding"
+    good.mkdir(parents=True)
+    (good / "preset.toml").write_text(
+        'title = "代码开发"\ndescription = "面向编程任务"\nskills = ["code-review"]\n',
+        encoding="utf-8",
+    )
+    # 一个写坏的场景：它必须出现在 problems 里，而不是从下拉里静默消失。
+    broken = presets / "broken"
+    broken.mkdir()
+    (broken / "preset.toml").write_text("skills = [\n", encoding="utf-8")
+
+    config = make_config(
+        tmp_path, workspace=workspace, skill_dirs=[workspace / "skills"], presets_dir=presets
+    )
+    scope = SessionRoot(config, make_root(config).root, "coding")
+    async with open_skill_store(tmp_path / "skills.db") as store:
+        app = FastAPI()
+        app.state.config = config
+        app.state.skills = SkillService(config, scope=scope, store=store)
+        app.state.workspaces = StubSessionRegistry(config, skills=app.state.skills)
+        app.include_router(router)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            yield http, config
+
+
+async def test_presets_endpoint_lists_scenarios_and_problems(
+    preset_api: tuple[httpx.AsyncClient, AppConfig],
+) -> None:
+    """场景清单：可用的进 ``items``，写坏的进 ``problems``。"""
+    http, _ = preset_api
+
+    response = await http.get("/api/presets")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["coding"]
+    assert body["items"][0]["title"] == "代码开发"
+    assert body["items"][0]["skills"] == ["code-review"]
+    assert [Path(item["directory"]).name for item in body["problems"]] == ["broken"]
+
+
+async def test_skills_endpoint_reports_the_scenario(
+    preset_api: tuple[httpx.AsyncClient, AppConfig],
+) -> None:
+    """清单能看出「这条会话属于哪个场景」，以及每个技能是否在白名单内。"""
+    http, config = preset_api
+    _write_skill(config, "code-review")
+    _write_skill(config, "outside")
+
+    body = (await http.get("/api/skills", params=_SESSION)).json()
+
+    assert body["preset"]["id"] == "coding"
+    assert body["preset_id"] == "coding"
+    by_name = {item["name"]: item for item in body["items"]}
+    assert by_name["code-review"]["in_preset"] is True
+    assert by_name["outside"]["in_preset"] is False
+    # 分类由来源推导：显式配的目录名就是 ``skills``，其虚拟路径即 ``/skills``（用户技能库），
+    # 因此如实标成 user——而不是硬套「显式配置 = custom」。判据是挂在哪，不是谁指定的。
+    assert by_name["code-review"]["category"] == "user"

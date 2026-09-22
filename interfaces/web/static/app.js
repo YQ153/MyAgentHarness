@@ -49,6 +49,8 @@
     workspaceClear: document.getElementById('workspace-clear'),
     workspacePick: document.getElementById('workspace-pick'),
     workspacePickStatus: document.getElementById('workspace-pick-status'),
+    presetPicker: document.getElementById('preset-picker'),
+    presetSelect: document.getElementById('preset-select'),
     workspaceBrowseOpen: document.getElementById('workspace-browse'),
     workspaceBrowseModal: document.getElementById('workspace-browse-modal'),
     workspaceBrowseClose: document.getElementById('workspace-browse-close'),
@@ -115,6 +117,16 @@
      * 等于把「用户没选」偷偷变成「用户选了配置里那个」，而两者本该落到不同的根上。
      */
     workspaceChoice: null,
+  /**
+   * 本次新建会话选择的**场景预设 ID**；``null`` 表示不限定（接受全部技能）。
+   *
+   * WHY 与 workspaceChoice 一样只存在本地、直到首条消息才交给服务端：场景与文件根在
+   * 同一条记录里锁定，之后不可变更（要换场景请新建会话）——因为技能视图按工作空间物化，
+   * 同一工作空间换场景会让两条会话的视图互相覆盖。
+   */
+  presetChoice: null,
+  /** 可选的场景清单（来自 ``GET /api/presets``）；空数组表示产品没交付任何场景。 */
+  presets: [],
     /**
      * 浏览弹窗的当前一层：``{path, parent, roots, entries}``。
      *
@@ -211,8 +223,18 @@
     if (state.threadId) {
       return path + separator + 'thread_id=' + encodeURIComponent(state.threadId);
     }
-    if (!state.workspaceChoice) return path;
-    return path + separator + 'workspace=' + encodeURIComponent(state.workspaceChoice);
+    // 草稿态：工作空间与场景都可能还没选（两者互相独立），所以分别拼接而不是提前返回。
+    // WHY 要把场景带上：技能面板应当按**即将使用的那套技能**展示——用户选了场景却在面板里
+    // 看不到技能集变化的话，"选场景"这件事在界面上就没有任何反馈。
+    const parts = [];
+    if (state.workspaceChoice) {
+      parts.push('workspace=' + encodeURIComponent(state.workspaceChoice));
+    }
+    if (state.presetChoice) {
+      parts.push('preset=' + encodeURIComponent(state.presetChoice));
+    }
+    if (!parts.length) return path;
+    return path + separator + parts.join('&');
   }
 
   async function api(path, options) {
@@ -1210,6 +1232,10 @@
     // 交给服务端——工作区只在**首条消息**上绑定，后续轮次带上它只会撞 409。
     const drafting = !state.threadId;
     const workspace = drafting ? state.workspaceChoice : null;
+    // 场景与工作空间一样只在**首条消息**上提交：两者都在那一刻锁定，之后不可变更。
+    // 直接读下拉框的值而不是 state.presetChoice，是为了避免"改了控件但状态没同步"这类
+    // 只在某条路径上出现的偏差——DOM 是用户唯一真正操作过的地方。
+    const preset = drafting ? els.presetSelect.value || null : null;
 
     setRunning(true);
     try {
@@ -1248,6 +1274,8 @@
               attachment_ids: attachmentIds,
               // 只在新会话的首条消息上带：服务端以它作为这条会话的绑定值
               workspace: workspace,
+              // 场景同理：与工作空间在同一条记录里锁定，之后给出不同的值会被 409 拒绝
+              preset: preset,
             }
           : {
               message_index: editing,
@@ -1409,6 +1437,11 @@
       els.attachInput.value = '';
     });
     els.modelSelect.addEventListener('change', updateAttachAvailability);
+    els.presetSelect.addEventListener('change', () => {
+      state.presetChoice = els.presetSelect.value || null;
+      // WHY 只记状态、不立刻拉面板：技能面板是弹窗、打开时才请求（请求会带上新的 preset）。
+      // 在这里主动刷新，等于用户每换一次场景就顺带拉一遍技能清单——而他此刻未必在看它。
+    });
 
     // 拖拽落点覆盖消息区与输入区：只认其中一个会让「拖到对话框上」变成浏览器
     // 直接打开该文件。必须 preventDefault 才能接管这个默认行为。
@@ -1981,6 +2014,9 @@ function clearWorkspacePreview() {
 function renderWorkspacePicker() {
   const drafting = !state.threadId;
   els.workspacePicker.hidden = !drafting;
+  // 场景选择器与工作空间选择器的显示时机**完全相同**（都只影响新建会话），所以在这里
+  // 一起刷新：两处各写一遍判断，迟早出现「一个收起来了、另一个还留着」。
+  renderPresetPicker(drafting);
   if (!drafting) return;
 
   const chosen = state.workspaceChoice;
@@ -1990,6 +2026,49 @@ function renderWorkspacePicker() {
   els.workspaceChoiceText.title = chosen || '';
   // 「不绑定」按钮只在已选时可用：没选的时候它什么也不做，留着反而像个必须点的步骤。
   els.workspaceClear.disabled = !chosen;
+}
+
+/**
+ * 渲染「本次会话场景」选择器。
+ *
+ * WHY 只在草稿态出现：场景与文件根在同一条记录里锁定，而技能视图按**工作空间**物化——
+ * 同一个工作空间换场景会让两条会话的视图互相覆盖，而两侧都不会报错。因此改场景的唯一
+ * 正确做法是新建会话，而不是就地改。
+ *
+ * WHY 没有任何场景时隐藏整个选择器：产品没交付场景（或预设目录为空）时，一个空下拉框
+ * 只会让人以为功能坏了。
+ */
+function renderPresetPicker(drafting) {
+  const available = state.presets.length > 0;
+  els.presetPicker.hidden = !drafting || !available;
+  if (!drafting || !available) return;
+  els.presetSelect.value = state.presetChoice || '';
+}
+
+/** 拉取场景清单并填充下拉框；失败只提示，不影响其余界面。 */
+async function loadPresets() {
+  try {
+    const response = await api('/api/presets');
+    const payload = await response.json();
+    state.presets = payload.items || [];
+    els.presetSelect.innerHTML = '';
+    const none = el('option', null, '不限定（接受全部技能）');
+    none.value = '';
+    els.presetSelect.appendChild(none);
+    state.presets.forEach((item) => {
+      const option = el('option', null, item.title + '（' + item.id + '）');
+      option.value = item.id;
+      option.title = item.description || '';
+      els.presetSelect.appendChild(option);
+    });
+    // 写坏的 preset.toml 会以 `problems` 下发：它们只会从下拉里静默消失，不提示的话
+    // 配置作者完全没有线索。
+    (payload.problems || []).forEach((problem) => {
+      appendNotice('场景配置有问题，已跳过：' + problem.directory + '（' + problem.reason + '）');
+    });
+  } catch (err) {
+    appendError('场景清单加载失败：' + err.message);
+  }
 }
 
 /* ------------------------------------------------------------------ 工作区浏览 */
@@ -2413,6 +2492,9 @@ function bindWorkspaceEvents() {
     await loadModels();
     // 上限在模型之后加载：两者都只影响输入区的可用性，而模型决定了「能不能传」
     await loadAttachmentLimits();
+    // 场景清单：只决定新建会话时下拉框里有什么；失败已在 loadPresets 内部兜住，
+    // 因此不阻塞首屏（一个可选的选择器加载失败，不该让整个界面停在白屏）。
+    await loadPresets();
     await loadThreads();
     // 刷新时按 URL 恢复：带会话 ID 则拉历史，否则进入草稿态（不创建任何东西）
     await syncWithUrl();
