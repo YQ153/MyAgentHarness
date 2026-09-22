@@ -3,9 +3,9 @@ name = "myagentharness"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "deepagents>=0.7.14",
+    "deepagents==0.7.15",
     "langgraph>=1.2.11",
-    "langchain>=1.4.0",
+    "langchain==1.4.2",
     "langchain-deepseek>=1.1.0",
     # 多 Provider 支持：按密钥存在性条件注册，未配置 Key 时不会加载对应后端
     "langchain-openai>=1.6.2",
