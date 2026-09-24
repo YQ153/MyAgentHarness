@@ -1,14 +1,26 @@
-# 单机编排：一个服务、两个卷。用法与变量说明见 README「容器化运行」。
+# 单机编排：一个服务、一个卷。用法与变量说明见 README「容器化运行」。
 #
 # WHY 端口只绑回环：容器会把端口映射到宿主机，网络边界比本机进程宽得多；本服务不区分
 # 调用方，任何能连上该端口的人都能读写你的会话与工作区。要让别的机器访问，请把它放在
 # 有访问控制的网络边界之后，并自行承担该边界的正确性。
+#
+# WHY 本文件放在 docker/ 下而不是仓库根：两份 Dockerfile 与编排集中在一处，避免「改了
+# 镜像定义却漏改编排」这类跨目录漂移。compose 的相对路径一律相对**本文件所在目录**解析，
+# 因此 build.context 与 env_file 都要回一级到仓库根；反过来，这也让
+# `docker compose -f docker/compose.yml ...` 在任何工作目录下都成立。
+#
+# WHY 显式写 name：compose 默认用「compose 文件所在目录名」当项目名，本文件搬进 docker/
+# 后项目名会从 myagentharness 变成 docker，卷名随之从 myagentharness_agent-data 变成
+# docker_agent-data——老部署会表现为「数据凭空消失」（其实是新建了一个空卷）。钉住项目名
+# 让这次搬迁对已有卷透明。
+
+name: myagentharness
 
 services:
   agent:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: app.Dockerfile
     image: myagentharness:local
     restart: unless-stopped
 
@@ -20,7 +32,7 @@ services:
     # 模型配置来自宿主机的 .env（该文件已被 .gitignore 忽略，且被 .dockerignore
     # 挡在构建上下文之外——它不会进镜像，只在运行时以环境变量形式注入）。
     env_file:
-      - .env
+      - ../.env
 
     environment:
       # 容器内必须监听 0.0.0.0，否则端口映射连不上（127.0.0.1 只对容器自己可见）
@@ -42,7 +54,7 @@ services:
     volumes:
       # WHY 用命名卷而不是绑定挂载宿主机目录：容器以 uid 10001 运行，绑定挂载的属主
       # 由宿主机决定，最省事的结果往往是「跑起来但写不进去」。命名卷首次挂载会继承
-      # 镜像里该目录的属主（Dockerfile 已把 /app/.data 交给 app），因此开箱可用。
+      # 镜像里该目录的属主（app.Dockerfile 已把 /app/.data 交给 app），因此开箱可用。
       #
       # WHY 只有一个卷：会话的检查点、审计、用量与「未绑定工作空间的会话专属目录」
       # 全都在这一个目录里——备份/搬迁只需要搬它。

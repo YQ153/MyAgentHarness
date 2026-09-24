@@ -26,6 +26,7 @@ from web_tools import (
     UnsupportedContentError,
     UpstreamServiceError,
     WebToolError,
+    _backoff_delay,
     register_tools,
 )
 
@@ -281,6 +282,7 @@ async def test_fetch_survives_unknown_charset(tmp_path, monkeypatch):
 
 async def test_fetch_maps_timeout_and_passes_configured_timeout(tmp_path, monkeypatch):
     config = make_config(tmp_path, web_fetch_timeout_seconds=7.5)
+    _no_wait(monkeypatch)
     stub = _patch_http(monkeypatch)
     monkeypatch.setattr(
         stub.client, "stream", lambda *args, **kwargs: _raise(httpx.ReadTimeout("读取超时"))
@@ -332,6 +334,7 @@ def _raise(exc: Exception) -> Any:
 
 async def test_fetch_maps_transport_error(tmp_path, monkeypatch):
     """传输层故障（连接被拒、DNS 失败、超时）必须收敛成可辨别的工具错误。"""
+    _no_wait(monkeypatch)
     stub = _patch_http(monkeypatch)
     monkeypatch.setattr(
         stub.client, "stream", lambda *args, **kwargs: _raise(httpx.ConnectError("连接被拒绝"))
@@ -573,6 +576,8 @@ async def test_search_skips_non_object_result_items(tmp_path, monkeypatch):
 
 
 async def test_search_maps_transport_error(tmp_path, monkeypatch):
+    config = _search_config(tmp_path, web_search_max_retries=0)
+    _no_wait(monkeypatch)
     stub = _patch_http(monkeypatch)
 
     async def _boom(url: str, **kwargs: Any) -> _StubResponse:
@@ -683,3 +688,178 @@ async def test_searxng_rejects_address_without_scheme(tmp_path, monkeypatch):
 
     with pytest.raises(WebToolError, match="必须是 http/https"):
         await _tool(config, "web_search").ainvoke({"query": "q"})
+
+
+# ================================================================== 传输层重试
+
+
+def _no_wait(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """把退避等待换成记账。
+
+    WHY 不许真的睡：被测的是「重试几次、退避多长」，而退避间隔本身已经被
+    ``_backoff_delay`` 的单测钉住了；让用例各睡上几秒只会把整套回归拖慢一个量级。
+    """
+    delays: list[float] = []
+
+    async def _record(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("asyncio.sleep", _record)
+    return delays
+
+
+async def test_search_retries_transient_error_and_succeeds(tmp_path, monkeypatch, caplog):
+    """一次 TLS 握手抖动不该让模型收到失败结果——2026-09-25 的实际故障正是如此：
+
+    同一轮对话里连续 4 次 Tavily 调用，前 3 次 200 OK，第 4 次 ``ConnectTimeout``。
+    请求没抵达服务端却让整次检索失败，模型只能改用其它途径，白白浪费一轮。
+
+    WHY 额外断言「重试成功」要留痕：若抖动在日志里只表现为一次偏慢的请求，事后
+    便无法把它与「网络正常」区分开——而那正是判断要不要换 provider 的唯一依据。
+    """
+    delays = _no_wait(monkeypatch)
+    stub = _patch_http(
+        monkeypatch,
+        _StubResponse(
+            headers={"content-type": "application/json"},
+            body=_tavily_body([{"title": "甲", "url": "https://a.example/1", "content": "摘要"}]),
+        ),
+    )
+    original_post = stub.client.post
+    attempts = 0
+
+    async def _flaky_post(url: str, **kwargs: Any) -> _StubResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectTimeout("")
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(stub.client, "post", _flaky_post)
+
+    with caplog.at_level(logging.INFO):
+        out = await _tool(_search_config(tmp_path), "web_search").ainvoke({"query": "python"})
+
+    assert "命中 1 条" in out
+    assert attempts == 2
+    assert delays == [pytest.approx(0.5)]
+    assert "传输层故障" in caplog.text
+    assert "重试成功" in caplog.text
+
+
+async def test_search_gives_up_after_configured_retries(tmp_path, monkeypatch):
+    """重试必须封顶：额度用尽后如实报错，不能无限重试把一轮对话挂住。"""
+    delays = _no_wait(monkeypatch)
+    config = _search_config(tmp_path, web_search_max_retries=2)
+    stub = _patch_http(monkeypatch)
+
+    async def _boom(url: str, **kwargs: Any) -> _StubResponse:
+        raise httpx.ConnectTimeout("")
+
+    monkeypatch.setattr(stub.client, "post", _boom)
+
+    with pytest.raises(UpstreamServiceError, match="共尝试 3 次"):
+        await _tool(config, "web_search").ainvoke({"query": "q"})
+
+    # 指数退避 0.5 → 1.0；第三次失败后立即抛出，因此只有两次等待
+    assert [round(delay, 2) for delay in delays] == [0.5, 1.0]
+
+
+async def test_search_does_not_retry_non_transient_transport_error(tmp_path, monkeypatch):
+    """不支持的协议重试一万次也是同一个结果：白白拖住一轮对话。
+
+    WHY 这条要单独钉住：重试集合是按「请求是否抵达服务端」划的，一旦有人把整个
+    ``TransportError`` 放进去，这类「注定失败」的错误也会开始空转。
+    """
+    delays = _no_wait(monkeypatch)
+    config = _search_config(tmp_path, web_search_max_retries=2)
+    stub = _patch_http(monkeypatch)
+
+    async def _boom(url: str, **kwargs: Any) -> _StubResponse:
+        raise httpx.UnsupportedProtocol("不支持的协议")
+
+    monkeypatch.setattr(stub.client, "post", _boom)
+
+    with pytest.raises(UpstreamServiceError, match="UnsupportedProtocol"):
+        await _tool(config, "web_search").ainvoke({"query": "q"})
+
+    assert delays == []
+
+
+async def test_search_names_endpoint_in_transport_failure(tmp_path, monkeypatch):
+    """``ConnectTimeout`` 的消息体是空的；错误文案必须自带目标，否则无从查起。
+
+    WHY 额外断言不含密钥：这段文案会同时进入日志与模型上下文，密钥出现在任何
+    一侧都是事故。
+    """
+    _no_wait(monkeypatch)
+    config = _search_config(tmp_path, web_search_max_retries=0)
+    stub = _patch_http(monkeypatch)
+
+    async def _boom(url: str, **kwargs: Any) -> _StubResponse:
+        raise httpx.ConnectTimeout("")
+
+    monkeypatch.setattr(stub.client, "post", _boom)
+
+    with pytest.raises(UpstreamServiceError) as caught:
+        await _tool(config, "web_search").ainvoke({"query": "q"})
+
+    message = str(caught.value)
+    assert "https://api.tavily.com/search" in message
+    assert "ConnectTimeout" in message
+    assert "tvly-test" not in message
+
+
+async def test_fetch_retries_transient_error_and_succeeds(tmp_path, monkeypatch):
+    """抓取同样不该因为一次连接抖动失败。
+
+    WHY 重试整次抓取而不是某一跳：每次尝试都会新建连接，于是重试自带「换一条干净
+    连接重来」的效果，SSRF 的逐跳校验也会重新跑一遍，不放宽任何判定。
+    """
+    delays = _no_wait(monkeypatch)
+    config = make_config(tmp_path, web_fetch_max_retries=1)
+    stub = _patch_http(monkeypatch, _text_response("正文".encode("utf-8")))
+    original_stream = stub.client.stream
+    attempts = 0
+
+    def _flaky_stream(method: str, url: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return _raise(httpx.ConnectTimeout(""))
+        return original_stream(method, url, **kwargs)
+
+    monkeypatch.setattr(stub.client, "stream", _flaky_stream)
+
+    out = await _tool(config, "web_fetch").ainvoke({"url": f"{_PUBLIC}/flaky"})
+
+    assert out == "正文"
+    assert attempts == 2
+    assert delays == [pytest.approx(0.5)]
+
+
+async def test_fetch_reports_attempts_after_retries_exhausted(tmp_path, monkeypatch):
+    """失败文案要写明尝试次数：1 次与 3 次之间隔着完全不同的一次排查。"""
+    _no_wait(monkeypatch)
+    config = make_config(tmp_path, web_fetch_max_retries=1)
+    stub = _patch_http(monkeypatch)
+    monkeypatch.setattr(
+        stub.client, "stream", lambda *args, **kwargs: _raise(httpx.ReadTimeout("读取超时"))
+    )
+
+    with pytest.raises(UpstreamServiceError) as caught:
+        await _tool(config, "web_fetch").ainvoke({"url": f"{_PUBLIC}/slow"})
+
+    message = str(caught.value)
+    assert f"{_PUBLIC}/slow" in message
+    assert "ReadTimeout" in message
+    assert "共尝试 2 次" in message
+
+
+@pytest.mark.parametrize(
+    ("attempt", "expected"),
+    [(0, 0.5), (1, 1.0), (2, 2.0), (3, 4.0), (8, 4.0)],
+)
+def test_backoff_grows_exponentially_and_is_capped(attempt: int, expected: float):
+    """退避必须封顶：工具处在模型同步等待的一次调用里。"""
+    assert _backoff_delay(attempt) == expected

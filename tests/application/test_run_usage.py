@@ -47,8 +47,15 @@ class BrokenUsageStore:
 
 
 def _chunk(text: str = "", **usage: Any) -> tuple[str, Any]:
-    """构造带用量字段的消息分片。"""
-    message = AIMessageChunk(content=text)
+    """构造带用量字段的消息分片。
+
+    WHY ``id`` 单独取：它是「同一响应共享、不同响应各异」的分段信号，必须落在
+    消息对象上——放进 ``usage_metadata`` 只是一个数字字段，累加器读不到。
+    """
+    call_id = usage.pop("id", None)
+    message = (
+        AIMessageChunk(content=text, id=call_id) if call_id else AIMessageChunk(content=text)
+    )
     if usage:
         message.usage_metadata = usage
     return ("messages", (message, {"langgraph_node": "model"}))
@@ -99,7 +106,19 @@ async def test_run_records_usage_once_with_cumulative_totals(
     assert _usage_event(events).payload == {
         "prompt_tokens": 100,
         "completion_tokens": 20,
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 0,
         "total_tokens": 120,
+        # 无 id 的分片走「计数回退」兜底：三次同 prompt 视为同一次调用，只有一段
+        "calls": [
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cache_hit_tokens": 0,
+                "cache_miss_tokens": 0,
+                "total_tokens": 120,
+            }
+        ],
     }
     # USAGE 必须早于 DONE，前端才能在收尾前把数字贴到助手消息里
     assert events[-1].event is AgentEventType.DONE
@@ -108,7 +127,7 @@ async def test_run_records_usage_once_with_cumulative_totals(
     summary = await usage_store.summarize(thread_id="t1")
     assert summary["prompt_tokens"] == 100
     assert summary["completion_tokens"] == 20
-    assert summary["run_count"] == 1
+    assert summary["call_count"] == 1
     assert summary["groups"][0]["key"] == "deepseek-flash"
 
 
@@ -125,7 +144,7 @@ async def test_run_records_usage_without_owner(
 
     await _drain(await service.stream("t1", "hi"))
 
-    assert (await usage_store.summarize(thread_id="t1"))["run_count"] == 1
+    assert (await usage_store.summarize(thread_id="t1"))["call_count"] == 1
 
 
 async def test_run_without_usage_still_reports_zero(
@@ -138,7 +157,7 @@ async def test_run_without_usage_still_reports_zero(
     events = await _drain(await service.stream("t1", "hi"))
 
     assert _usage_event(events).payload["total_tokens"] == 0
-    assert (await usage_store.summarize())["run_count"] == 1
+    assert (await usage_store.summarize())["call_count"] == 1
 
 
 async def test_error_run_still_records_usage(
@@ -204,5 +223,87 @@ async def test_multiple_runs_accumulate_rows(
     await _drain(await service.stream("t1", "第二轮"))
 
     summary = await usage_store.summarize(thread_id="t1")
-    assert summary["run_count"] == 2
+    assert summary["call_count"] == 2
     assert summary["total_tokens"] == 30
+
+
+async def test_run_records_cache_counters_end_to_end(
+    tmp_path, thread_store: ThreadMetaStore, usage_store: UsageStore
+):
+    """WHY 端到端：缓存字段横跨 translator → USAGE 事件 → 落库三处，
+    任何一处漏接的表现都是「命中率恒为 0」——那既不报错，也正好会让人
+    再次得出「没有缓存收益」的结论。"""
+    graph = ScriptedGraph(
+        [
+            _chunk(
+                "ok",
+                input_tokens=1000,
+                output_tokens=10,
+                prompt_cache_hit_tokens=900,
+                prompt_cache_miss_tokens=100,
+            )
+        ]
+    )
+    service = _service(tmp_path, thread_store, graph, usage_store)
+
+    events = await _drain(await service.stream("t1", "hi", model_name="deepseek-flash"))
+
+    payload = _usage_event(events).payload
+    assert payload["cache_hit_tokens"] == 900
+    assert payload["cache_miss_tokens"] == 100
+
+    summary = await usage_store.summarize(thread_id="t1")
+    assert summary["cache_hit_tokens"] == 900
+    assert summary["cache_miss_tokens"] == 100
+    assert summary["groups"][0]["cache_hit_tokens"] == 900
+
+
+async def test_run_records_each_model_call_as_its_own_row(
+    tmp_path, thread_store: ThreadMetaStore, usage_store: UsageStore
+):
+    """WHY 逐次落库：一轮内多次模型调用的 prompt 是**递增**的，此前靠「计数回退」
+    分段时递增不触发回退，整轮被并成一次——成本被系统性低估，命中率趋势也不可读。
+    分段信号改用消息 id 后，两个 id 对应两行。"""
+    graph = ScriptedGraph(
+        [
+            _chunk("你", input_tokens=5000, output_tokens=1, id="call-1"),
+            _chunk("好", input_tokens=9000, output_tokens=6, id="call-1"),
+            _chunk("！", input_tokens=12000, output_tokens=14, id="call-2"),
+            _chunk("。", input_tokens=12000, output_tokens=20, id="call-2"),
+        ]
+    )
+    service = _service(tmp_path, thread_store, graph, usage_store)
+
+    events = await _drain(await service.stream("t1", "hi", model_name="deepseek-flash"))
+
+    # 汇总事件 = 全部调用之和（两次调用相加，而不是只留最后一次）
+    payload = _usage_event(events).payload
+    assert payload["prompt_tokens"] == 21000
+    assert payload["completion_tokens"] == 26
+    assert [call["prompt_tokens"] for call in payload["calls"]] == [9000, 12000]
+
+    rows, _ = await usage_store.list_recent(thread_id="t1")
+    assert [row["prompt_tokens"] for row in rows] == [9000, 12000]
+    # 同一轮的两行必须能按 trace 归拢（CLI 形态为 None 时至少不互相污染）
+    assert rows[0]["model"] == "deepseek-flash"
+
+
+async def test_run_without_ids_still_sums_chunks(
+    tmp_path, thread_store: ThreadMetaStore, usage_store: UsageStore
+):
+    """WHY 兜底路径必须保住：部分 provider / 网关的分片没有 id，此时退回
+    计数回退判据——精度差一些，但不能把用量丢成零。"""
+    graph = ScriptedGraph(
+        [
+            _chunk("a", input_tokens=1000, output_tokens=1),
+            _chunk("b", input_tokens=2000, output_tokens=5),
+        ]
+    )
+    service = _service(tmp_path, thread_store, graph, usage_store)
+
+    events = await _drain(await service.stream("t1", "hi"))
+
+    # 递增不触发回退 → 仍视为同一次调用的累计快照，取最后一片
+    assert _usage_event(events).payload["prompt_tokens"] == 2000
+    rows, _ = await usage_store.list_recent(thread_id="t1")
+    assert len(rows) == 1

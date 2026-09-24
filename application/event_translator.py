@@ -92,6 +92,16 @@ class LangGraphEventTranslator:
         """是否曾从流中取到用量字段。"""
         return not self._usage.empty
 
+    @property
+    def usage_calls(self) -> list[TokenUsage]:
+        """本轮**逐次模型调用**的用量快照（按发生顺序）。
+
+        WHY 需要逐次而不是只有 :attr:`usage` 总和：一轮运行内可能有多次模型调用
+        （模型 → 工具 → 模型），它们的命中率各不相同——首次调用通常低（新内容）、
+        后续调用命中历史。逐次落库后，「命中率随轮次的趋势」才第一次变得可读。
+        """
+        return self._usage.calls
+
     def feed(self, mode: str, chunk: Any) -> list[AgentEvent]:
         """消费一个流增量。
 

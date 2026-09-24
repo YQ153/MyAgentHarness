@@ -21,6 +21,7 @@ from bootstrap.web import (
 )
 from config import AppConfig
 from interfaces.web.attachment_routes import router as attachment_router
+from interfaces.web.errors import install_error_handlers
 from interfaces.web.health import router as health_router
 from interfaces.web.knowledge_routes import router as knowledge_router
 from interfaces.web.request_context import RequestContextMiddleware
@@ -138,6 +139,10 @@ def create_app(config: AppConfig) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.config = config
+
+    # WHY 错误处理器要在任何路由之前装好：它决定**全部**端点（包括未匹配路由的 404、
+    # 方法不允许的 405）的错误体形状；晚装会让一部分请求先按框架默认形状回出去。
+    install_error_handlers(app)
 
     # WHY 审计上下文中间件最先注册：Starlette 的中间件按注册顺序由外向内执行，
     # 最先注册即最外层，路由与异常处理都在它之内，任何分支写下的审计都能

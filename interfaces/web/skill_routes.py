@@ -90,6 +90,9 @@ async def list_preset_catalog(request: Request) -> PresetListResponse:
                     "title": preset.title,
                     "description": preset.description,
                     "skills": list(preset.skills),
+                    # WHY 一并下发自动准入开关：它决定「白名单之外的通用技能能不能用」，
+                    # 少这一位界面就无法解释为什么某个技能不在白名单里却仍在视图里。
+                    "include_general": preset.include_general,
                 }
                 for preset in catalog.presets
             ],

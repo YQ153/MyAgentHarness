@@ -932,13 +932,22 @@ class RunService:
         # 但部分用量也比没有任何数字更能回答「这次花了多少」。
         if translator.has_usage:
             usage = translator.usage
+            rate = usage.cache_hit_rate
+            calls = translator.usage_calls
             logger.info(
-                "会话 %s 本轮用量：prompt=%d completion=%d",
+                "会话 %s 本轮用量：prompt=%d completion=%d cache_hit=%d cache_miss=%d "
+                "命中率=%s 调用=%d 次",
                 handle.thread_id,
                 usage.prompt_tokens,
                 usage.completion_tokens,
+                usage.cache_hit_tokens,
+                usage.cache_miss_tokens,
+                # WHY 缺失写「未知」而不是 0%：provider 未上报与「一次都没命中」
+                # 是两个结论，把前者显示成 0% 会直接推翻缓存收益的判断依据。
+                f"{rate:.1%}" if rate is not None else "未知",
+                len(calls),
             )
-            yield AgentEvent(AgentEventType.USAGE, usage.as_payload())
+            yield AgentEvent(AgentEventType.USAGE, self._usage_payload(usage, calls))
         else:
             # WHY 缺失必须留日志而不是静默跳过：长期为 0 意味着 provider 换了
             # 字段口径而本模块的映射没跟上，静默会让成本统计悄悄失真。
@@ -946,7 +955,20 @@ class RunService:
                 "会话 %s 本轮未取到 token 用量（provider 未提供或字段口径变更），按 0 记录",
                 handle.thread_id,
             )
-            yield AgentEvent(AgentEventType.USAGE, TokenUsage(0, 0).as_payload())
+            yield AgentEvent(AgentEventType.USAGE, self._usage_payload(TokenUsage(0, 0), []))
+
+    @staticmethod
+    def _usage_payload(usage: TokenUsage, calls: list[TokenUsage]) -> dict[str, Any]:
+        """构造 USAGE 事件载荷：汇总数字 + 逐次调用明细。
+
+        WHY 明细放进同一事件而不是另开一类事件：前端只消费汇总（多一类事件
+        就要前端同步改渲染），而落库侧需要明细——同一份载荷两个消费方各取所需，
+        「一轮恰好一个 USAGE 事件」的既有约定不被打破。
+        """
+        return {
+            **usage.as_payload(),
+            "calls": [call.as_payload() for call in calls],
+        }
 
     def _track_event(self, event: AgentEvent, handle: RunHandle) -> None:
         """按事件类型维护运行治理所需的派生状态。
@@ -1289,35 +1311,64 @@ class RunService:
             return None
 
     async def _record_usage(self, handle: RunHandle, payload: dict[str, Any]) -> None:
-        """把本轮用量写入用量表。
+        """把本轮用量写入用量表（**每次模型调用一行**）。
 
         WHY 吞掉异常：用量是旁路数据，写库失败不应让一次成功的对话变成
         错误响应，也不该影响已经产出的事件流；失败会留下完整日志供告警，
         代价只是这一轮的用量缺失。
 
+        WHY 逐次落库而不是一轮一行：一轮运行内可能有多次模型调用（模型 →
+        工具 → 模型），只落一行会让成本被系统性低估（此前只记该轮最后一次
+        调用的用量）；逐次落库后，按行求和即该轮真实消耗，且命中率随轮次的
+        趋势第一次可读。同一轮的多行共享同一个 trace_id，可据此还原归属。
+
         Args:
             handle: 本次运行的句柄，提供会话、模型别名与所有者。
-            payload: USAGE 事件的载荷（prompt / completion / total）。
+            payload: USAGE 事件的载荷（汇总数字 + ``calls`` 逐次明细）。
         """
         if self._usage_store is None:
             return
 
-        prompt = payload.get("prompt_tokens") or 0
-        completion = payload.get("completion_tokens") or 0
-        try:
-            await self._usage_store.record(
-                thread_id=handle.thread_id,
-                model=handle.model_name or self._config.default_model,
-                prompt_tokens=int(prompt),
-                completion_tokens=int(completion),
-                owner_id=handle.owner_id,
-                # WHY 用量也要链路标识：审计说「谁在什么时候干了什么」，用量说
-                # 「这次花了多少」——两者分开看都只是半张图，同一个 trace_id 才能
-                # 回答「这一次请求到底花了多少」。CLI 形态下为 None，表示未知。
-                trace_id=audit_trace_id(),
-            )
-        except Exception:
-            logger.exception("用量记录失败：thread=%s", handle.thread_id)
+        rows: list[dict[str, int]] = [
+            {
+                "prompt_tokens": int(call.get("prompt_tokens") or 0),
+                "completion_tokens": int(call.get("completion_tokens") or 0),
+                "cache_hit_tokens": int(call.get("cache_hit_tokens") or 0),
+                "cache_miss_tokens": int(call.get("cache_miss_tokens") or 0),
+            }
+            for call in payload.get("calls") or []
+            if isinstance(call, dict)
+        ]
+        if not rows:
+            # WHY 缺失仍记一行 0：缺失率本身就是需要观测的信号（provider 换了
+            # 字段口径时它会长年非零），静默跳过会让成本统计悄悄失真。
+            rows = [
+                dict.fromkeys(
+                    ("prompt_tokens", "completion_tokens", "cache_hit_tokens", "cache_miss_tokens"),
+                    0,
+                )
+            ]
+
+        # WHY trace_id 取一次、循环外：同一轮的所有调用属于同一个链路；
+        # 若放进循环里，将来换成「每次调用生成新 id」的实现时，同一轮的
+        # 调用会被拆散到不同链路上，而那没有任何收益。
+        trace_id = audit_trace_id()
+        for row in rows:
+            try:
+                await self._usage_store.record(
+                    thread_id=handle.thread_id,
+                    model=handle.model_name or self._config.default_model,
+                    prompt_tokens=row["prompt_tokens"],
+                    completion_tokens=row["completion_tokens"],
+                    cache_hit_tokens=row["cache_hit_tokens"],
+                    cache_miss_tokens=row["cache_miss_tokens"],
+                    owner_id=handle.owner_id,
+                    trace_id=trace_id,
+                )
+            except Exception:
+                # WHY 继续落其余行而不是整轮放弃：某一行失败（例如单值越界）
+                # 不代表其余行也会失败，部分成功优于全失；失败行有完整日志。
+                logger.exception("用量记录失败：thread=%s", handle.thread_id)
 
     async def _touch(self, thread_id: str) -> None:
         """刷新会话的最近活动时间。

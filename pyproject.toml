@@ -3,12 +3,12 @@ name = "myagentharness"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "deepagents==0.7.15",
-    "langgraph>=1.2.11",
+    "deepagents==0.7.17",
+    "langgraph==1.2.12",
     "langchain==1.4.2",
-    "langchain-deepseek>=1.1.0",
+    "langchain-deepseek==1.1.1",
     # 多 Provider 支持：按密钥存在性条件注册，未配置 Key 时不会加载对应后端
-    "langchain-openai>=1.6.2",
+    "langchain-openai==1.6.3",
     "langchain-anthropic>=1.7.2",
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.53.0",
@@ -38,3 +38,43 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+# WHY 显式落一份配置：仓库先前没有 ruff 配置，IDE 插件只能按各自的默认规则集跑，
+# 同一个文件在不同机器上给出的告警集合不一致。
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# WHY 只开默认集合（E4/E7/E9/F）加 B：B 正是本次要处理的 B008 所在规则集，
+# 而 I / UP / ANN 这类规则会在上百个既有文件上一次性刷出成千条告警，把真正
+# 该修的问题淹掉。要收紧就按规则集逐个打开，不要一次全开。
+select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# WHY 必须列出来：FastAPI 规定路由参数写成 ``x: T = Depends(...)`` /
+# ``Query(...)``，即把函数调用放在默认值里；B008 的默认白名单不认识它们，
+# 于是每一条路由都被报「不要在参数默认值里做函数调用」。列进白名单后这些调用被
+# 视为无副作用的声明式标记，B008 不再告警——比在几十个参数上逐个加
+# ``# noqa: B008`` 更干净，也不会因为新增路由时忘了加注释而重新报错。
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Form",
+    "fastapi.File",
+    "fastapi.params.Depends",
+    "fastapi.params.Query",
+    "fastapi.params.Path",
+    "fastapi.params.Body",
+    "fastapi.params.Header",
+    "fastapi.params.Cookie",
+    "fastapi.params.Form",
+    "fastapi.params.File",
+    "fastapi.security.Security",
+    "fastapi.security.http.HTTPBearer",
+    "fastapi.security.oauth2.OAuth2PasswordBearer",
+]

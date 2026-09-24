@@ -22,6 +22,7 @@
 | 会话整理 | 标题搜索、重命名、归档（软删除，可恢复）与「含已归档」开关；归档不影响历史、用量与运行 |
 | 长期记忆 | 三层：**全局** `AGENTS.md`（`MEMORY_FILE` 指定，人工维护、跨全部会话共享，以只读挂载 `/global/` 交给 Agent）+ **工作区** `AGENTS.md`（未配全局记忆时生效，随项目走）+ `/memories/`（Agent 自写，落 SQLite，重启不丢）；Web 端「记忆」面板可查看与删除 |
 | 模型切换 | 每次请求可指定模型别名，也可走配置里的默认模型 |
+| 图表渲染 | 助手消息里用 ```` ```mermaid ```` 包起来的图会在浏览器里画成图（代码块收进「图源码」可展开）；第三方库**内置**在 `interfaces/web/static/vendor/`，第一次遇到图时才加载 |
 | 执行护栏 | 单次运行的模型调用次数、递归深度、shell 超时与输出长度均有上限 |
 
 ---
@@ -145,12 +146,16 @@ uv run python main.py web --host 0.0.0.0 --port 8080
   ——只有「里面确实存在含 `SKILL.md` 的子目录」时才搬（`skills` 是很常见的目录名，不含技能包的
   同名目录不会被搬走）。`.skills-active`（派生物）不迁移，会按当前启停状态重建。
 - **场景（预设）**：新建会话时可以选一个**场景**（由随应用交付的 `<应用目录>/skills/presets/`
-  下的 `preset.toml` 声明，例如「代码开发」「文档写作」），它决定这条会话启用哪些技能——场景
-  白名单之外的技能不会进入该会话的视图。场景与工作空间在**同一条记录里一起锁定**（同一个工作
-  空间只属于一个场景，改场景请新建会话）。**不选场景 = 不限定**，接受全部技能（与升级前的行为
-  一致）。技能因此分三类：**通用**（`skills/builtin/`，每个场景都能用）、**场景预设**
-  （`skills/presets/<场景>/`，只有该场景用）、**用户**（`<工作区>/.harness/skills/`，你自己放的
-  ——同名时它覆盖前两类）。
+  下的 `preset.toml` 声明，例如「代码开发」「文档写作」），它决定这条会话启用哪些技能。场景与
+  工作空间在**同一条记录里一起锁定**（同一个工作空间只属于一个场景，改场景请新建会话）。
+  **不选场景 = 不限定**，接受全部技能（与升级前的行为一致）。
+  技能因此分三类：**通用**（`skills/builtin/`，**默认每个场景都能用**，不必写进场景名单）、
+  **场景预设**（`skills/presets/<场景>/`，只有该场景用）、**用户**（`<工作区>/.harness/skills/`，
+  你自己放的——同名时它覆盖前两类）。
+  场景的 `skills` 是**白名单**，只写**非通用**的技能即可；想连通用技能一起收紧，就在
+  `preset.toml` 里写 `include_general = false`——那时该场景只认白名单里那几个名字，仍要保留的
+  通用技能也得显式写出来（「文档写作」场景正是这么做的：它不需要「代码审查」「项目脚手架」，
+  但要用 `doc-to-markdown`）。
 - 两个入口：**「选择文件夹…」**弹出操作系统的文件夹选择对话框；**「浏览…」**在网页里逐级
   挑选，也可以直接粘贴路径。任意目录都可以选 —— 没有允许清单，「不绑定」也是一个正常选项。
 - **「选择文件夹…」弹的是原生对话框，但它出现在运行服务端的那台机器上**，不是浏览器这边。
@@ -181,8 +186,9 @@ uv run python main.py web --host 0.0.0.0 --port 8080
 ### 3. 容器化运行
 
 ```bash
-docker compose up -d --build     # 首次构建并启动
-docker compose ps                # 等 STATUS 出现 (healthy)
+# 容器相关文件都在 docker/ 下（两份 Dockerfile + 一份编排），因此都要带 -f
+docker compose -f docker/compose.yml up -d --build   # 首次构建并启动
+docker compose -f docker/compose.yml ps              # 等 STATUS 出现 (healthy)
 curl -s http://127.0.0.1:8000/ready
 ```
 
@@ -191,7 +197,11 @@ curl -s http://127.0.0.1:8000/ready
 依赖抖动不该让编排系统反复重启容器。
 
 **它长什么样**：镜像用多阶段构建（依赖装完只拷结果），以 **uid 10001 的非 root 用户**
-运行，`Dockerfile` 里带 `HEALTHCHECK`。端口默认只绑 `127.0.0.1:8000`。
+运行，`docker/app.Dockerfile` 里带 `HEALTHCHECK`。端口默认只绑 `127.0.0.1:8000`。
+
+> 编排的项目名被显式钉为 `myagentharness`（见 `docker/compose.yml` 的 `name:`），
+> 因此卷名恒为 `myagentharness_agent-data`：把 compose 文件挪进 `docker/` 不会换掉卷、
+> 也不会让既有数据「消失」。
 
 #### 环境变量
 
@@ -266,13 +276,13 @@ mkdir -p ./projects && sudo chown -R 10001:10001 ./projects
 CLI 直接使用与 Web 相同的配置（compose 的 `env_file` 会把它带进容器）：
 
 ```bash
-docker compose exec agent python main.py cli
+docker compose -f docker/compose.yml exec agent python main.py cli
 ```
 
 想临时换一个工作空间时用 `--workspace`：
 
 ```bash
-docker compose exec agent python main.py cli --workspace /app/.data/sessions/demo
+docker compose -f docker/compose.yml exec agent python main.py cli --workspace /app/.data/sessions/demo
 ```
 
 本机（非容器）同理：直接 `python main.py cli`。
@@ -283,8 +293,8 @@ Web 接口在同一个容器里，无需另起进程。
 
 ```bash
 # 查看日志 / 停止
-docker compose logs -f agent
-docker compose down            # 保留卷；加 -v 会连数据一起删
+docker compose -f docker/compose.yml logs -f agent
+docker compose -f docker/compose.yml down   # 保留卷；加 -v 会连数据一起删
 ```
 
 ## 五、执行档位（安全相关）
@@ -362,7 +372,7 @@ python scripts/setup_sandbox_image.py
 python scripts/setup_sandbox_image.py --base <可用的基础镜像>
 ```
 
-镜像由 `docker/sandbox.Dockerfile` 定义，与**应用自身**的根 `Dockerfile` 分开：
+镜像由 `docker/sandbox.Dockerfile` 定义，与**应用自身**的 `docker/app.Dockerfile` 分开：
 那份的受众是「跑应用」，这份是「跑命令」，而后者越空越好——一次成功逃逸能碰到的东西，
 就等于镜像里有什么。它只带 Python 与 coreutils，不预装编译器与网络工具。
 
@@ -448,7 +458,7 @@ JSON 数组（元素是对象，没有分隔符能表达）。
 > 变量——但一声不响会让「配置写着某个已不存在的项」被当成生效。
 | `DB_PATH` | `./.data/agent.db` | SQLite 数据库（检查点 + 会话元数据 + 审计 + 用量 + **长期记忆**） |
 | `SKILL_DIRS` | 通用技能 + 场景预设 + 本根技能库 | 技能目录，按顺序查找（越靠后优先级越高）；多目录用路径分隔符（Windows `;` / POSIX `:`）。默认三项：**通用技能**（`<应用目录>/skills/builtin`）、**场景预设**（`<应用目录>/skills/presets/<场景>`，仅绑定该场景的会话使用）、**用户技能库**（`<工作区>/.harness/skills`）。前两项在工作区之外，由程序挂只读虚拟路径后读取 |
-| `PRESETS_DIR` | `<应用目录>/skills/presets` | 场景预设目录：每个一级子目录是一个**场景**（`preset.toml` 声明该场景用哪些技能，可附技能包）。覆盖它可整套换成团队自己的场景集 |
+| `PRESETS_DIR` | `<应用目录>/skills/presets` | 场景预设目录：每个一级子目录是一个**场景**（`preset.toml` 声明该场景用哪些技能——只写非通用的，以及是否自动准入通用技能 `include_general`（默认 `true`），可附技能包）。覆盖它可整套换成团队自己的场景集 |
 | `THREAD_TITLE_MAX_CHARS` | `24` | **自动生成**标题的字符上限，超出以省略号截断 |
 | `THREAD_RENAME_MAX_CHARS` | `120` | **手动改名**允许的字符上限；超长直接报错（不静默截断用户输入） |
 | `AUDIT_RETENTION_DAYS` | `180` | 审计日志保留天数，超期记录由定期任务删除 |
@@ -465,9 +475,11 @@ JSON 数组（元素是对象，没有分隔符能表达）。
 | `WEB_SEARCH_BASE_URL` | 空 | 检索服务地址；`searxng` 必填（如 `http://127.0.0.1:8888`），`tavily` 留空用官方地址 |
 | `WEB_SEARCH_TIMEOUT_SECONDS` | `15` | 单次检索请求超时（秒） |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | 检索结果条数上限（结果会整体进入上下文） |
+| `WEB_SEARCH_MAX_RETRIES` | `2` | 传输层故障（连接/TLS 超时、连接被重置）的额外尝试次数；HTTP 状态码错误不重试 |
 | `WEB_FETCH_TIMEOUT_SECONDS` | `20` | 单次抓取请求超时（秒） |
 | `WEB_FETCH_MAX_CHARS` | `20000` | 抓取正文的字符上限，超出部分截断并显式标注 |
 | `WEB_FETCH_MAX_REDIRECTS` | `3` | 跟随重定向的跳数上限；**每一跳都复检出站安全** |
+| `WEB_FETCH_MAX_RETRIES` | `1` | 抓取遇传输层故障的重试次数（地址由模型给出，失败后换来源通常更有效） |
 | `WEB_USER_AGENT` | 空 | 出站请求的 User-Agent；留空用内置默认值 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Web 监听地址与端口 |
 | `LOG_LEVEL` | `INFO` | 日志级别：DEBUG/INFO/WARNING/ERROR |
@@ -588,6 +600,50 @@ SSE 事件类型：
 | `error` | 运行期错误 |
 | `done` | 本轮运行结束 |
 
+### 错误响应
+
+所有失败响应统一为两个键（**状态码本身没有变化**）：
+
+```json
+{ "detail": "会话 8f3c9a1d 正在运行中，请等待本轮结束后再发起", "code": "thread_busy" }
+```
+
+- `detail`：人类可读的原因，**恒为字符串**——既有客户端与脚本读的就是它，未做任何改动；
+- `code`：稳定的机器可读错误码，取值**只增不改**。新增一个码不会破坏既有客户端：
+  不认识它的分支应当走兜底提示。
+
+**为什么需要 `code`**：同一个状态码要表达处置完全不同的失败。以 409 为例它有七种含义，
+客户端该做的事各不相同（等待 / 新建会话 / 先发第一条消息 / 恢复目录 / 重新发起对话 /
+关掉那个对话框）；此前只能靠匹配 `detail` 的中文文案去猜，而文案是会改的。
+
+| 状态码 | `code` | 客户端该做什么 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 改请求参数 |
+| 400 | `thread_id_invalid` | 改会话 ID（形状或长度不合法） |
+| 400 | `unknown_model` | 换成 `GET /api/models` 里存在的别名 |
+| 400 | `vision_unsupported` | 换支持多模态的模型，或去掉图片 |
+| 404 | `not_found` | 目标不存在 |
+| 405 | `method_not_allowed` | 换请求方法 |
+| 409 | `thread_busy` | 等本轮结束再发 |
+| 409 | `thread_root_locked` | 沿用原工作空间，或新建会话 |
+| 409 | `thread_preset_locked` | 新建会话（同一个工作空间只属于一个场景） |
+| 409 | `thread_root_not_ready` | 先选工作空间，或先发出第一条消息 |
+| 409 | `thread_root_unavailable` | 恢复那个目录，或删除这条会话 |
+| 409 | `interrupt_expired` | 重新发起对话（该审批已超期作废） |
+| 409 | `folder_picker_busy` | 关掉服务端已弹出的那个对话框再试 |
+| 409 | `conflict` | 未归类的状态冲突 |
+| 422 | `request_validation_failed` | 按请求体 schema 修正；该响应额外带 `errors`（逐条字段路径与原因） |
+| 429 | `run_concurrency_exceeded` | 按 `Retry-After` 给的秒数重试（全局并发已满） |
+| 429 | `run_rate_limited` | 按 `Retry-After` 给的秒数重试（请求过于频繁） |
+| 500 | `internal_error` | 服务端故障（响应体为 JSON；此前框架默认回的是纯文本） |
+| 501 | `folder_picker_unavailable` | 换用「浏览…」（该部署形态没有图形环境） |
+| 501 | `not_implemented` | 该部署形态不提供此能力 |
+| 503 | `service_unavailable` | 服务尚未装配完成或正在关闭 |
+| 504 | `folder_picker_timeout` | 对话框等待超时，重来一次 |
+
+一处刻意的例外：`GET /ready` 返回 503 时响应体是**就绪报告本身**（它要说明是哪一项没就绪），
+不带 `code`——探活系统只看状态码，而人需要的是原因清单。
+
 ### 附件与多模态输入
 
 - **存放**：`<工作区>/.attachments/<thread_id>/`，每个附件两个文件（内容 + 元数据）。
@@ -634,9 +690,12 @@ MyAgentHarness/
 ├── knowledge_runtime.py      # 知识库的进程级服务句柄
 ├── knowledge_tools.py        # 知识库工具（默认不加载）
 │
-├── Dockerfile                # 应用镜像：多阶段构建，以非 root 用户运行
-├── docker-compose.yml        # 编排：端口只绑定回环地址
-├── docker/                   # 沙箱执行镜像（受众是"跑命令"，与应用镜像分开）
+├── .dockerignore             # 构建上下文排除项（必须在仓库根：它只对上下文根生效）
+├── docker/                   # 容器相关定义集中在此（应用镜像 / 执行镜像 / 编排）
+│   ├── app.Dockerfile        # 应用镜像：多阶段构建，以非 root 用户运行
+│   ├── sandbox.Dockerfile    # Tier 2 执行镜像（受众是"跑命令"，越空越好）
+│   ├── compose.yml           # 编排：端口只绑定回环地址
+│   └── README.md             # 两份镜像 + 一份编排的用法与约定
 ├── pyproject.toml            # 依赖声明（requires-python >= 3.14）
 ├── uv.lock                   # 精确锁定的依赖版本
 ├── .env.example              # 配置模板
@@ -743,6 +802,12 @@ MyAgentHarness/
 - 联网检索：**tavily 适配器已对真实服务验证**（`python scripts/smoke_web_chain.py` 可复跑）；
   **SearXNG 适配器仍未经真实实例验证**——本机无自建实例，公网实例全部不可达、Docker 也拉不到
   镜像。其请求构造（含 `format=json`）与响应解析已由用例钉住，接上可达实例后跑同一条脚本即可补齐。
+- 图表渲染**只发生在浏览器里**（服务端不画图，导出的 Markdown 里仍是代码块），因此：
+  带 `mermaid` 语言标记的代码块才有图，**图源码上限 20000 字**（超过就走降级，理由是布局
+  是同步计算，更大的图会把界面按在那里几秒）；宽图横向滚动而不缩放（缩放会把标签字号缩到
+  读不出）。渲染失败时保留源码、只多加一行原因——图没画出来不等于模型写错了图，也可能是
+  本仓内置的 Mermaid 版本不支持那种语法或那个类型，需要的话按
+  `interfaces/web/static/vendor/README.md` 升级（哈希与版本都在那里登记，测试会校验）。
 - 检查点为单机 SQLite，多副本部署需另行替换为共享存储（如 PostgreSQL 检查点）；
   长期记忆与它共用同一个文件，多副本部署时需一并替换。
 - 长期记忆只有一份（工作区里没有第二份）：记忆命名空间由进程内唯一的主体标识派生，

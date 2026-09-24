@@ -82,9 +82,24 @@ async def test_usage_store_upgrades_a_legacy_database(tmp_path):
             model="deepseek-flash",
             prompt_tokens=1,
             completion_tokens=2,
+            cache_hit_tokens=1,
             trace_id="trace-1",
         )
-        assert "trace_id" in _columns(db_path, "usage_log")
+        columns = _columns(db_path, "usage_log")
+        assert "trace_id" in columns
+        # WHY 也要断言缓存列：老库缺的是**两批**列（trace_id 与缓存计数），
+        # 只断言第一批会让「缓存列漏补」在唯一会走补列分支的地方静默存在。
+        assert {"cache_hit_tokens", "cache_miss_tokens"} <= columns
+
+
+async def test_fresh_usage_database_has_cache_columns(tmp_path):
+    """全新库的缓存列与 ``_SCHEMA`` 一致；与升级路径互为对照。"""
+    db_path = tmp_path / "fresh.db"
+
+    async with open_usage_store(db_path):
+        pass
+
+    assert {"cache_hit_tokens", "cache_miss_tokens"} <= _columns(db_path, "usage_log")
 
 
 async def test_opening_twice_is_idempotent(tmp_path):

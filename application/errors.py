@@ -7,10 +7,103 @@ WHY 单独成模块：接口层需要按异常类型映射 HTTP 状态码。异�
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+class ErrorCode(StrEnum):
+    """稳定的机器可读错误码。
+
+    WHY 与 HTTP 状态码分开：同一个状态码要表达多种**处置完全不同**的失败——本应用的
+    409 就同时表示「会话正在运行」「文件根已锁定」「场景已锁定」「还没有根」「根不可用」
+    「审批已过期」六种，而调用方拿到的只有一句会随文案改动而变化的中文，只能做字符串
+    匹配。把「是哪一种失败」变成响应里的一个稳定字段，客户端才能可靠分派。
+
+    WHY 取值是 snake_case 字符串而不是整数：它直接出现在响应体与日志里，需要能被人
+    读懂、被 grep 命中；数字码还得另配一张表才能解释。
+
+    兼容性约定：**只增不改**。某个取值一经发布即构成对外契约，改名等同于破坏性变更；
+    新增一个码永远安全——调用方的兜底分支会接住它。各码对应的 HTTP 状态码集中在
+    ``interfaces.web.errors.STATUS_BY_CODE``（以「码 → 状态」为唯一方向，避免一处状态
+    对应多码时无处裁决）。
+    """
+
+    INVALID_REQUEST = "invalid_request"
+    """请求载荷或查询参数不被接受（本服务自己的校验）。对应 HTTP 400。"""
+
+    REQUEST_VALIDATION_FAILED = "request_validation_failed"
+    """请求体未通过 schema 校验（框架抛出的校验错误）。对应 HTTP 422。"""
+
+    THREAD_ID_INVALID = "thread_id_invalid"
+    """会话 ID 的形状不合法（规则见 ``thread_utils``）。对应 HTTP 400。"""
+
+    UNKNOWN_MODEL = "unknown_model"
+    """请求指定的模型别名未注册。对应 HTTP 400。"""
+
+    VISION_UNSUPPORTED = "vision_unsupported"
+    """目标模型不接受图片输入；本次请求的图片未被发送。对应 HTTP 400。"""
+
+    NOT_FOUND = "not_found"
+    """目标资源不存在。对应 HTTP 404。"""
+
+    THREAD_BUSY = "thread_busy"
+    """该会话已有运行中的轮次；等本轮结束后重试即可。对应 HTTP 409。"""
+
+    THREAD_ROOT_LOCKED = "thread_root_locked"
+    """会话的文件根已锁定，与本次请求给出的工作空间不一致；需沿用原根或新建会话。对应 HTTP 409。"""
+
+    THREAD_PRESET_LOCKED = "thread_preset_locked"
+    """场景已锁定（同一个工作空间只属于一个场景）；需新建会话。对应 HTTP 409。"""
+
+    THREAD_ROOT_NOT_READY = "thread_root_not_ready"
+    """这条会话还没有文件根（既无会话 ID 也无工作空间）；先选工作空间或先发出第一条消息。对应 HTTP 409。"""
+
+    THREAD_ROOT_UNAVAILABLE = "thread_root_unavailable"
+    """文件根已确定但当前不可用（用户选定的目录不见了）；恢复该目录或删除这条会话。对应 HTTP 409。"""
+
+    INTERRUPT_EXPIRED = "interrupt_expired"
+    """待审批的中断已超过挂起 TTL；本次审批不再被接受，需重新发起对话。对应 HTTP 409。"""
+
+    FOLDER_PICKER_BUSY = "folder_picker_busy"
+    """服务端已有一个文件夹选择对话框在等待（同一进程一次只允许一个）。对应 HTTP 409。"""
+
+    CONFLICT = "conflict"
+    """未归类的状态冲突（兜底）。对应 HTTP 409。"""
+
+    METHOD_NOT_ALLOWED = "method_not_allowed"
+    """该路径不支持此 HTTP 方法（框架抛出）。对应 HTTP 405。"""
+
+    RUN_CONCURRENCY_EXCEEDED = "run_concurrency_exceeded"
+    """全局并发已达上限；按 ``Retry-After`` 稍后重试。对应 HTTP 429。"""
+
+    RUN_RATE_LIMITED = "run_rate_limited"
+    """该主体在窗口内发起得过于频繁；按 ``Retry-After`` 稍后重试。对应 HTTP 429。"""
+
+    INTERNAL_ERROR = "internal_error"
+    """未归类的服务端故障（兜底）。对应 HTTP 500。"""
+
+    FOLDER_PICKER_UNAVAILABLE = "folder_picker_unavailable"
+    """该部署形态无法弹出系统文件夹对话框（无桌面环境）；改用网页内浏览。对应 HTTP 501。"""
+
+    NOT_IMPLEMENTED = "not_implemented"
+    """该部署形态未提供此能力（兜底）。对应 HTTP 501。"""
+
+    SERVICE_UNAVAILABLE = "service_unavailable"
+    """服务尚未装配完成或正在关闭。对应 HTTP 503。"""
+
+    FOLDER_PICKER_TIMEOUT = "folder_picker_timeout"
+    """文件夹选择对话框等待超时。对应 HTTP 504。"""
+
+    UNCLASSIFIED = "unclassified"
+    """哨兵：状态码不在兜底表里、也无法从异常推断出码时使用。
+
+    WHY 需要一个「不撒谎」的哨兵，而不是把这类失败归到 ``internal_error``：它多半是
+    4xx（例如框架抛出的 415），归成服务端故障会把「你的请求不对」说成「我们坏了」。
+    出现它一定伴随一条 WARNING 日志，提示该补一条兜底映射。
+    """
 
 
 class ThreadBusyError(RuntimeError):

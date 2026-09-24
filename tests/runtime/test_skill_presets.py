@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from runtime.skill_presets import (
+    DEFAULT_INCLUDE_GENERAL,
     PRESET_FILE_NAME,
     PresetCatalog,
     PresetProblem,
@@ -60,6 +61,7 @@ def test_loads_a_complete_preset(tmp_path: Path) -> None:
     assert preset.title == "代码开发"
     assert preset.description == "面向编程任务"
     assert preset.skills == ("a", "b")
+    assert preset.include_general is DEFAULT_INCLUDE_GENERAL
     assert preset.allows("a") is True
     assert preset.allows("c") is False
 
@@ -86,6 +88,73 @@ def test_an_empty_allowlist_means_unrestricted(tmp_path: Path) -> None:
     assert preset is not None
     assert preset.skills == ()
     assert preset.allows("anything") is True
+
+
+def test_general_skills_are_admitted_by_default(tmp_path: Path) -> None:
+    """``include_general`` 缺省为开：通用技能不写进白名单也属于本场景。
+
+    WHY 这是开关的核心语义：通用技能的定义就是「每个场景都能用」。要求每个场景都抄一遍
+    通用技能名，漏一个就是一次静默的能力缺失——既不报错，也没有任何线索。
+    """
+    _preset(tmp_path, "coding", 'skills = ["a"]\n')
+
+    preset = load_presets(tmp_path).get("coding")
+
+    assert preset is not None
+    assert preset.include_general is True
+    assert preset.allows("general-skill", is_general=True) is True
+    assert preset.allows("general-skill", is_general=False) is False
+
+
+def test_turning_the_switch_off_closes_the_allowlist(tmp_path: Path) -> None:
+    """关掉开关后场景只认白名单里那几个名字，通用技能也必须显式写出来。"""
+    _preset(tmp_path, "coding", 'skills = ["a"]\ninclude_general = false\n')
+
+    preset = load_presets(tmp_path).get("coding")
+
+    assert preset is not None
+    assert preset.include_general is False
+    assert preset.allows("a") is True
+    assert preset.allows("general-skill", is_general=True) is False
+
+
+def test_a_listed_general_skill_is_still_admitted_when_the_switch_is_off(
+    tmp_path: Path,
+) -> None:
+    """白名单里写了的通用技能，关掉开关也照样生效（写进来永远不是错）。"""
+    _preset(tmp_path, "coding", 'skills = ["a"]\ninclude_general = false\n')
+
+    preset = load_presets(tmp_path).get("coding")
+
+    assert preset is not None
+    assert preset.allows("a", is_general=True) is True
+
+
+def test_an_empty_allowlist_stays_unrestricted_when_the_switch_is_off(tmp_path: Path) -> None:
+    """空白名单仍然是「不限定」：开关只在白名单非空时参与判定。
+
+    WHY 钉住这一条：若把「空 + 关」解释成「全禁」，场景一创建就没有任何技能，且没有报错
+    ——与 ``allows`` 里那条「空 = 不限定」的规则直接打架。
+    """
+    _preset(tmp_path, "coding", 'title = "代码开发"\ninclude_general = false\n')
+
+    preset = load_presets(tmp_path).get("coding")
+
+    assert preset is not None
+    assert preset.skills == ()
+    assert preset.allows("anything") is True
+
+
+def test_a_non_boolean_switch_is_reported(tmp_path: Path) -> None:
+    """``include_general`` 必须是真正的布尔；TOML 里的 ``1`` 是整数而不是布尔。"""
+    _preset(tmp_path, "coding", 'skills = ["a"]\ninclude_general = 1\n')
+
+    catalog = load_presets(tmp_path)
+
+    assert catalog.presets == ()
+    problem = _problem_of(catalog, "coding")
+    assert problem is not None
+    assert "布尔" in problem.reason
 
 
 def test_presets_are_sorted_by_id(tmp_path: Path) -> None:
@@ -228,6 +297,14 @@ def test_shipped_presets_load_without_problems() -> None:
 
     assert catalog.problems == (), f"交付的场景有问题：{catalog.problems}"
     assert catalog.ids == ["coding", "writing"]
+    # 两个场景的开关口径必须钉住：coding 靠自动准入拿到通用技能（白名单里只有自带技能），
+    # writing 关掉了它——写作任务不需要「代码审查」「项目脚手架」，一旦误开就会混进来。
+    assert catalog.get("coding") is not None
+    assert catalog.get("coding").include_general is True
+    assert catalog.get("writing") is not None
+    assert catalog.get("writing").include_general is False
+    # 关掉开关的场景必须把它要用的通用技能显式写出来，否则那一项会从场景里消失。
+    assert "doc-to-markdown" in catalog.get("writing").skills
     # 每个场景至少声明了技能；白名单里的名字必须是合法技能名（小写、连字符）。
     for preset in catalog.presets:
         assert preset.title

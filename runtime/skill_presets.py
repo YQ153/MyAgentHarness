@@ -33,8 +33,19 @@ logger = logging.getLogger(__name__)
 PRESET_FILE_NAME = "preset.toml"
 """场景描述文件名：每个场景目录下一份（与技能包的 ``SKILL.md`` 同一层级）。"""
 
-_KNOWN_KEYS = frozenset({"title", "description", "skills"})
+_KNOWN_KEYS = frozenset({"title", "description", "skills", "include_general"})
 """允许出现的键。未知键一律报为问题——静默忽略会让「配了半天没生效」无从解释。"""
+
+DEFAULT_INCLUDE_GENERAL = True
+"""``include_general`` 的默认值：通用技能（``skills/builtin/``）自动进入每个场景。
+
+WHY 默认开启：通用技能的定义就是「每个场景都能用」。若默认关闭，每新增一个通用技能都要
+把每个 ``preset.toml`` 补一遍，而漏补的结果是该场景安静地少一项能力——既不报错，也没有
+任何线索（``missing_skills`` 只报反方向：白名单里写了却找不到）。
+
+WHY 仍然留着关闭的口子：有的场景确实要收敛（写作场景不需要「代码审查」「项目脚手架」），
+关闭后该场景就只认白名单里那几个名字——包括它想保留的通用技能也要显式写出来。
+"""
 
 PRESET_ID_RE = re.compile(r"^[a-z0-9](?:-?[a-z0-9])*$")
 """场景 ID（取自目录名）的字符集：小写字母、数字与单个连字符，且不以连字符开头或结尾。
@@ -64,24 +75,38 @@ class SkillPreset:
             是唯一权威，避免"文件里写 A、目录叫 B"这类两份说法）。
         title: 界面上显示的场景名。
         description: 一句话说明这个场景适合什么任务。
-        skills: **技能名白名单**。空元组表示「不限定」——该场景接受全部可用技能。
+        skills: **技能名白名单**（只写**非通用**的技能）。空元组表示「不限定」——该场景
+            接受全部可用技能。
+        include_general: 通用技能（``skills/builtin/``）是否**不写进白名单也能用**。
     """
 
     preset_id: str
     title: str
     description: str
     skills: tuple[str, ...] = ()
+    include_general: bool = DEFAULT_INCLUDE_GENERAL
 
-    def allows(self, skill_name: str) -> bool:
+    def allows(self, skill_name: str, *, is_general: bool = False) -> bool:
         """该技能是否属于本场景。
 
         WHY 空白名单表示「不限定」而不是「什么都不允许」：``skills`` 省略时最可能的意图是
         「这个场景不做额外限制」，而按「空 = 全禁」解释会让场景一创建就没有任何技能，
         且没有任何报错。
+
+        WHY 通用技能由 ``include_general`` 单独决定、而不是要求它同样写在白名单里：写在
+        白名单里当然也生效（无害冗余），但要求每个场景都抄一遍通用技能名，漏一个就是一次
+        静默的能力缺失。
+
+        Args:
+            skill_name: 技能名。
+            is_general: 该技能是否是随应用交付的**通用技能**。判定由调用方做——本模块只知道
+                名字，不知道它来自哪个来源目录。
         """
         if not self.skills:
             return True
-        return skill_name in self.skills
+        if skill_name in self.skills:
+            return True
+        return is_general and self.include_general
 
 
 @dataclass(frozen=True)
@@ -197,6 +222,15 @@ def _load_one(directory: Path) -> SkillPreset | PresetProblem:
     if description is not None and not isinstance(description, str):
         return _problem(directory, f"description 必须是字符串，实际：{type(description).__name__}")
 
+    include_general = raw.get("include_general", DEFAULT_INCLUDE_GENERAL)
+    # WHY 只认真正的布尔（TOML 里 ``1`` 是整数而不是布尔）：按真值解释会顺带接受 0 / 1，
+    # 而「写成 2 算什么」这类歧义一旦进来，场景的技能集就不再能从配置里读出来。
+    if not isinstance(include_general, bool):
+        return _problem(
+            directory,
+            f"include_general 必须是布尔值，实际：{type(include_general).__name__}",
+        )
+
     skills, problem = _parse_skills(raw.get("skills"), directory)
     if problem is not None:
         return problem
@@ -207,6 +241,7 @@ def _load_one(directory: Path) -> SkillPreset | PresetProblem:
         title=(title or "").strip() or preset_id,
         description=(description or "").strip(),
         skills=skills,
+        include_general=include_general,
     )
 
 
@@ -259,6 +294,7 @@ def load_presets(root: Path) -> PresetCatalog:
 
 
 __all__ = [
+    "DEFAULT_INCLUDE_GENERAL",
     "PRESET_FILE_NAME",
     "PresetCatalog",
     "PresetProblem",

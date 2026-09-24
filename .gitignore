@@ -10,6 +10,8 @@ __pycache__/
 coverage.xml
 .pytest_cache/
 .import_linter_cache/
+# 测试自己造的临时会话目录：路径里带用例名，每次运行都可能换一套，入库只会污染状态
+.pytest-tmp2/
 
 # 虚拟环境
 .venv/

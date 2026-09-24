@@ -190,6 +190,41 @@ async def test_skipped_files_are_counted(tmp_path: Path) -> None:
     assert "跳过 1 个" in result
 
 
+# --------------------------------------------------------------- 注入预算
+
+
+def _config_with_budget(tmp_path: Path, budget: int) -> AppConfig:
+    """建好一份多片段的工作区，并给检索配一个很小的注入预算。"""
+    base = _workspace(tmp_path, "notes/a.md", "关键词 内容细节。" * 300)
+    return make_config(
+        tmp_path,
+        workspace=make_root(base).root,
+        knowledge_search_max_chars=budget,
+    )
+
+
+async def test_search_respects_injection_budget(tmp_path: Path) -> None:
+    """检索结果整体进入上下文，只限制条数挡不住「一条片段上千字」。
+
+    WHY 按字符设上限才是真正的注入侧预算：它决定的是「本次往对话**尾部**追加
+    多少」，不改动已有消息——因此对 DeepSeek 的前缀缓存是中性的，这与一切
+    「清历史」类治理有本质区别。
+    """
+    config = _config_with_budget(tmp_path, budget=200)
+    registry = _registry(config)
+    await _call(registry, "index_documents", config)
+
+    result = await _call(registry, "search_documents", config, query="关键词")
+
+    assert "注入预算" in result
+    assert "未注入" in result
+    # 预算 200 而首条就约 600 字（截断后）：只有首条放行，其余全部挡下。
+    # WHY 首条必达要作为断言钉住：一条都不给时模型只会用同样的检索词重试，
+    # 把检索能力整体废掉，远比「这一条超了一点预算」代价高。
+    assert "[1]" in result
+    assert len(result) < 1200
+
+
 # --------------------------------------------------------------- 进程级句柄
 
 

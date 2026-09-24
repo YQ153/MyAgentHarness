@@ -112,6 +112,19 @@ class ThreadMetadataReader(Protocol):
         """统计满足条件的会话数。"""
         ...
 
+    async def list_thread_ids(
+        self,
+        *,
+        owner_id: str | None = None,
+        include_unowned: bool = False,
+        workspace: str | None = None,
+        workspace_bound: bool | None = None,
+        include_archived: bool = True,
+        limit: int = 500,
+    ) -> list[str]:
+        """按条件枚举会话 ID（只取主键，用于批量清理的目标解析）。"""
+        ...
+
     async def ping(self) -> bool:
         """探测存储连通性；用于就绪检查。"""
         ...
@@ -249,11 +262,17 @@ class UsageLedger(Protocol):
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
         owner_id: str = "",
         trace_id: str | None = None,
         created_at: str | None = None,
     ) -> int:
-        """记录一次运行的用量；返回新记录的 ID。"""
+        """记录一次运行的用量；返回新记录的 ID。
+
+        ``cache_hit_tokens`` / ``cache_miss_tokens`` 表示输入侧命中与未命中缓存的
+        token 数（provider 未上报时为 0）；它们让「缓存到底有没有省到钱」可被度量。
+        """
         ...
 
     async def summarize(
@@ -266,6 +285,18 @@ class UsageLedger(Protocol):
         group_by: str = "model",
     ) -> dict[str, Any]:
         """按维度聚合时间窗内的用量。"""
+        ...
+
+    async def list_recent(
+        self,
+        *,
+        owner_id: str | None = None,
+        thread_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """按时间正序取最近的逐条用量；返回 ``(记录列表, 是否被 limit 截断)``。"""
         ...
 
 

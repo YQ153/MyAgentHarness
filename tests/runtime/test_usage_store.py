@@ -33,7 +33,7 @@ async def test_record_defaults_owner_and_timestamp(store: UsageStore):
 
     summary = await store.summarize(group_by="thread")
     assert summary["groups"][0]["key"] == "t1"
-    assert summary["run_count"] == 1
+    assert summary["call_count"] == 1
 
 
 async def test_record_rejects_invalid_arguments(store: UsageStore):
@@ -56,6 +56,56 @@ async def test_record_propagates_db_failure(store: UsageStore):
         await store.record(thread_id="t", model="m", prompt_tokens=1, completion_tokens=1)
 
 
+async def test_record_persists_cache_counters(store: UsageStore):
+    """WHY 单独一条：缓存计数横跨写入的 INSERT 与聚合的 SUM 两处，
+    任一处漏掉列，读出来都是 0——而 0 恰好也是一个完全合法的取值，
+    所以这种「断线」不会以任何异常的形式暴露。"""
+    await store.record(
+        thread_id="t1",
+        model="deepseek-flash",
+        prompt_tokens=1000,
+        completion_tokens=10,
+        cache_hit_tokens=900,
+        cache_miss_tokens=100,
+    )
+
+    summary = await store.summarize(thread_id="t1")
+
+    assert summary["cache_hit_tokens"] == 900
+    assert summary["cache_miss_tokens"] == 100
+    assert summary["groups"][0]["cache_hit_tokens"] == 900
+    assert summary["groups"][0]["cache_miss_tokens"] == 100
+
+
+async def test_record_defaults_cache_counters_to_zero(store: UsageStore):
+    """未上报缓存的调用仍可落库，缓存列取 0 而不是 NULL。
+
+    WHY 强调不是 NULL：``SUM`` 遇到 NULL 会整体塌成 NULL，聚合结果就再也
+    不是数字了——这是「可空列」在这个表里最典型的失效方式。
+    """
+    await store.record(thread_id="t1", model="m", prompt_tokens=5, completion_tokens=1)
+
+    summary = await store.summarize()
+
+    assert summary["cache_hit_tokens"] == 0
+    assert summary["cache_miss_tokens"] == 0
+
+
+async def test_record_rejects_invalid_cache_counters(store: UsageStore):
+    with pytest.raises(ValueError, match="cache_hit_tokens"):
+        await store.record(
+            thread_id="t", model="m", prompt_tokens=1, completion_tokens=1, cache_hit_tokens=-1
+        )
+    with pytest.raises(ValueError, match="cache_miss_tokens"):
+        await store.record(
+            thread_id="t",
+            model="m",
+            prompt_tokens=1,
+            completion_tokens=1,
+            cache_miss_tokens=10**9,
+        )
+
+
 # ------------------------------------------------------------------ 聚合
 
 
@@ -73,7 +123,7 @@ async def test_summarize_totals_and_group_by_model(store: UsageStore):
     assert summary["prompt_tokens"] == 157
     assert summary["completion_tokens"] == 18
     assert summary["total_tokens"] == 175
-    assert summary["run_count"] == 3
+    assert summary["call_count"] == 3
     # 按总量降序：deepseek-flash 120 > openai 55
     assert [group["key"] for group in summary["groups"]] == ["deepseek-flash", "openai"]
     assert summary["groups"][0]["total_tokens"] == 120
@@ -93,15 +143,15 @@ async def test_summarize_filters_owner_and_thread(store: UsageStore):
     await _seed(store)
 
     alice = await store.summarize(owner_id="alice")
-    assert alice["run_count"] == 2
+    assert alice["call_count"] == 2
     assert alice["total_tokens"] == 165
 
     bob_thread = await store.summarize(owner_id="bob", thread_id="t2")
-    assert bob_thread["run_count"] == 1
+    assert bob_thread["call_count"] == 1
     assert bob_thread["total_tokens"] == 10
 
     # owner 与 thread 不匹配时结果必须为空，而不是退化成「只按 owner 过滤」
-    assert (await store.summarize(owner_id="alice", thread_id="t2"))["run_count"] == 0
+    assert (await store.summarize(owner_id="alice", thread_id="t2"))["call_count"] == 0
 
 
 async def test_summarize_time_window(store: UsageStore):
@@ -115,10 +165,10 @@ async def test_summarize_time_window(store: UsageStore):
     await _seed(store)
 
     summary = await store.summarize(since="2020-01-01T00:00:00+00:00")
-    assert summary["run_count"] == 3
+    assert summary["call_count"] == 3
 
     all_rows = await store.summarize()
-    assert all_rows["run_count"] == 4
+    assert all_rows["call_count"] == 4
 
 
 async def test_summarize_empty_table(store: UsageStore):
@@ -128,7 +178,9 @@ async def test_summarize_empty_table(store: UsageStore):
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
-        "run_count": 0,
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 0,
+        "call_count": 0,
         "groups": [],
     }
 
@@ -138,6 +190,115 @@ async def test_summarize_rejects_bad_arguments(store: UsageStore):
         await store.summarize(group_by="model; DROP TABLE usage_log;")
     with pytest.raises(ValueError, match="since"):
         await store.summarize(since="  ")
+
+
+# ------------------------------------------------------------------ 逐条查询
+
+
+async def _seed_calls(store: UsageStore) -> None:
+    """三次调用，命中率依次变差——用来观察「趋势」这件事本身。"""
+    await store.record(
+        thread_id="t1",
+        model="m",
+        prompt_tokens=1000,
+        completion_tokens=10,
+        cache_hit_tokens=900,
+    )
+    await store.record(
+        thread_id="t1",
+        model="m",
+        prompt_tokens=2000,
+        completion_tokens=20,
+        cache_hit_tokens=1000,
+    )
+    await store.record(
+        thread_id="t2",
+        model="m",
+        prompt_tokens=3000,
+        completion_tokens=30,
+        cache_hit_tokens=0,
+    )
+
+
+async def test_list_recent_returns_chronological_order(store: UsageStore):
+    """WHY 必须是时间正序：序列视角读的是「第几次开始掉」，
+    倒序返回会让趋势被读反——而那看起来只是「数据有点怪」。"""
+    await _seed_calls(store)
+
+    items, truncated = await store.list_recent(limit=10)
+
+    assert truncated is False
+    assert [item["prompt_tokens"] for item in items] == [1000, 2000, 3000]
+
+
+async def test_list_recent_keeps_the_newest_when_limited(store: UsageStore):
+    """WHY 关键：超出条数时留下的必须是**最近**的几条。
+
+    取成最早的几条，趋势恰好被读反；而错的那份数据与对的那份形状完全一样，
+    没有任何异常会暴露它。
+    """
+    await _seed_calls(store)
+
+    items, truncated = await store.list_recent(limit=2)
+
+    assert truncated is True
+    assert [item["prompt_tokens"] for item in items] == [2000, 3000]
+
+
+async def test_list_recent_filters_by_thread_and_window(store: UsageStore):
+    await _seed_calls(store)
+    await store.record(
+        thread_id="t1",
+        model="m",
+        prompt_tokens=7,
+        completion_tokens=1,
+        created_at="2000-01-01T00:00:00+00:00",
+    )
+
+    scoped, _ = await store.list_recent(thread_id="t1")
+    assert [item["prompt_tokens"] for item in scoped] == [1000, 2000, 7]
+
+    recent, _ = await store.list_recent(thread_id="t1", since="2020-01-01T00:00:00+00:00")
+    assert [item["prompt_tokens"] for item in recent] == [1000, 2000]
+
+
+async def test_list_recent_exposes_cache_counters(store: UsageStore):
+    await store.record(
+        thread_id="t1",
+        model="deepseek-flash",
+        prompt_tokens=1000,
+        completion_tokens=10,
+        cache_hit_tokens=900,
+    )
+
+    items, _ = await store.list_recent()
+
+    assert items[0]["model"] == "deepseek-flash"
+    assert items[0]["cache_hit_tokens"] == 900
+    assert items[0]["cache_miss_tokens"] == 0
+
+
+async def test_list_recent_empty_table(store: UsageStore):
+    items, truncated = await store.list_recent()
+
+    assert items == []
+    assert truncated is False
+
+
+async def test_list_recent_rejects_bad_limit(store: UsageStore):
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_recent(limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_recent(limit=201)
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_recent(limit="10")
+
+
+async def test_list_recent_propagates_db_failure(store: UsageStore):
+    await store._conn.close()
+
+    with pytest.raises(Exception):
+        await store.list_recent()
 
 
 # ------------------------------------------------------------------ 工具函数

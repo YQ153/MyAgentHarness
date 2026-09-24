@@ -24,6 +24,8 @@
         <button id="skills-open" type="button">技能</button>
         <!-- 审计日志：业务动作的留痕（工具调用 / 会话增删 / 记忆删除 / 审批决策），只读 -->
         <button id="audit-open" type="button">审计</button>
+        <!-- 用量面板：token 消耗与缓存命中率（前者回答花了多少，后者解释为什么是这么多） -->
+        <button id="usage-open" type="button">用量</button>
       </div>
     </header>
 
@@ -286,11 +288,68 @@
     </div>
   </div>
 
+  <!--
+    用量面板：数据来自 GET /api/usage。两个数字各有分工——合计回答「花了多少」，
+    缓存命中率回答「为什么是这么多」（DeepSeek 的命中价仅为未命中的 2%）。
+    「未知」与「0%」必须分开显示：前者是 provider 未上报，后者是一次都没命中。
+  -->
+  <div id="usage-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>用量</h3>
+        <button id="usage-close" type="button" class="icon-btn">&times;</button>
+      </div>
+      <p class="knowledge-hint">
+        只统计本机全部模型调用。「聚合」视角按模型 / 会话 / 日期给出总量；「按次」视角按
+        时间正序列出逐次调用，用来看缓存命中率随轮次的趋势。缓存命中率是「命中数 ÷ 输入
+        总数」——DeepSeek 的缓存命中价仅为未命中的 2%，这个数字直接决定成本；它依赖上游
+        上报命中数，上游不提供该字段时会显示 0.0%（与「确实没命中」外观相同）。
+      </p>
+      <div class="knowledge-toolbar">
+        <label class="usage-field">视角
+          <select id="usage-view" title="聚合看总量，按次看趋势">
+            <option value="aggregate">聚合</option>
+            <option value="series">按次</option>
+          </select>
+        </label>
+        <label class="usage-field">范围
+          <select id="usage-scope" title="只看当前会话，或全部会话">
+            <option value="all">全部</option>
+            <option value="thread">当前会话</option>
+          </select>
+        </label>
+        <label class="usage-field">窗口
+          <select id="usage-days" title="统计最近多少天">
+            <option value="7">7 天</option>
+            <option value="30">30 天</option>
+            <option value="90">90 天</option>
+          </select>
+        </label>
+        <!-- 分组只在聚合视角有意义：按次视角本身就是「不聚合」，这个选择器此时会被隐藏 -->
+        <label class="usage-field" id="usage-groupby-field">分组
+          <select id="usage-groupby" title="按哪个维度拆分">
+            <option value="model">模型</option>
+            <option value="thread">会话</option>
+            <option value="day">日期</option>
+          </select>
+        </label>
+        <button id="usage-refresh" type="button">刷新</button>
+      </div>
+      <div id="usage-caps" class="knowledge-caps"></div>
+      <div id="usage-list" class="knowledge-list"></div>
+    </div>
+  </div>
+
   <!-- 必须在 app.js 之前：助手消息的渲染依赖它的全局 Markdown -->
   <script src="/markdown.js"></script>
   <!-- 必须在 app.js 之前：工作区面板的状态由它的全局 WorkspaceScope 构造（错序时
        会话切换不会清掉上一条会话的目录缓存，且不报错） -->
   <script src="/workspace_scope.js"></script>
+  <!-- 助手消息里的 Mermaid 代码块 → 图。它自己不引第三方：真正那份 2.7 MB 的发行文件
+       由它在第一次扫到 mermaid 代码块时按需注入（绝大多数会话里没有图，
+       写在这里等于让每次打开页面都付一次解析代价）。 -->
+  <script src="/mermaid_render.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

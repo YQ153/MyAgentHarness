@@ -25,7 +25,15 @@ from tests.application.test_audit_enrichment import FakeCheckpointer, FakeGraphF
 from tests.conftest import StubSessionRegistry, make_config
 
 
-def _record(thread_id: str, title: str, *, archived: bool = False, owner_id: str = "") -> dict[str, Any]:
+def _record(
+    thread_id: str,
+    title: str,
+    *,
+    archived: bool = False,
+    owner_id: str = "",
+    workspace: str = "",
+    bound: bool = False,
+) -> dict[str, Any]:
     return {
         "thread_id": thread_id,
         "owner_id": owner_id,
@@ -35,6 +43,8 @@ def _record(thread_id: str, title: str, *, archived: bool = False, owner_id: str
         "turn_count": 1,
         "archived": archived,
         "archived_at": "2026-01-02T00:00:00+00:00" if archived else "",
+        "workspace": workspace,
+        "workspace_bound": bound,
     }
 
 
@@ -44,6 +54,7 @@ class StubThreadStore:
     def __init__(self, records: list[dict[str, Any]] | None = None) -> None:
         self._records = {item["thread_id"]: item for item in (records or [])}
         self.list_calls: list[dict[str, Any]] = []
+        self.list_id_calls: list[dict[str, Any]] = []
         self.reject_tags = False
         """置为 True 时 ``set_tags`` 抛 ValueError，模拟存储层的标签校验。"""
 
@@ -56,6 +67,14 @@ class StubThreadStore:
 
     async def count(self, **kwargs: Any) -> int:
         return len(self._records)
+
+    async def list_thread_ids(self, **kwargs: Any) -> list[str]:
+        """记录入参并交出现有记录：过滤语义由 ``tests/runtime/test_thread_store.py`` 覆盖。"""
+        self.list_id_calls.append(kwargs)
+        return list(self._records)
+
+    async def delete(self, thread_id: str) -> bool:
+        return self._records.pop(thread_id, None) is not None
 
     async def rename(self, thread_id: str, title: str) -> dict[str, Any] | None:
         record = self._records.get(thread_id)
@@ -97,8 +116,25 @@ class FailingRenameStore(StubThreadStore):
         raise aiosqlite.OperationalError("database disk image is malformed")
 
 
+class FailingListIdsStore(StubThreadStore):
+    """``list_thread_ids`` 必定失败的替身：用于验证批量删除的 500 映射。"""
+
+    async def list_thread_ids(self, **kwargs: Any) -> list[str]:
+        raise aiosqlite.OperationalError("database disk image is malformed")
+
+
+class StubRuns:
+    """运行服务替身：只记录「哪些会话的挂起审批登记被清掉」。"""
+
+    def __init__(self) -> None:
+        self.cleared: list[str] = []
+
+    def clear_hitl_pending(self, thread_id: str) -> None:
+        self.cleared.append(thread_id)
+
+
 def _build_client(
-    tmp_path, store: StubThreadStore | None, *, workspaces: Any = None
+    tmp_path, store: StubThreadStore | None, *, workspaces: Any = None, runs: Any = None
 ) -> TestClient:
     """构造只挂载业务路由的测试客户端。
 
@@ -106,6 +142,8 @@ def _build_client(
         tmp_path: 临时目录（配置的数据目录）。
         store: 会话存储替身；``None`` 表示让 ``app.state.threads`` 缺失（验 503）。
         workspaces: 会话根注册表替身；``None`` 表示用标准的那个。
+        runs: 运行服务替身；``None`` 表示用记录型替身（删除类端点会清理挂起审批登记，
+            缺了它那条路径会以 503 失败，而失败原因与用例意图无关）。
     """
     app = FastAPI()
     config = make_config(tmp_path)
@@ -121,6 +159,7 @@ def _build_client(
             workspaces=workspaces if workspaces is not None else StubSessionRegistry(config),
         )
     )
+    app.state.runs = runs if runs is not None else StubRuns()
     app.include_router(router)
     return TestClient(app)
 
@@ -364,3 +403,77 @@ def test_history_maps_root_failures_to_409(tmp_path, error):
 
     assert response.status_code == 409
     assert response.json()["detail"] == str(error)
+
+
+# ------------------------------------------------------------------ 按工作空间删除
+
+
+def test_list_response_carries_workspace_fields(tmp_path):
+    """清单必须带上文件根与归属：界面按它分组，缺了就只能把所有会话平铺。"""
+    store = StubThreadStore([_record("t1", "会话", workspace="/proj", bound=True)])
+    client = _build_client(tmp_path, store)
+
+    item = client.get("/api/threads").json()["items"][0]
+
+    assert item["workspace"] == "/proj"
+    assert item["workspace_bound"] is True
+
+
+def test_delete_workspace_forwards_filters_and_clears_hitl(tmp_path):
+    """过滤条件必须落到存储层，并逐条清理挂起审批登记（与单条删除同口径）。"""
+    store = StubThreadStore([_record("t1", "会话", workspace="/proj", bound=True)])
+    runs = StubRuns()
+    client = _build_client(tmp_path, store, runs=runs)
+
+    response = client.delete("/api/threads?workspace=/proj&bound=true&include_archived=true")
+
+    assert response.status_code == 200
+    call = store.list_id_calls[0]
+    assert call["workspace"] == "/proj"
+    assert call["workspace_bound"] is True
+    assert call["include_archived"] is True
+
+    body = response.json()
+    assert body["workspace"] == "/proj"
+    assert body["workspace_bound"] is True
+    assert body["requested"] == 1
+    assert [item["thread_id"] for item in body["items"]] == ["t1"]
+    assert "t1" not in store._records
+    assert runs.cleared == ["t1"]
+
+
+def test_delete_workspace_unbound_branch_omits_path(tmp_path):
+    """「未绑定工作空间」那一组只给 bound=false：它们的路径各不相同，没有可按的路径。"""
+    store = StubThreadStore([_record("m1", "会话", workspace="/sessions/m1")])
+    client = _build_client(tmp_path, store)
+
+    response = client.delete("/api/threads?bound=false")
+
+    assert response.status_code == 200
+    call = store.list_id_calls[0]
+    assert call["workspace"] is None
+    assert call["workspace_bound"] is False
+    # 归档只是清单可见性：不带上它，清干净的组会在「含已归档」里重新出现
+    assert call["include_archived"] is True
+
+
+def test_delete_workspace_rejects_missing_filters(tmp_path):
+    """不带过滤条件的批量删除等于清空全部会话，必须 400 且一条都不动。"""
+    store = StubThreadStore([_record("t1", "会话")])
+    client = _build_client(tmp_path, store)
+
+    response = client.delete("/api/threads")
+
+    assert response.status_code == 400
+    assert "必须给出" in response.json()["detail"]
+    assert store.list_id_calls == []
+    assert "t1" in store._records
+
+
+def test_delete_workspace_maps_listing_failure_to_500(tmp_path):
+    client = _build_client(tmp_path, FailingListIdsStore([_record("t1", "会话")]))
+
+    response = client.delete("/api/threads?bound=false")
+
+    assert response.status_code == 500
+    assert "枚举会话失败" in response.json()["detail"]

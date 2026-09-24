@@ -28,6 +28,7 @@ from agent.guardrails import build_interrupt_on, build_permissions
 from runtime.skill_view import sources_for_graph
 from agent.profiles import ensure_profiles_registered
 from agent.run_context import AgentRunContext
+from agent.tool_errors import ToolErrorConvergenceMiddleware
 from llm.registry import ModelRegistry, build_default_registry
 
 if TYPE_CHECKING:
@@ -141,9 +142,23 @@ def build_agent(
     # WHY 不用 cast 或 ``list[Any]`` 抹平：那会连「中间件声明的上下文必须与图同源」
     # 一起抹掉，而那条约束正是声明 ``context_schema`` 的意义。
     middleware: list[AgentMiddleware[Any, AgentRunContext, Any]] = [
+        # WHY 放在最前（工具包装链的最外层）：工具异常只有被这一层接住才不会终结整轮
+        # 运行，而它要接住的包括**内层中间件与工具本身**抛出的异常——顺序反了就只能
+        # 接住一部分。动机与边界见 agent/tool_errors.py。
+        ToolErrorConvergenceMiddleware(),
         TodoListMiddleware[Any, AgentRunContext](),
-        # WHY ContextEditingMiddleware：DeepSeek 无 prompt 缓存收益，控制
-        # 上下文成本只能靠裁剪历史的工具调用记录。
+        # WHY ContextEditingMiddleware：控制上下文的**长度**成本——大结果已落盘
+        # 留存，留在历史里的只是文本本身，裁掉较早的记录可减少每轮重算的输入量。
+        #
+        # WHY 不再断言「DeepSeek 无 prompt 缓存收益」（2026-09-23 证伪）：DeepSeek
+        # 的上下文硬盘缓存**默认开启**，命中价为未命中的 1/50（flash 空闲时段
+        # 0.02 元 vs 1 元每百万 token），明细由 prompt_cache_hit_tokens /
+        # prompt_cache_miss_tokens 上报，现已由 application.usage 采集。原文把
+        # 「不需要手写 cache_control 断点」误当成了「没有收益」，方向恰恰相反。
+        #
+        # 待实测：DeepSeek 缓存要求前缀完整匹配，而裁剪历史的中间段会破坏前缀
+        # 一致性，可能反而压低命中率。命中率现已可观测（每轮日志与 /api/usage），
+        # 据此再决定这条中间件是否保留。
         ContextEditingMiddleware[Any, AgentRunContext](),
         # WHY 限制单次运行调用次数：通用 Agent 最大的成本风险是模型陷入
         # 「读—改—再读」循环，必须有硬上限兜底。
@@ -193,11 +208,11 @@ def build_agent(
             tools=list(tools) if tools else None,
             skills=skill_sources or None,
             # WHY 来源可能来自根外（全局长期记忆经只读挂载暴露，见 agent.readonly_mount）：
-            # deepagents 对读不到的来源是静默跳过的，所以「来源」与「挂载」必须同源——
+            # dependents 对读不到的来源是静默跳过的，所以「来源」与「挂载」必须同源——
             # 两者都由 ``memory_plan`` 给出。
             memory=memory_plan.sources or None,
             # WHY 传 backend 而不是直接取规则：可执行 backend 下工具级权限
-            # 无法约束 execute，deepagents 会拒绝该组合；由 build_permissions
+            # 无法约束 execute，dependents 会拒绝该组合；由 build_permissions
             # 按能力裁剪并告警，见其 docstring。
             permissions=build_permissions(backend),
             interrupt_on=build_interrupt_on(

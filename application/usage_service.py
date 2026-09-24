@@ -11,10 +11,11 @@ WHY 独立于 ``HealthService``：健康检查是「进程此刻能不能干活�
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from application.dto import UsageGroup, UsageSummary
+from application.dto import UsageGroup, UsageCall, UsageSeries, UsageSummary
 from application.errors import NotFoundError
+from application.usage import cache_hit_rate
 from runtime.usage_store import window_start
 
 if TYPE_CHECKING:
@@ -25,6 +26,17 @@ logger = logging.getLogger(__name__)
 
 _VALID_GROUP_BY = ("model", "thread", "day")
 """允许的聚合维度；与 ``runtime.usage_store`` 的白名单保持一致。"""
+
+_DEFAULT_SERIES_ITEMS = 50
+"""「按次」视角默认返回的条数。"""
+
+_MAX_SERIES_ITEMS = 200
+"""「按次」视角允许请求的最大条数。
+
+WHY 与存储层上限同值却仍在这里拦：这一层拦能给调用方一个明确的 400（告诉他
+参数该改多少），存储层那道是数据边界、防的是绕过服务层的直接调用。两处的职责
+不同，因此都保留——但取值必须一致，否则会出现「服务层放行、存储层报错」的错位。
+"""
 
 
 class UsageService:
@@ -117,27 +129,147 @@ class UsageService:
             )
             raise RuntimeError("用量聚合失败") from exc
 
-        groups = [UsageGroup(**item) for item in result.get("groups") or []]
+        groups = [
+            UsageGroup(
+                **{
+                    **item,
+                    # WHY 命中率在这里补而不由存储层返回：``runtime`` 层不得反向
+                    # 依赖 ``application``（分层方向是 application → runtime），
+                    # 而命中率的定义只该有一处——聚合出的原始计数在应用层换算。
+                    "cache_hit_rate": cache_hit_rate(
+                        prompt_tokens=int(item.get("prompt_tokens") or 0),
+                        cache_hit_tokens=int(item.get("cache_hit_tokens") or 0),
+                    ),
+                }
+            )
+            for item in result.get("groups") or []
+        ]
+        prompt_total = int(result.get("prompt_tokens") or 0)
+        cache_hit_total = int(result.get("cache_hit_tokens") or 0)
         summary = UsageSummary(
             window_days=window_days,
             since=since,
             group_by=group_by,
             thread_id=normalized_thread,
-            prompt_tokens=int(result.get("prompt_tokens") or 0),
+            prompt_tokens=prompt_total,
             completion_tokens=int(result.get("completion_tokens") or 0),
             total_tokens=int(result.get("total_tokens") or 0),
-            run_count=int(result.get("run_count") or 0),
+            cache_hit_tokens=cache_hit_total,
+            cache_miss_tokens=int(result.get("cache_miss_tokens") or 0),
+            cache_hit_rate=cache_hit_rate(
+                prompt_tokens=prompt_total, cache_hit_tokens=cache_hit_total
+            ),
+            call_count=int(result.get("call_count") or 0),
             groups=groups,
         )
         logger.debug(
-            "用量汇总完成：window=%d 天 total=%d runs=%d",
+            "用量汇总完成：window=%d 天 total=%d runs=%d cache_hit_rate=%s",
             window_days,
             summary.total_tokens,
-            summary.run_count,
+            summary.call_count,
+            f"{summary.cache_hit_rate:.1%}" if summary.cache_hit_rate is not None else "未知",
         )
         return summary
 
+    async def series(
+        self,
+        *,
+        thread_id: str | None = None,
+        days: int | None = None,
+        limit: int | None = None,
+    ) -> UsageSeries:
+        """按时间正序返回最近的逐次调用用量（「按次」视角）。
+
+        WHY 与 ``summarize`` 并列而不是合并：两者回答的问题不同——聚合回答
+        「一共花了多少」，序列回答「它是怎么变成这个数的」。合并后返回类型只能
+        写成联合体，调用方每次都要先判断拿到的是哪一种。
+
+        Args:
+            thread_id: 只统计该会话；``None`` 表示不限会话。
+            days: 统计窗口天数；``None`` 表示取配置默认值。
+            limit: 返回条数上限；``None`` 表示取默认值。
+
+        Returns:
+            窗口内按时间正序排列的逐次调用记录，并标出是否被条数上限截断。
+
+        Raises:
+            ValueError: ``days`` / ``limit`` 非法（调用方应映射为 400）。
+            NotFoundError: ``thread_id`` 指向的会话不存在（调用方应映射为 404）。
+            RuntimeError: 查询失败（调用方应映射为 500）。
+        """
+        window_days = self._resolve_days(days)
+        items_limit = self._resolve_limit(limit)
+
+        normalized_thread: str | None = None
+        if thread_id is not None:
+            normalized_thread = await self._normalize_thread(thread_id)
+
+        since = window_start(window_days)
+
+        try:
+            rows, truncated = await self._usage_store.list_recent(
+                owner_id=None,
+                thread_id=normalized_thread,
+                since=since,
+                limit=items_limit,
+            )
+        except (ValueError, NotFoundError):
+            # 与 summarize 同一理由：参数错误与会话不存在要原样透出，路由层靠类型
+            # 把它们分别映射为 400 / 404；包成 RuntimeError 会把「会话不存在」
+            # 变成一次服务故障。
+            raise
+        except Exception as exc:
+            logger.exception(
+                "用量序列查询失败：thread=%s days=%s limit=%s",
+                normalized_thread,
+                window_days,
+                items_limit,
+            )
+            raise RuntimeError("用量序列查询失败") from exc
+
+        calls = [self._to_call(row) for row in rows]
+        logger.debug(
+            "用量序列完成：thread=%s 返回 %d 条（截断=%s）",
+            normalized_thread,
+            len(calls),
+            truncated,
+        )
+        return UsageSeries(
+            window_days=window_days,
+            since=since,
+            thread_id=normalized_thread,
+            limit=items_limit,
+            count=len(calls),
+            truncated=truncated,
+            items=calls,
+        )
+
     # ------------------------------------------------------------------ 内部
+
+    @staticmethod
+    def _to_call(row: dict[str, Any]) -> UsageCall:
+        """把存储层的一行原始记录转成对外契约。
+
+        WHY 命中率在这里重算而不由存储层给出：``runtime`` 不得反向依赖
+        ``application``，而命中率的定义只该有一处——它与聚合视角共用
+        ``application.usage.cache_hit_rate``，保证两个视角下同一个数是同一个值。
+        """
+        prompt_tokens = int(row.get("prompt_tokens") or 0)
+        cache_hit_tokens = int(row.get("cache_hit_tokens") or 0)
+        completion_tokens = int(row.get("completion_tokens") or 0)
+        return UsageCall(
+            created_at=str(row.get("created_at") or ""),
+            thread_id=str(row.get("thread_id") or ""),
+            model=str(row.get("model") or ""),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            cache_hit_tokens=cache_hit_tokens,
+            cache_miss_tokens=int(row.get("cache_miss_tokens") or 0),
+            cache_hit_rate=cache_hit_rate(
+                prompt_tokens=prompt_tokens, cache_hit_tokens=cache_hit_tokens
+            ),
+        )
 
     def _resolve_days(self, days: int | None) -> int:
         """校验并解析时间窗天数。"""
@@ -147,6 +279,21 @@ class UsageService:
         if resolved < 1 or resolved > self._config.usage_max_window_days:
             raise ValueError(
                 f"days 必须在 1..{self._config.usage_max_window_days} 之间，实际：{resolved}"
+            )
+        return resolved
+
+    def _resolve_limit(self, limit: int | None) -> int:
+        """校验并解析「按次」视角的条数上限。
+
+        WHY 在这里而不是路由层校验：路由层的 Query 约束只拦得住 HTTP 形态的调用，
+        而 CLI 与测试也会直接调服务；把规则放在服务层，两种入口得到同一份口径。
+        """
+        resolved = _DEFAULT_SERIES_ITEMS if limit is None else limit
+        if not isinstance(resolved, int) or isinstance(resolved, bool):
+            raise ValueError(f"limit 必须是整数，实际：{type(resolved).__name__}")
+        if resolved < 1 or resolved > _MAX_SERIES_ITEMS:
+            raise ValueError(
+                f"limit 必须在 1..{_MAX_SERIES_ITEMS} 之间，实际：{resolved}"
             )
         return resolved
 

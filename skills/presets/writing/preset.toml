@@ -3,6 +3,11 @@
 # 字段与校验规则见 runtime/skill_presets.py。`skills` 是**技能名白名单**：名字从全部
 # 来源解析（内置 skills/builtin、本场景目录 skills/presets/writing/、用户工作区的
 # .harness/skills/），同名时优先级 用户 > 预设 > 内置。
+#
+# 本场景关闭了通用技能的自动准入：写作任务不需要「代码审查」「项目脚手架」，而自动准入
+# 一旦开启就会把它们一并带进来。关掉之后，连仍想保留的那个通用技能（doc-to-markdown）
+# 也必须显式写出来——这正是 `include_general = false` 的含义：本场景只认白名单里那几个名字。
 title = "文档写作"
 description = "面向文档与写作任务：Markdown 规范整理、文档转换"
+include_general = false
 skills = ["markdown-style", "doc-to-markdown"]

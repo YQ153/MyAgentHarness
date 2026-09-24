@@ -15,12 +15,14 @@ from typing import Any
 from fastapi import HTTPException, Request, status
 
 from application.errors import (
+    ErrorCode,
     NotFoundError,
     SessionPresetLockedError,
     SessionRootLockedError,
     SessionRootNotReadyError,
     SessionRootUnavailableError,
 )
+from interfaces.web.errors import ApiError
 
 #: 解析会话根时属于「状态不允许」的那几种失败：都映射为 409。
 #:
@@ -83,14 +85,11 @@ def require_state(request: Request, attr: str, label: str) -> Any:
         已装配的服务实例。
 
     Raises:
-        HTTPException: 503，服务未初始化。
+        ApiError: 503 ``service_unavailable``，服务未初始化。
     """
     service = getattr(request.app.state, attr, None)
     if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"{label}未初始化",
-        )
+        raise ApiError(ErrorCode.SERVICE_UNAVAILABLE, f"{label}未初始化")
     return service
 
 

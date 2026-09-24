@@ -241,6 +241,8 @@ async def test_presets_endpoint_lists_scenarios_and_problems(
     assert [item["id"] for item in body["items"]] == ["coding"]
     assert body["items"][0]["title"] == "代码开发"
     assert body["items"][0]["skills"] == ["code-review"]
+    # 自动准入开关要随场景下发：界面靠它解释「没写在白名单里的通用技能为什么也在」。
+    assert body["items"][0]["include_general"] is True
     assert [Path(item["directory"]).name for item in body["problems"]] == ["broken"]
 
 
@@ -256,9 +258,12 @@ async def test_skills_endpoint_reports_the_scenario(
 
     assert body["preset"]["id"] == "coding"
     assert body["preset_id"] == "coding"
+    assert body["preset"]["include_general"] is True
     by_name = {item["name"]: item for item in body["items"]}
     assert by_name["code-review"]["in_preset"] is True
+    assert by_name["code-review"]["admitted_by"] == "whitelist"
     assert by_name["outside"]["in_preset"] is False
+    assert by_name["outside"]["admitted_by"] == "excluded"
     # 分类由来源推导：显式配的目录名就是 ``skills``，其虚拟路径即 ``/skills``（用户技能库），
     # 因此如实标成 user——而不是硬套「显式配置 = custom」。判据是挂在哪，不是谁指定的。
     assert by_name["code-review"]["category"] == "user"

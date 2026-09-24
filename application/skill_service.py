@@ -47,6 +47,17 @@ WHY 由**来源虚拟路径**推导，而不是给技能包加一个字段：分
 这类自相矛盾，而面板与 Agent 会各信一边。
 """
 
+ADMITTED_BY_WHITELIST = "whitelist"
+ADMITTED_BY_GENERAL = "general"
+ADMITTED_BY_UNRESTRICTED = "unrestricted"
+ADMITTED_BY_EXCLUDED = "excluded"
+"""技能**为什么**进了（或没进）本场景的技能集。
+
+WHY 把归因一并算出来而不是只给一个布尔：场景过滤有三种不同的成立方式，而「不在本场景内」
+与「被用户停用」在排查时是两件事。只回布尔的话，用户删掉白名单里的一行之后只能靠猜——
+那一行到底是「唯一让它生效的东西」（``whitelist``），还是「写了也白写」（``general``）。
+"""
+
 
 def list_presets(config: AppConfig) -> PresetCatalog:
     """列出全部场景预设（**不需要会话上下文**）。
@@ -166,6 +177,10 @@ class SkillService:
         三个来源（通用 / 场景预设 / 用户库），而来源是"整目录"粒度的——只有把三处的
         技能先全部发现、再按名字筛，才能表达「这个场景要这几项，无论它们来自哪里」。
 
+        WHY 通用技能的自动准入也在这里判：它需要「这个名字是不是随应用交付的通用技能」，
+        而名字与来源的对应关系只有巡检结果里有——``runtime.skill_presets`` 手上只有名字。
+        自动准入开启时（默认），白名单只需写**非通用**的技能。
+
         Args:
             state_scope: 启停状态的**作用域**（默认全局），与工作区是两个维度：
                 工作区决定「有哪些技能包可用」，启停作用域决定「其中哪些被选中」；
@@ -180,6 +195,7 @@ class SkillService:
         """
         inventory, enabled = await self._snapshot(state_scope=state_scope)
         preset = self.preset()
+        general = await self._general_names(preset)
         # WHY 只求一次来源表：``skill_host_dir`` 每次调用都会重扫一遍技能目录，而
         # 「有几个技能就扫几遍」在技能多时纯属浪费 IO。
         sources = self._scope.skill_sources()
@@ -187,7 +203,10 @@ class SkillService:
         for package in inventory.packages:
             # WHY 场景过滤排在启停之前：两者都满足才进视图，而这个顺序只影响日志归因
             # ——「不在本场景内」与「被用户停用」是两件不同的事，排查时不能混为一谈。
-            if preset is not None and not preset.allows(package.name):
+            admission = self._admission(
+                preset, package.name, is_general=package.name in general
+            )
+            if admission == ADMITTED_BY_EXCLUDED:
                 continue
             if not enabled.get(package.name, DEFAULT_ENABLED):
                 continue
@@ -203,9 +222,10 @@ class SkillService:
             entries.append(ViewEntry(name=package.name, source_dir=source_dir))
         result = await asyncio.to_thread(rebuild_view, self._view_dir, entries)
         logger.info(
-            "技能视图已重建：view=%s preset=%s 启用 %d，移除 %d，跳过 %d",
+            "技能视图已重建：view=%s preset=%s 通用自动准入=%s 启用 %d，移除 %d，跳过 %d",
             self._view_dir,
             self._scope.preset or "(不限定)",
+            "开" if (preset is None or preset.include_general) else "关",
             len(result.copied),
             len(result.removed),
             len(result.skipped),
@@ -219,7 +239,8 @@ class SkillService:
 
         Returns:
             含 ``items`` / ``unloadable`` / ``load_errors`` / ``view_path`` /
-            ``graph_sources`` / ``view_warning`` 的结果字典。
+            ``graph_sources`` / ``view_warning`` 的结果字典；``items`` 每项还带
+            ``admitted_by``（见 :data:`ADMITTED_BY_*`）。
 
         Raises:
             ValueError: ``state_scope`` 非法。
@@ -228,6 +249,7 @@ class SkillService:
         sources, warning = self.graph_sources()
         catalog = self.presets()
         preset = self._resolve_preset(catalog)
+        general = await self._general_names(preset)
         # WHY 单独算出「白名单里有、但当前来源里找不到」的技能名：场景里的名字写对了而技能
         # 包没交付（或名字打错）时，视图会安静地少一项——那正是「我选了场景，Agent 却不会
         # 那项技能」这种无从解释的现象。这里把它变成一条可读的清单。
@@ -235,6 +257,14 @@ class SkillService:
         missing = sorted(
             name for name in (preset.skills if preset is not None else ()) if name not in known
         )
+        # WHY 先算一遍归因再组装条目：``in_preset`` 与 ``admitted_by`` 是同一次判定的两个
+        # 侧面（布尔 + 原因），各判一次迟早出现「说不在场景内、又给出 whitelist」这种自相矛盾。
+        admissions = {
+            package.name: self._admission(
+                preset, package.name, is_general=package.name in general
+            )
+            for package in inventory.packages
+        }
 
         return {
             # WHY 响应字段仍叫 ``scope`` 而参数改叫 ``state_scope``：前者是既有 API 契约
@@ -246,6 +276,9 @@ class SkillService:
                     "title": preset.title,
                     "description": preset.description,
                     "skills": list(preset.skills),
+                    # WHY 把开关一并下发：白名单里没写的通用技能到底能不能用，取决于它。
+                    # 少了这一位，界面无法解释「这个技能不在白名单里、却出现在视图里」。
+                    "include_general": preset.include_general,
                 }
                 if preset is not None
                 else None
@@ -268,7 +301,10 @@ class SkillService:
                     "enabled": enabled.get(package.name, DEFAULT_ENABLED),
                     # WHY 由服务端算 ``in_preset`` 而不是让前端比对白名单：清单可能来自不同
                     # 场景的会话，而「属不属于本场景」是本次请求上下文里的判定结果。
-                    "in_preset": preset is None or preset.allows(package.name),
+                    "in_preset": admissions[package.name] != ADMITTED_BY_EXCLUDED,
+                    # WHY 连原因一起下发：用户删掉白名单里某一行之后，需要能看出那一行是
+                    # 「唯一让它生效的东西」还是「写了也白写」（通用技能本来就自动准入）。
+                    "admitted_by": admissions[package.name],
                     "problems": list(package.problems),
                 }
                 for package in inventory.packages
@@ -335,6 +371,51 @@ class SkillService:
         }
 
     # ------------------------------------------------------------------ 内部
+
+    async def _general_names(self, preset: SkillPreset | None) -> frozenset[str]:
+        """随应用交付的**通用技能**名集合（``skills/builtin/`` 下的那些）。
+
+        WHY 单独再巡检一次通用目录、而不是看清单里每个技能的来源：清单已按「用户 > 预设 >
+        通用」去重，同名被覆盖之后只剩胜出那一个。于是「用户放了一个自己的 ``code-review``」
+        会让它的来源变成用户目录，而按来源判定就会**反过来把它踢出场景**——与用户「我要改
+        这个技能」的意图正好相反。只认「这个名字在通用目录里存在」，两种情形就都对了。
+
+        WHY 只在确实需要时才巡检：未绑定场景、场景没写白名单，或场景关掉了自动准入时，
+        这个集合不参与任何判定，多扫一次纯属浪费。
+
+        Args:
+            preset: 本根绑定的场景；``None`` 表示不限定。
+
+        Returns:
+            通用技能名集合。为空表示「没有通用技能这个概念」：显式配置了 ``SKILL_DIRS``
+            时通用目录不再是来源（那些技能一律算 custom），或通用目录读不到——两种情形下
+            自动准入都不生效，而白名单判定照旧。
+        """
+        if preset is None or not preset.skills or not preset.include_general:
+            return frozenset()
+        inventory = await asyncio.to_thread(
+            inspect_skills,
+            self._scope.root,
+            [VIRTUAL_BUILTIN_SKILLS],
+            mounts=self._scope.mount_table,
+        )
+        return frozenset(inventory.names)
+
+    def _admission(self, preset: SkillPreset | None, name: str, *, is_general: bool) -> str:
+        """该技能为何（或为何不）属于本场景，返回 :data:`ADMITTED_BY_*` 之一。
+
+        WHY 判定只走 ``SkillPreset.allows`` 一处：把「白名单怎么算」复制到这里，改口径时
+        必然漏一处，而症状是「面板说在场景内、视图里却没有」。这里只做**归因**。
+        """
+        if preset is None:
+            return ADMITTED_BY_UNRESTRICTED
+        if not preset.allows(name, is_general=is_general):
+            return ADMITTED_BY_EXCLUDED
+        if not preset.skills:
+            return ADMITTED_BY_UNRESTRICTED
+        if name in preset.skills:
+            return ADMITTED_BY_WHITELIST
+        return ADMITTED_BY_GENERAL
 
     async def _snapshot(self, *, state_scope: str):
         """一次取齐「技能清单」与「启用状态」。

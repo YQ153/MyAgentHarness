@@ -14,6 +14,7 @@ from typing import Any
 import aiosqlite
 import pytest
 
+import application.thread_service as thread_service_module
 from application.dto import DeleteOutcome
 from application.errors import NotFoundError
 from application.thread_service import ThreadService
@@ -64,6 +65,32 @@ class FailingArchiveStore(ThreadMetaStore):
 
     async def set_archived(self, thread_id: str, archived: bool) -> dict[str, Any] | None:
         raise aiosqlite.OperationalError("database disk image is malformed")
+
+
+class FailingListIdsStore(ThreadMetaStore):
+    """``list_thread_ids`` 必定失败的存储替身。"""
+
+    async def list_thread_ids(self, **kwargs: Any) -> list[str]:
+        raise aiosqlite.OperationalError("database disk image is malformed")
+
+
+class RacingDeleteStore(ThreadMetaStore):
+    """把「记录已被别的请求删掉」这个并发窗口固定下来的存储替身。
+
+    WHY 需要它：``vanish`` 里的会话在 ``delete`` 时返回 ``False``（本次动作没有命中任何行），
+    而其记录确实已经不在库里——这正是「枚举之后、删除之前被别处删掉」的形态。
+    """
+
+    def __init__(self, conn: Any) -> None:
+        super().__init__(conn)
+        self.vanish: set[str] = set()
+
+    async def delete(self, thread_id: str) -> bool:
+        if thread_id in self.vanish:
+            self.vanish.discard(thread_id)
+            await super().delete(thread_id)
+            return False
+        return await super().delete(thread_id)
 
 
 def _service(
@@ -316,3 +343,161 @@ async def test_history_opens_a_session_whose_directory_does_not_exist_yet(
     assert messages == []
     assert factory.scopes[0].root == config.session_dir("t1")
     assert config.session_dir("t1").is_dir(), "解析时就该把专属目录建出来"
+
+
+# ------------------------------------------------------------------ 按工作空间清理
+
+
+async def test_delete_threads_by_workspace_removes_only_that_workspace(tmp_path, thread_store):
+    """批量删除只覆盖该工作空间——跨组误删是这类接口最严重的失败。
+
+    WHY 单列一条：路径要经过「写入时归一」与「过滤时归一」两道，任何一道不一致都会让
+    「删这一组」变成「一条都没删到」，而接口照样返回成功（0 条）。
+    """
+    audit = RecordingAuditStore()
+    service = _service(tmp_path, thread_store, audit=audit)
+    root = str(tmp_path / "proj")
+    other = str(tmp_path / "other")
+    for thread_id in ("a1", "a2"):
+        await thread_store.create(thread_id, workspace=root, workspace_bound=True)
+    await thread_store.create("b1", workspace=other, workspace_bound=True)
+    await thread_store.create("m1", workspace=str(tmp_path / "sessions" / "m1"))
+
+    result = await service.delete_threads_by_workspace(workspace=root, workspace_bound=True)
+
+    assert result.requested == 2
+    assert result.deleted + result.partial == 2
+    assert result.failed == 0
+    assert await thread_store.get("a1") is None
+    assert await thread_store.get("a2") is None
+    assert await thread_store.get("b1") is not None
+    assert await thread_store.get("m1") is not None
+
+    event = audit.of_type("thread_workspace_delete")[-1]
+    assert event["details"]["requested"] == 2
+    assert event["details"]["workspace"] == root
+    assert event["outcome"] == "success"
+
+
+async def test_delete_threads_by_workspace_cleans_unbound_group(tmp_path, thread_store):
+    """``bound=False`` 清理「未绑定工作空间」那一组（它们的路径各不相同）。
+
+    WHY 单列一条：这一组只能按归属过滤——界面上「未绑定工作空间」分组的删除按钮走的正是
+    这条分支，按路径过滤会一条都命中不到。
+    """
+    service = _service(tmp_path, thread_store)
+    await thread_store.create("m1", workspace=str(tmp_path / "sessions" / "m1"))
+    await thread_store.create("m2", workspace=str(tmp_path / "sessions" / "m2"))
+    await thread_store.create("b1", workspace=str(tmp_path / "proj"), workspace_bound=True)
+
+    result = await service.delete_threads_by_workspace(workspace_bound=False)
+
+    assert result.requested == 2
+    assert result.workspace_bound is False
+    assert await thread_store.get("m1") is None
+    assert await thread_store.get("m2") is None
+    assert await thread_store.get("b1") is not None
+
+
+async def test_delete_threads_by_workspace_includes_archived(tmp_path, thread_store):
+    """归档只是清单可见性：按工作空间清理必须连它一起收掉。
+
+    WHY 单列一条：漏掉已归档的会话会让「清空这个工作空间」之后的清单在勾上「含已归档」时
+    又把这一组显示出来，而用户刚刚才确认过要删掉它。
+    """
+    service = _service(tmp_path, thread_store)
+    root = str(tmp_path / "proj")
+    await thread_store.create("a1", workspace=root, workspace_bound=True)
+    await service.set_archived("a1", True)
+
+    result = await service.delete_threads_by_workspace(workspace=root, workspace_bound=True)
+
+    assert result.requested == 1
+    assert await thread_store.get("a1") is None
+
+
+async def test_delete_threads_by_workspace_rejects_missing_filters(tmp_path, thread_store):
+    """两个条件都不给等于清空全部会话：必须拒绝，且一条都不删。
+
+    WHY 单列一条：这是本接口唯一可能造成大规模误删的入口，而它距一次「前端漏拼查询参数」
+    只有一步之遥。
+    """
+    service = _service(tmp_path, thread_store)
+    await thread_store.create("b1", workspace=str(tmp_path / "proj"), workspace_bound=True)
+
+    with pytest.raises(ValueError, match="必须给出"):
+        await service.delete_threads_by_workspace()
+
+    assert await thread_store.get("b1") is not None
+
+
+@pytest.mark.parametrize("bad", ["   ", 123])
+async def test_delete_threads_by_workspace_rejects_bad_path(tmp_path, thread_store, bad):
+    """空串不能当成「未确定根」那一组：路径过滤与归属过滤是两件事，混用会删错批。"""
+    service = _service(tmp_path, thread_store)
+
+    with pytest.raises(ValueError):
+        await service.delete_threads_by_workspace(workspace=bad)
+
+
+async def test_delete_threads_by_workspace_rejects_non_bool_flags(tmp_path, thread_store):
+    service = _service(tmp_path, thread_store)
+    await thread_store.create("b1", workspace=str(tmp_path / "proj"), workspace_bound=True)
+
+    with pytest.raises(ValueError, match="workspace_bound"):
+        await service.delete_threads_by_workspace(workspace_bound="yes")
+    with pytest.raises(ValueError, match="include_archived"):
+        await service.delete_threads_by_workspace(workspace_bound=False, include_archived="yes")
+
+
+async def test_delete_threads_by_workspace_rejects_oversized_batch(
+    tmp_path, thread_store, monkeypatch
+):
+    """超过批量上限时整批拒绝，且一条都不删。
+
+    WHY 用 monkeypatch 而不是真造 500 条会话：这里要验的是「超限时不做部分删除」这条决策，
+    与会话条数无关；造几百条只会让用例变慢，并把失败信息淹在数据量里。
+    """
+    monkeypatch.setattr(thread_service_module, "_MAX_WORKSPACE_DELETE", 1)
+    service = _service(tmp_path, thread_store)
+    root = str(tmp_path / "proj")
+    for index in range(2):
+        await thread_store.create(f"t{index}", workspace=root, workspace_bound=True)
+
+    with pytest.raises(ValueError, match="超过 1 条"):
+        await service.delete_threads_by_workspace(workspace=root, workspace_bound=True)
+
+    assert await thread_store.get("t0") is not None
+    assert await thread_store.get("t1") is not None
+
+
+async def test_delete_threads_by_workspace_listing_failure_is_runtime_error(
+    tmp_path, thread_store
+):
+    """列举失败必须是 RuntimeError：路由靠它映射 500，而吞掉会变成「删除成功 0 条」。"""
+    service = _service(tmp_path, FailingListIdsStore(thread_store._conn))
+
+    with pytest.raises(RuntimeError, match="枚举会话失败"):
+        await service.delete_threads_by_workspace(workspace_bound=False)
+
+
+async def test_delete_threads_by_workspace_reports_raced_removal(tmp_path, thread_store):
+    """枚举到但已被并发删掉的会话记成「不存在」，不把整批变成失败。
+
+    WHY 用替身固定那个窄窗口：「先 get 到记录、随后 delete 落空」只在另一个请求刚好插进来
+    时出现。把它固定下来，才能验证这条分类不会掉进 FAILED——那会把一次成功报成故障。
+    """
+    store = RacingDeleteStore(thread_store._conn)
+    service = _service(tmp_path, store)
+    root = str(tmp_path / "proj")
+    await store.create("a1", workspace=root, workspace_bound=True)
+    await store.create("a2", workspace=root, workspace_bound=True)
+    store.vanish.add("a2")
+
+    result = await service.delete_threads_by_workspace(workspace=root, workspace_bound=True)
+
+    assert result.requested == 2
+    assert result.not_found == 1
+    assert result.failed == 0
+    assert await store.get("a1") is None
+    assert await store.get("a2") is None

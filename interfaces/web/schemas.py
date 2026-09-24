@@ -269,6 +269,14 @@ class SkillInfo(BaseModel):
         default=True,
         description="是否属于本条会话的场景白名单；false 表示它不会进入本次的技能视图",
     )
+    admitted_by: str = Field(
+        default="",
+        description=(
+            "为什么进了（或没进）本次技能集：whitelist（写在场景白名单里）/ "
+            "general（通用技能，场景未关闭自动准入）/ unrestricted（未绑定场景或白名单为空）/ "
+            "excluded（不在本场景内，不会进入视图）"
+        ),
+    )
     problems: list[str] = Field(
         default_factory=list,
         description="上游只告警不报错的问题（如 name 与目录名不符）；非空表示该技能形态可疑",
@@ -290,7 +298,14 @@ class PresetInfo(BaseModel):
     description: str = Field(default="", description="一句话说明这个场景适合什么任务")
     skills: list[str] = Field(
         default_factory=list,
-        description="技能名白名单；空列表表示不限定（接受全部技能）",
+        description="技能名白名单（只写非通用的技能）；空列表表示不限定（接受全部技能）",
+    )
+    include_general: bool = Field(
+        default=True,
+        description=(
+            "通用技能（skills/builtin/）是否不写进白名单也能用；"
+            "false 表示该场景只认白名单里那几个名字"
+        ),
     )
 
 

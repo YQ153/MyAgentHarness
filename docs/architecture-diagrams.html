@@ -493,7 +493,7 @@
     <tbody>
       <tr><td><code>interfaces/cli.py</code></td><td>进程内交互</td><td><code>run_cli</code>(L196) · <code>main_sync</code>(L283) · <code>_run_turn</code>(L147) · <code>ask_human</code>(L96) · <code>render_event</code>(L38)</td></tr>
       <tr><td><code>web/health.py</code></td><td>无前缀 · <b>无需凭据</b></td><td><code>GET /health</code> · <code>GET /ready</code> · <code>GET /metrics</code></td></tr>
-      <tr><td><code>web/routes.py</code></td><td><code>/api</code></td><td><code>GET /api/models</code> · <code>GET|POST /api/workspaces/dirs|pick</code> · <code>GET /api/tools</code> · <code>GET /api/usage</code> · <code>GET|DELETE /api/memories</code> · <code>POST|GET /api/threads</code> · <code>PATCH|DELETE /api/threads/{id}</code> · <code>GET /api/threads/{id}/export</code> · <code>POST /api/threads/import</code> · <code>GET /api/threads/{id}</code></td></tr>
+      <tr><td><code>web/routes.py</code></td><td><code>/api</code></td><td><code>GET /api/models</code> · <code>GET|POST /api/workspaces/dirs|pick</code> · <code>GET /api/tools</code> · <code>GET /api/usage</code> · <code>GET|DELETE /api/memories</code> · <code>POST|GET /api/threads</code> · <code>DELETE /api/threads（按 workspace/bound 清空一组）</code> · <code>PATCH|DELETE /api/threads/{id}</code> · <code>GET /api/threads/{id}/export</code> · <code>POST /api/threads/import</code> · <code>GET /api/threads/{id}</code></td></tr>
       <tr><td><code>web/routes.py</code> · SSE</td><td><code>/api</code> · <code>text/event-stream</code></td><td><b><code>POST /api/threads/{id}/runs</code></b> · <b><code>POST .../resume</code></b> · <b><code>POST .../regenerate</code></b> · <b><code>POST .../edit</code></b> · <code>POST .../stop</code> · <code>GET .../branches</code> · <code>POST .../branches/activate</code></td></tr>
       <tr><td><code>web/workspace_routes.py</code></td><td><code>/api/workspace</code></td><td><code>GET /info</code> · <code>GET /files</code> · <code>GET /file</code></td></tr>
       <tr><td><code>web/attachment_routes.py</code></td><td>无前缀</td><td><code>GET /api/attachments/limits</code> · <code>POST|GET /api/threads/{id}/attachments</code> · <code>DELETE .../attachments/{attachment_id}</code></td></tr>
@@ -567,7 +567,7 @@ skills         = sources_for_graph(...)                              # /.skills-
 memory         = memory_plan.sources
 permissions    = build_permissions(backend)
 interrupt_on   = build_interrupt_on(execution_mode, sandbox_tier, require_approval)
-middleware     = [TodoListMiddleware, ContextEditingMiddleware,
+middleware     = [ToolErrorConvergenceMiddleware, TodoListMiddleware, ContextEditingMiddleware,
                   ModelCallLimitMiddleware(run_limit=max_model_calls_per_run, exit_behavior="end")]
 checkpointer   = AsyncSqliteSaver
 store          = AsyncSqliteStore
@@ -753,7 +753,7 @@ name           = "universal-agent"</code></pre>
     宁可拒绝运行，也不悄悄换成更弱的隔离。
   </div>
 </div>
-<p class="cap">相关配置：<code>execution_mode</code> · <code>sandbox_tier</code> · <code>sandbox_require_approval</code> · <code>sandbox_wsl_distro</code>（见 <code>config.py</code>）。
+<p class="cap">相关配置：<code>execution_mode</code> · <code>sandbox_tier</code> · <code>sandbox_require_approval</code> · <code>sandbox_wsl_distro</code>（见 <code>config/</code> 包）。
 审批联动：<code>agent/guardrails.py::build_interrupt_on(execution_mode, sandbox_tier, require_approval)</code>。</p>
 
 <!-- ============================================================ 图 8 -->
@@ -1094,7 +1094,7 @@ print(g.draw_mermaid()); print(sorted(g.nodes), list(g.edges))
     <tr><td>装配流程与生命周期</td><td><code>bootstrap/core.py::build_app_context</code> · <code>interfaces/web/app.py::_lifespan</code></td></tr>
     <tr><td>端到端链路各跳</td><td><code>application/run_service.py</code>(<code>stream</code> L272 / <code>resume</code> L546 / <code>_consume</code> L733 / <code>_iterate</code> L851 / <code>_stream_graph</code> L1032)</td></tr>
     <tr><td>路由与端点</td><td><code>interfaces/web/routes.py</code>(<code>APIRouter(prefix="/api")</code> L74 · <code>_encode_stream</code> L896) 及各 <code>*_routes.py</code></td></tr>
-    <tr><td>存储表与落盘路径</td><td><code>runtime/*_store.py</code> · <code>runtime/sqlite_lifecycle.py</code> · <code>config.py</code>(<code>db_path</code> L547 · <code>resolved_sessions_root</code> L1318 · <code>roots_store_root</code> L1330 · <code>SessionRoot.storage_dir</code> L1761 · <code>SessionRoot.knowledge_db</code> L1816)</td></tr>
+    <tr><td>存储表与落盘路径</td><td><code>runtime/*_store.py</code> · <code>runtime/sqlite_lifecycle.py</code> · <code>config/</code>(<code>db_path</code> <code>config/settings/paths.py</code> L39 · <code>resolved_sessions_root</code> <code>config/app_config.py</code> L108 · <code>roots_store_root</code> L120 · <code>SessionRoot.storage_dir</code> <code>config/session_root.py</code> L286 · <code>SessionRoot.knowledge_db</code> L341)</td></tr>
     <tr><td>沙箱三档与 auto 顺序</td><td><code>runtime/sandbox/factory.py</code>(<code>resolve_tier</code> L55 · <code>build_sandbox_runner</code> L88 · <code>_create_runner</code> L154)</td></tr>
     <tr><td>技能 / 知识库 / 记忆</td><td><code>runtime/skill_view.py</code> · <code>runtime/skill_store.py</code> · <code>knowledge_runtime.py</code> · <code>runtime/knowledge_store.py</code> · <code>agent/run_context.py</code></td></tr>
     <tr><td>工具集清单</td><td><code>agent/tools.py::BUILTIN_TOOL_NAMES</code>(L57-69) · <code>web_tools.py::register_tools</code>(L472) · <code>knowledge_tools.py::register_tools</code>(L157)</td></tr>
