@@ -35,6 +35,7 @@ from application.dto import (
     ThreadExport,
     ThreadListResult,
     ThreadSummary,
+    WorkspaceDeleteResult,
 )
 from application.errors import NotFoundError
 from application.ports import AuditLog, ThreadMetadataStore
@@ -57,6 +58,15 @@ if TYPE_CHECKING:
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+_MAX_WORKSPACE_DELETE = 500
+"""「按工作空间清理会话」一次允许删除的条数上限。
+
+WHY 要有上限：这个动作一次删掉的是一个工作空间下的**全部**会话（含检查点），期间持有
+数据库写锁。无上限时，一个被长期复用的工作空间可能攒下几千条会话，一次请求就会让写入
+停顿很久、超时后前端只看到失败，而部分删除已经落库——留下一个「删了一半」的状态。
+超限时如实拒绝，让用户分批处理，比删一半要诚实。
+"""
 
 
 def _restore_messages(messages: list[HistoryMessage]) -> tuple[list[Any], int]:
@@ -749,6 +759,171 @@ class ThreadService:
             outcome=outcome,
             checkpoint_removed=checkpoint_removed,
             detail=detail,
+        )
+
+    async def delete_threads_by_workspace(
+        self,
+        *,
+        workspace: str | None = None,
+        workspace_bound: bool | None = None,
+        include_archived: bool = True,
+    ) -> WorkspaceDeleteResult:
+        """按工作空间清理会话：删掉该分组下的**全部**会话（元数据 + 检查点 + 附件）。
+
+        WHY 需要它而不是让界面逐条调 ``delete_thread``：界面上的分组是「同一个工作空间下
+        的全部会话」，而清单接口是按页返回的——照当前这一页的 ID 逐条删，会漏掉未显示的
+        那些。用户以为清空了、实际没有，而残留的会话仍然占着磁盘、也会继续出现在后续
+        清单里。这里由服务端按同一个过滤条件解析全集，与界面上「这一组」的含义严格一致。
+
+        WHY 不删除磁盘上的任何目录：这一组里的根可能是用户自己的项目目录（删掉等于毁掉
+        他的仓库），也可能是应用为某条会话建的专属目录（里面的产物他可能还要）。本方法的
+        职责只有「会话」这一份数据，目录的处置交给人——「删除」这个词在界面上会写明这一点。
+
+        WHY 逐条走 ``delete_thread`` 而不是一条 ``DELETE FROM``：删一条会话远不只是删一行
+        元数据——它要清检查点、按**该会话绑定的根**清附件、写审计。批量 SQL 会跳过这些，
+        留下无法再被任何入口清掉的残留。
+
+        Args:
+            workspace: 工作空间绝对路径（内部归一后精确比较）；``None`` 表示不按路径过滤。
+            workspace_bound: 根是否由用户显式选定；``None`` 表示不按归属过滤。
+                ``False`` 用来清理「未绑定工作空间」的那一组（应用为它们建的专属目录）。
+            include_archived: 是否连同已归档的会话一起删除。默认 ``True``：归档只是清单
+                可见性，清理一个工作空间时把它留下会让清完的组又冒出来。
+
+        Returns:
+            汇总计数与逐条结果。
+
+        Raises:
+            ValueError: 两个过滤条件都没给（等于清空全部会话）、取值类型不对，或命中条数
+                超过 ``_MAX_WORKSPACE_DELETE``。
+            RuntimeError: 枚举目标会话失败（调用方应映射为 500）。
+        """
+        # WHY 拒绝「什么条件都不给」：那个请求的语义是「删除全部会话」，而它离一次误操作
+        # （前端漏拼一个查询参数）只有一步之遥。这里没有「清空一切」这个产品动作，因此
+        # 宁可 400 也不做一件用户没说过要做的破坏性事情。
+        if workspace is None and workspace_bound is None:
+            raise ValueError(
+                "必须给出 workspace 或 bound 至少一项：不带过滤条件的批量删除等于清空全部会话"
+            )
+        if workspace is not None:
+            if not isinstance(workspace, str):
+                raise ValueError(f"workspace 必须是字符串，实际：{type(workspace).__name__}")
+            if not workspace.strip():
+                # WHY 把空串判为非法而不是当成「未确定根」那一组：路径过滤与归属过滤是两件事，
+                # 而空串在两种写法下含义不同（空路径 vs bound=false），放行会让调用方以为
+                # 自己按路径过滤了，实际匹配的是另一批会话。
+                raise ValueError("workspace 不能是空白字符串；要清理「未绑定工作空间」请用 bound=false")
+        if workspace_bound is not None and not isinstance(workspace_bound, bool):
+            raise ValueError(
+                f"workspace_bound 必须是布尔值，实际：{type(workspace_bound).__name__}"
+            )
+        if not isinstance(include_archived, bool):
+            raise ValueError(
+                f"include_archived 必须是布尔值，实际：{type(include_archived).__name__}"
+            )
+
+        # WHY 多取一条：返回长度超过上限就说明还有更多命中项，此时拒绝整批（而不是删前 N 条）
+        # ——「删了一半」无法向用户解释，也没有任何界面能告诉他剩下的在哪里。
+        try:
+            ids = await self._thread_store.list_thread_ids(
+                workspace=workspace,
+                workspace_bound=workspace_bound,
+                include_archived=include_archived,
+                limit=_MAX_WORKSPACE_DELETE + 1,
+            )
+        except ValueError:
+            # 参数错误原样透出：路由要把它映射成 400 而不是 500
+            raise
+        except Exception as exc:
+            logger.exception(
+                "按工作空间枚举会话失败：workspace=%s bound=%s", workspace, workspace_bound
+            )
+            raise RuntimeError("按工作空间枚举会话失败") from exc
+
+        if len(ids) > _MAX_WORKSPACE_DELETE:
+            raise ValueError(
+                f"该工作空间下的会话超过 {_MAX_WORKSPACE_DELETE} 条，一次删除太多会长时间占用"
+                "数据库写锁；请先归档一部分，或逐个删除"
+            )
+
+        logger.info(
+            "开始按工作空间清理会话：workspace=%s bound=%s 命中=%d",
+            workspace,
+            workspace_bound,
+            len(ids),
+        )
+
+        items: list[DeleteResult] = []
+        for thread_id in ids:
+            try:
+                items.append(await self.delete_thread(thread_id))
+            except NotFoundError:
+                # 并发下已被别处删掉（另一个页面、或上一次请求的残留）：按「不存在」记账并继续。
+                # WHY 不中断整批：这个动作的意图是「让这个工作空间干净」，一条已被删掉的会话
+                # 恰好是意图已满足，让它把剩下的几十条都卡住只是把一次成功变成一次失败。
+                logger.info("批量删除时发现会话已不存在：thread=%s", thread_id)
+                items.append(
+                    DeleteResult(
+                        thread_id=thread_id,
+                        outcome=DeleteOutcome.NOT_FOUND,
+                        checkpoint_removed=False,
+                        detail="会话在批量删除过程中已被移除",
+                    )
+                )
+            except Exception as exc:
+                # WHY 不吞错也不中断：单条失败（例如检查点存储异常）不代表其余会话删不得；
+                # 但失败必须记账并留日志，否则「删了 10 条、成功了 9 条」会表现为全部成功。
+                logger.exception("批量删除会话失败：thread=%s", thread_id)
+                items.append(
+                    DeleteResult(
+                        thread_id=thread_id,
+                        outcome=DeleteOutcome.FAILED,
+                        checkpoint_removed=False,
+                        detail=str(exc) or type(exc).__name__,
+                    )
+                )
+
+        deleted = sum(1 for item in items if item.outcome is DeleteOutcome.DELETED)
+        partial = sum(1 for item in items if item.outcome is DeleteOutcome.PARTIAL)
+        not_found = sum(1 for item in items if item.outcome is DeleteOutcome.NOT_FOUND)
+        failed = sum(1 for item in items if item.outcome is DeleteOutcome.FAILED)
+
+        await self._audit(
+            event_type="thread_workspace_delete",
+            actor_id=LOCAL_ACTOR_ID,
+            target_id=workspace or "",
+            action="delete_workspace",
+            outcome="success" if failed == 0 else "partial",
+            details={
+                "workspace": workspace or "",
+                "workspace_bound": workspace_bound,
+                "include_archived": include_archived,
+                "requested": len(items),
+                "deleted": deleted,
+                "partial": partial,
+                "not_found": not_found,
+                "failed": failed,
+            },
+        )
+
+        logger.info(
+            "按工作空间清理会话完成：workspace=%s bound=%s 命中=%d 删除=%d 残留=%d 失败=%d",
+            workspace,
+            workspace_bound,
+            len(items),
+            deleted,
+            partial,
+            failed,
+        )
+        return WorkspaceDeleteResult(
+            workspace=workspace or "",
+            workspace_bound=bool(workspace_bound),
+            requested=len(items),
+            deleted=deleted,
+            partial=partial,
+            not_found=not_found,
+            failed=failed,
+            items=items,
         )
 
     async def _delete_attachments(self, thread_id: str, workspace_root: Path) -> int:

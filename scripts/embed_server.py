@@ -6,7 +6,8 @@
 
 用法（由客户端调用，一般不需要手工执行）::
 
-    .data/embed-venv/Scripts/python scripts/embed_server.py --model BAAI/bge-small-zh-v1.5
+    .data/embed-venv/Scripts/python scripts/embed_server.py --model BAAI/bge-small-zh-v1.5 \
+        --cache-dir .data/embed-cache
 
 手工执行时它从 stdin 读 JSON 行、向 stdout 写 JSON 行，可直接用来验证模型环境。
 
@@ -107,15 +108,23 @@ def _encode(vectors: list[list[float]]) -> tuple[str, int]:
     return base64.b64encode(struct.pack(f"<{len(flat)}f", *flat)).decode("ascii"), dims
 
 
-def _load_model(model_name: str) -> object:
+def _load_model(model_name: str, cache_dir: str = "") -> object:
     """加载并预热模型。
+
+    Args:
+        model_name: fastembed 模型标识。
+        cache_dir: 权重缓存目录；空串表示用 fastembed 的默认位置。
+
+    WHY 缓存目录必须由父进程指定：默认值落在系统临时目录（Windows 实测
+    ``%TEMP%\\fastembed_cache``），会被磁盘清理清掉，而清掉的表现只是「下次重新下载
+    90 MB」，不报错。父进程按数据目录推导后传进来，权重才能和独立环境同处一块可写卷。
 
     Raises:
         ImportError: 当前环境没有 ``fastembed``。
     """
     from fastembed import TextEmbedding
 
-    model = TextEmbedding(model_name=model_name)
+    model = TextEmbedding(model_name=model_name, cache_dir=cache_dir or None)
     # WHY 预热一次：onnxruntime 的首次推理含图优化与内存分配，不预热会把它的耗时
     # 算进「冷启动」，让上游据此定出的超时阈值过高。
     list(model.embed(["warmup"]))
@@ -132,6 +141,11 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(description="MyAgentHarness 嵌入服务（stdio）")
     parser.add_argument("--model", required=True, help="fastembed 模型标识")
+    parser.add_argument(
+        "--cache-dir",
+        default="",
+        help="权重缓存目录；留空用 fastembed 默认位置（会被磁盘清理清掉）",
+    )
     args = parser.parse_args(argv)
 
     def respond(payload: dict[str, object]) -> None:
@@ -140,7 +154,7 @@ def main(argv: list[str]) -> int:
 
     started = time.perf_counter()
     try:
-        model = _load_model(args.model)
+        model = _load_model(args.model, args.cache_dir)
     except Exception as exc:
         # WHY 把加载失败当成一次「响应」而不是直接崩：客户端在等 ready 行，进程静默
         # 退出只会让它看到 EOF。带上类型与消息（并写进 stderr）能让「缺 fastembed」

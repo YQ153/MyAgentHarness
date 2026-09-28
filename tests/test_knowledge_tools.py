@@ -83,9 +83,15 @@ def _call(registry: ToolRegistry, name: str, config: AppConfig, **payload: Any) 
     )
 
 
-def _workspace(tmp_path: Path, relative: str, text: str) -> AppConfig:
-    """建好工作区并写入一份文件，返回配置。"""
-    config = make_config(tmp_path)
+def _workspace(tmp_path: Path, relative: str, text: str, **config_overrides: Any) -> AppConfig:
+    """建好工作区并写入一份文件，返回配置。
+
+    WHY 开出 ``config_overrides``：本模块验证的是**手动工具路径**，而默认配置会装配
+    自动同步（``IntervalWorker`` 启动即跑一轮）。后台首轮与用例手动调用的
+    ``index_workspace`` 竞争同一个工作区——谁先扫到文件，谁的汇总就是「新索引 1 个」，
+    另一方只能如实报「内容未变」。需要确定性行为的用例显式关掉它，而不是赌时序。
+    """
+    config = make_config(tmp_path, **config_overrides)
     make_root(config).root.mkdir(parents=True, exist_ok=True)
     target = make_root(config).root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -127,9 +133,18 @@ async def test_search_before_indexing_reports_no_hits(tmp_path: Path) -> None:
 
 
 async def test_index_then_search_round_trip(tmp_path: Path) -> None:
-    """验收形态：先索引工作区，再通过工具检索到并带上出处与所在小节。"""
+    """验收形态：先索引工作区，再通过工具检索到并带上出处与所在小节。
+
+    WHY 关掉自动索引：这条断言钉的是「工具的第一次手动索引报新索引 1 个」。自动同步
+    的后台首轮与它赛跑，赢了就会让手动调用如实改报「内容未变」——那是功能的正确行为，
+    不是这条用例要验证的东西（自动索引另有 tests/test_knowledge_auto_index.py 与
+    tests/application/test_knowledge_sync.py 覆盖）。
+    """
     config = _workspace(
-        tmp_path, "notes/login.md", "# 登录问题\n\n登录接口超时排查记录：p99 达到 3 秒。"
+        tmp_path,
+        "notes/login.md",
+        "# 登录问题\n\n登录接口超时排查记录：p99 达到 3 秒。",
+        knowledge_auto_index=False,
     )
     registry = _registry(config)
 
@@ -188,6 +203,41 @@ async def test_skipped_files_are_counted(tmp_path: Path) -> None:
     result = await _call(registry, "index_documents", config)
 
     assert "跳过 1 个" in result
+
+
+# --------------------------------------------------------------- 注入预算
+
+
+def _config_with_budget(tmp_path: Path, budget: int) -> AppConfig:
+    """建好一份多片段的工作区，并给检索配一个很小的注入预算。"""
+    base = _workspace(tmp_path, "notes/a.md", "关键词 内容细节。" * 300)
+    return make_config(
+        tmp_path,
+        workspace=make_root(base).root,
+        knowledge_search_max_chars=budget,
+    )
+
+
+async def test_search_respects_injection_budget(tmp_path: Path) -> None:
+    """检索结果整体进入上下文，只限制条数挡不住「一条片段上千字」。
+
+    WHY 按字符设上限才是真正的注入侧预算：它决定的是「本次往对话**尾部**追加
+    多少」，不改动已有消息——因此对 DeepSeek 的前缀缓存是中性的，这与一切
+    「清历史」类治理有本质区别。
+    """
+    config = _config_with_budget(tmp_path, budget=200)
+    registry = _registry(config)
+    await _call(registry, "index_documents", config)
+
+    result = await _call(registry, "search_documents", config, query="关键词")
+
+    assert "注入预算" in result
+    assert "未注入" in result
+    # 预算 200 而首条就约 600 字（截断后）：只有首条放行，其余全部挡下。
+    # WHY 首条必达要作为断言钉住：一条都不给时模型只会用同样的检索词重试，
+    # 把检索能力整体废掉，远比「这一条超了一点预算」代价高。
+    assert "[1]" in result
+    assert len(result) < 1200
 
 
 # --------------------------------------------------------------- 进程级句柄
@@ -327,17 +377,20 @@ async def test_service_recovers_after_close(tmp_path: Path) -> None:
     assert rebuilt.capabilities()["vector_enabled"] is False
 
 
-async def test_knowledge_db_sits_next_to_the_data_dir(tmp_path: Path) -> None:
-    """知识库文件落在数据目录下、与主库分开。
+async def test_knowledge_db_lives_in_the_workspace(tmp_path: Path) -> None:
+    """知识库文件落在工作区内的 ``.harness/`` 下（2026-09-22 改）。
 
-    WHY 分开：向量维度一变就要整库重建，独立文件让「删掉重来」是明确可执行的；而
-    ``vec0`` 是加载式扩展，写进主库会让「扩展不可用」与检查点库纠缠在一起。
+    WHY 跟着工作区走：索引的对象就是工作区里的文档（库里以根内虚拟路径为键去重），放在
+    项目里才能让「删项目 = 删索引」「备份项目带上索引」同时成立。
+
+    WHY 仍与主库分开：向量维度一变就要整库重建，独立文件让「删掉重来」是明确可执行的；
+    而 ``vec0`` 是加载式扩展，写进主库会让「扩展不可用」与检查点库纠缠在一起。
     """
     config = make_config(tmp_path)
-    await ensure_service(config, make_root(config).root)
+    root = make_root(config)
+    await ensure_service(config, root.root)
 
-    # 每个根一个库文件，文件名带上根的标识（没有例外）：两个项目的 /README.md 是
-    # 同一个键，共用一份索引会互相覆盖。
-    expected = tmp_path / f"knowledge-{knowledge_runtime.workspace_slug(make_root(config).root)}.db"
-    assert knowledge_runtime.knowledge_db_path(config, make_root(config).root) == expected
-    assert expected.is_file()
+    # 每个根各有一个 ``.harness/``，所以库名固定；而两个项目的 /README.md 是同一个键，
+    # 按根分库才能避免互相覆盖。
+    assert knowledge_runtime.knowledge_db_path(config, root.root) == root.knowledge_db
+    assert root.knowledge_db.is_file()

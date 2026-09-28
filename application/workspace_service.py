@@ -84,9 +84,11 @@ class WorkspaceService:
 
         self._config = config
         self._root = scope.root
-        # WHY 带上挂载表：技能库、技能视图与工具输出留存住在工作区之外，由只读挂载暴露在
-        # 固定虚拟路径下。面板要能打开「完整输出」（``/_tool_outputs/…``）就得按这张表解析
-        # ——否则那条路径会被当成工作区内的相对路径，读到一个不存在的文件（404）。
+        # WHY 带上挂载表：技能库、技能视图与工具输出留存虽然物理上就在工作区内的
+        # ``.harness/`` 下（2026-09-22 改），但对外仍只经**固定虚拟路径**暴露
+        # （``/skills``、``/_tool_outputs`` …）。面板要能打开「完整输出」
+        # （``/_tool_outputs/…``）就得按这张表解析——否则那条路径会被当成工作区内的相对
+        # 路径，读到一个不存在的文件（404）。
         self._mounts = scope.mount_table
         self._audit_store = audit_store
         logger.info("WorkspaceService 就绪：root=%s mounts=%d", self._root, len(self._mounts))

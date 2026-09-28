@@ -109,6 +109,9 @@ _GLOBALS = frozenset(
         "confirm", "alert", "prompt", "atob", "btoa", "getComputedStyle",
         "document", "window", "console", "navigator", "location", "history",
         "localStorage", "sessionStorage",
+        # 解析不可信标记用的惰性文档构造器（mermaid_render.js 的 extractSvg）：
+        # 它得到的是不取资源的游离文档，比给游离 div 设 innerHTML 更安全。
+        "DOMParser",
         # Node（node --test 直接加载这些文件时会用到）
         "require", "module", "exports", "define", "self", "globalThis",
     }
@@ -121,7 +124,14 @@ WHY 逐个列出而不是用 ``^[A-Z]`` 之类的形状规则：形状规则会�
 
 
 def _static_scripts() -> list[Path]:
-    """全部前端脚本（按文件名排序，让失败信息稳定）。"""
+    """**自研**前端脚本（按文件名排序，让失败信息稳定）。
+
+    WHY 是 ``glob`` 而不是 ``rglob``：``static/vendor/`` 下放的是第三方发行文件（如压缩后的
+    mermaid），本契约对它没有意义——用「调用的名字必须在本文件声明过」去量压缩代码，只会
+    得到一屏与产品无关的误报，而会误报的断言很快就会被当成噪音忽略。
+    ``static/vendor/README.md`` 写明了这条豁免，``test_vendor_bundle.py`` 负责钉住它
+    （防止有人把 ``glob`` 改成 ``rglob`` 之后没意识到后果）。
+    """
     return sorted(STATIC_DIR.glob("*.js"))
 
 
@@ -133,7 +143,10 @@ def _declared_names(source: str) -> set[str]:
     for match in _PARAMS.finditer(source):
         raw = match.group("params") or match.group("arrow") or match.group("single") or ""
         for part in raw.split(","):
-            candidate = part.strip().split("=")[0].strip().strip("{}[]")
+            # WHY 连圆括号一起剥：`new Promise((resolve, reject) => {…})` 里，``[^)]*`` 只能
+            # 停在**里层**的 `)` 上，于是匹配从外层 `(` 开始、第一段参数带着一个前导 `(`。
+            # 不剥掉它，`resolve` 就会被判成「未声明的调用」——而它正是本检查要放行的形参。
+            candidate = part.strip().split("=")[0].strip().strip("{}[]()")
             if re.fullmatch(r"[A-Za-z_$][\w$]*", candidate):
                 names.add(candidate)
     return names
@@ -146,6 +159,7 @@ def test_static_scripts_are_discovered() -> None:
     assert {
         "app.js",
         "markdown.js",
+        "mermaid_render.js",
         "workspace_scope.js",
     } <= names, sorted(names)
 

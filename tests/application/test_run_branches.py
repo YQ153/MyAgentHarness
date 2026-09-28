@@ -383,7 +383,7 @@ async def test_regenerate_keeps_the_previous_attempt_usage(
         test_config, usage_store=usage_store, thread_store=thread_store
     ).summarize(thread_id="t1")
 
-    assert summary.run_count == 2
+    assert summary.call_count == 2
     assert summary.total_tokens == 220  # (100 + 10) × 2 次尝试
 
 

@@ -16,6 +16,7 @@ root_packages =
     agent
     application
     bootstrap
+    config
     interfaces
     llm
     runtime
@@ -104,19 +105,41 @@ forbidden_modules =
     bootstrap
 allow_indirect_imports = True
 
+; ---------------------------------------------------------------- contract 7
+; config is the neutral leaf: every layer may import it, it must import none of
+; them. This used to be an AST-only rule (tests/test_root_module_contract.py)
+; because config.py was a single-file module that import-linter could not see;
+; it became a package, so the boundary is now enforced here as well.
+[importlinter:contract:config-is-leaf]
+name = config must not depend on any layer
+type = forbidden
+source_modules =
+    config
+forbidden_modules =
+    agent
+    application
+    bootstrap
+    interfaces
+    llm
+    runtime
+
 ; ===========================================================================
-; Root-level modules are NOT covered here, and cannot be. import-linter only
-; accepts packages as analysis roots: root_packages entries must be directories
-; with __init__.py, so listing a single-file module fails with
+; Root-level single-file modules are NOT covered here, and cannot be.
+; import-linter only accepts packages as analysis roots: root_packages entries
+; must be directories with __init__.py, so listing a single-file module fails
+; with
 ;   "'config' is a module, not a package."
 ; and referencing one from a contract (after putting it back) fails with
 ;   "Module 'config' does not exist."
 ; Both verified against import-linter 2.15 / grimp 3.17.
 ;
-; The affected modules are config / text_utils / thread_utils / web_safety /
+; config used to be one of these root-level modules, but it was split into the
+; config/ package, so its boundaries are now contract 7 above. The remaining
+; root-level modules are text_utils / thread_utils / web_safety /
 ; knowledge_runtime / knowledge_tools / web_tools / main. Their boundaries are
-; enforced instead by tests/test_root_module_contract.py, which runs in the same
-; CI job as `uv run lint-imports`.
+; still enforced by tests/test_root_module_contract.py, which runs in the same
+; CI job as `uv run lint-imports` (and additionally guards the config package's
+; zero-repo-dependency rule from the AST side).
 ;
 ; WHY this note lives here: the obvious "fix" for a missing rule is to append
 ; the module to root_packages, which only yields a confusing tool error. This

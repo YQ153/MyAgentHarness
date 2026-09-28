@@ -1,4 +1,4 @@
-"""根级模块的依赖边界契约。
+"""根级模块与 config 包的依赖边界契约。
 
 WHY 这份契约不在 `.importlinter` 里：import-linter 只接受「包」作为分析根——
 `root_packages` 必须是含 `__init__.py` 的目录。单文件模块既不能列为分析根
@@ -12,6 +12,13 @@ WHY 值得钉：这批模块在根级的**唯一理由**是「不被反向依赖
 放进任一层都会立刻构成循环（见两个模块各自的 docstring）。角色一旦被破坏，
 症状不是这里报错，而是「某个 import 顺序下才崩」的循环导入，或契约 3
 （`runtime` 是叶子）被从根级模块绕开。
+
+config 曾经也是这批单文件模块之一（当时以 `frozenset()` 中立叶子登记在
+`_BOUNDARIES`）；2026-09-24 拆成 `config/` 包后，它的边界已升级为
+`.importlinter` 的 contract 7（`config must not depend on any layer`）。
+本测试仍从 AST 侧保留一条对 config 包的独立断言（见
+`test_config_package_is_neutral_leaf`）：import-linter 与本测试跑在同一个
+CI 任务里，两侧同时钉住同一规则，任何一侧被误删都会被另一侧接住。
 
 WHY 用 AST 而不是「导入后检查 `sys.modules`」：静态解析与 `.importlinter` 口径一致
 （两者都只认源码里写了什么），且覆盖 `if TYPE_CHECKING:` 块与函数内延迟导入——
@@ -46,7 +53,8 @@ from tests._ast_imports import (
 _BOUNDARIES: dict[str, frozenset[str]] = {
     # 中立叶子：存在的唯一理由就是「谁都可以依赖它，它不依赖任何一层」。
     # 一旦它依赖了某一层，下沉的理由（避免 application <-> runtime 循环）当场失效。
-    "config": frozenset(),
+    # （config 原来也登记在这里；拆成 config/ 包后升级为 .importlinter contract 7，
+    # 并由本文件末尾的 test_config_package_is_neutral_leaf 从 AST 侧继续钉住。）
     "text_utils": frozenset(),
     "thread_utils": frozenset(),
     "web_safety": frozenset(),
@@ -76,7 +84,14 @@ _BOUNDARIES: dict[str, frozenset[str]] = {
     "main": frozenset({"application", "config", "interfaces"}),
 }
 
-_KNOWN_TOP_LEVEL = _LAYER_PACKAGES | frozenset(_BOUNDARIES)
+_KNOWN_TOP_LEVEL = _LAYER_PACKAGES | frozenset(_BOUNDARIES) | frozenset({"config"})
+"""已知顶层名字 = 分层包 + 根级模块角色表 + config 包。
+
+WHY config 要单独补进已知集合：它不再出现在 `_BOUNDARIES`（已转包），但
+`knowledge_runtime` / `knowledge_tools` / `web_tools` / `main` 的允许集里都
+引用着 "config" 这条边——不补进来，这些 import 会被当成「不认识的名字」
+过滤掉，角色表的 stale 断言反而会误报「声明了但已不存在的依赖」。
+"""
 
 #: 允许取用知识库服务句柄的顶层模块。
 #:
@@ -134,11 +149,15 @@ def _repo_imports(module_path: Path) -> frozenset[str]:
 def _scannable_paths() -> list[Path]:
     """返回参与运行期装配的模块文件。
 
-    范围为六个分层包 + 八个根级模块。
+    范围为六个分层包 + config 包 + 七个根级模块。
 
     WHY 排除 `scripts/` 与 `tests/`：前者是一次性探针，后者是测试本身；
     它们不参与运行期装配，其中 `scripts/inspect_thread.py` 与
     `tests/test_knowledge_tools.py` 确实会导入服务句柄，且是正当的。
+
+    WHY config 包也纳入扫描：服务句柄不可被任意取用的检查按「模块文件」
+    逐个看 import；config 转包后它的模块不再是根级 `*.py`，不显式纳入就会
+    从这道反向检查的覆盖面里悄悄消失。
 
     Returns:
         按路径排序的模块文件列表。
@@ -148,7 +167,7 @@ def _scannable_paths() -> list[Path]:
             后面的断言会因「无可检查」而全部通过。
     """
     paths: list[Path] = []
-    for package in sorted(_LAYER_PACKAGES):
+    for package in sorted(_LAYER_PACKAGES | {"config"}):
         paths.extend(sorted((ROOT / package).rglob("*.py")))
     paths.extend(ROOT / f"{name}.py" for name in sorted(_BOUNDARIES))
 
@@ -172,7 +191,9 @@ def test_root_module_imports_stay_within_its_role(module_name: str) -> None:
     assert not forbidden, (
         f"{module_name}.py 依赖了 {forbidden}，超出它声明的角色范围 {sorted(allowed)}。\n"
         "根级模块的角色（本表是它们唯一的约束）：\n"
-        "  中立叶子 config / text_utils / thread_utils / web_safety：不依赖仓库内任何模块；\n"
+        "  中立叶子 text_utils / thread_utils / web_safety：不依赖仓库内任何模块；\n"
+        "  中立叶子 config（现为 config/ 包）：不依赖仓库内任何模块，\n"
+        "    另由 .importlinter contract 7 与 test_config_package_is_neutral_leaf 双轨钉住；\n"
         "  服务句柄 knowledge_runtime：只可依赖 application / llm / runtime / config；\n"
         "  工具插件 web_tools / knowledge_tools：只可依赖注册 SPI、中立模块与自己的服务句柄；\n"
         "  入口 main：只可依赖 config 与 interfaces / application。\n"
@@ -227,4 +248,30 @@ def test_service_handle_is_reached_only_by_its_legitimate_callers() -> None:
         "装配层建立它并负责拆除，知识库插件因扩展点没有注入依赖的通道而取用它。\n"
         "其余模块应当经由应用层获得服务——请改走 AppContext 注入，"
         "若确实需要新增一个取用方，先确认它不会绕过应用层。"
+    )
+
+
+@pytest.mark.parametrize(
+    "module_path",
+    sorted((ROOT / "config").rglob("*.py")),
+    ids=lambda path: path.relative_to(ROOT).as_posix(),
+)
+def test_config_package_is_neutral_leaf(module_path: Path) -> None:
+    """config 包内任何模块只准依赖自身，不准依赖仓库内任何其它顶层模块。
+
+    config 原是根级单文件模块，以 `frozenset()` 中立叶子登记在 `_BOUNDARIES`；
+    拆成包后该条目移出角色表，边界升级为 `.importlinter` contract 7。本测试
+    从 AST 侧保留同一条断言：两侧跑在同一个 CI 任务里，互为备份——任何一侧
+    被误删，另一侧仍会接住。config 的中立叶子身份是它被全部六层安全依赖的
+    前提，一旦它依赖某一层，六层与 config 之间立刻出现成环路径。
+    """
+    actual = _repo_imports(module_path)
+    # 包内 sibling 导入（from config.constants import X）解析出的顶层名就是
+    # "config" 自身，是合法的自引用；除此之外出现任何仓库内顶层名都是越界。
+    forbidden = sorted(actual - {"config"})
+    assert not forbidden, (
+        f"{module_path.relative_to(ROOT).as_posix()} 依赖了 {forbidden}，"
+        "超出 config 包的中立叶子角色（它存在的理由就是被所有层安全依赖）。\n"
+        "若确有正当依赖，说明这段逻辑不该住在 config 包里——请把它移到对应层，"
+        "或先同时修订 .importlinter contract 7 与本测试，并写清新的边界理由。"
     )

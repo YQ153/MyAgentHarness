@@ -163,6 +163,71 @@ html, body {
   margin-top: 6px;
 }
 
+/* ---------- 会话分组（按工作空间） ---------- */
+
+/*
+ * WHY 分组自己是一个容器而不是靠标题行分隔：组内的条目仍要各自带边框与选中态
+ * （.thread-item 的既有样式），套一层容器才能让「这一组有几条」在视觉上成立。
+ */
+.t-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.t-group + .t-group {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+.t-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+}
+
+/* min-width: 0 是省略号生效的前提：flex 子项默认不收缩到内容宽度以下 */
+.t-group-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.t-group-count {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f1f3f5;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* 组标题里的操作按钮比行内那个更小：它是「整组」层面的动作，不该与条目争视觉权重 */
+.t-group-head .icon-action {
+  flex: none;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+.thread-item .t-actions .icon-action.danger-action,
+.t-group-head .icon-action.danger-action {
+  color: var(--danger);
+  border-color: #fecaca;
+}
+
+.thread-item .t-actions .icon-action.danger-action:hover,
+.t-group-head .icon-action.danger-action:hover {
+  background: #fee2e2;
+  color: var(--danger);
+}
+
 .icon-action {
   padding: 2px 8px;
   border: 1px solid var(--border);
@@ -1141,6 +1206,53 @@ button.small {
   text-decoration: underline;
 }
 
+/* Mermaid 图：本页只负责「摆哪儿、怎么滚动」，配色交给 mermaid 自己的主题
+   （它把配色写在 svg 内的 <style> 里，外部覆盖会随版本漂移）。 */
+.md-mermaid {
+  margin: 8px 0;
+  padding: 8px 10px;
+  /* WHY 允许横向滚动而不是缩放到容器宽度：宽时序图一旦缩放，标签字号会小到读不出，
+     而读不出内容的图等于没渲染——宁可让用户横向拖一下。 */
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  text-align: center;
+}
+
+.md-mermaid svg {
+  /* 图小于容器时按原尺寸居中；大于容器时由上面的横向滚动接管（不要在这里做 100% 缩放） */
+  max-width: none;
+}
+
+.md-mermaid-source {
+  margin-top: 6px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.md-mermaid-source summary {
+  cursor: pointer;
+}
+
+.md-mermaid-source pre.md-code {
+  margin: 6px 0 0;
+  /* 与图同底色会看不出代码块的边界，因此这里用页面底色把它衬出来 */
+  background: var(--bg);
+}
+
+/* 渲染失败的说明：它是告警（正文还在、只是没画出来），不是错误红条——
+   用错误色会让人以为这一轮对话出了问题。 */
+.md-mermaid-error {
+  margin: 8px 0 0;
+  padding: 4px 8px;
+  border-left: 3px solid var(--warn);
+  background: var(--bg);
+  color: var(--warn);
+  font-size: 12px;
+}
+
 .msg-action:hover {
   color: var(--accent);
   opacity: 1;
@@ -1241,4 +1353,50 @@ button.small {
   padding: 16px 0;
   font-size: 13px;
   color: var(--muted, #888);
+}
+
+/* ---------------------------------------------------------------- 用量面板 */
+
+.usage-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted, #888);
+}
+
+.usage-field select {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+/* 命中率是唯一能解释「为什么花了这么多」的数字，给它一点强调；
+   与其余 chip 长得一样时，它会被一眼略过——而它恰恰是本面板存在的理由。 */
+.usage-rate {
+  border-color: var(--accent, #2563eb);
+  color: var(--accent, #2563eb);
+  font-weight: 600;
+}
+
+/* 截断提示与其余 chip 分开：它是「你看到的不是全部」的告警，不是又一个统计量 */
+.usage-truncated {
+  border-color: var(--warn, #b45309);
+  color: var(--warn, #b45309);
+}
+
+/* 命中率内联条：外框等宽，填充部分表示命中率——一排条的长度变化就是趋势 */
+.usage-bar {
+  flex: none;
+  width: 72px;
+  height: 6px;
+  border-radius: 3px;
+  background: #eceff3;
+  overflow: hidden;
+}
+
+.usage-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent, #2563eb);
 }

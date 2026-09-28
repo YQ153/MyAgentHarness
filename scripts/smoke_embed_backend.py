@@ -70,6 +70,9 @@ async def _check_idle_reclaim(config: AppConfig, backend: EmbedProcessClient) ->
         dims=backend.dims,
         timeout=config.embedding_timeout_seconds,
         idle_seconds=_IDLE_PROBE_SECONDS,
+        # WHY 必须沿用被测后端的缓存目录：不传就是 fastembed 的默认临时目录，于是这条
+        # 探针会**再下载一份 90 MB**——而它存在的目的只是验回收逻辑。
+        cache_dir=backend.cache_dir,
     )
     try:
         await probe.embed([_NEAR_A])

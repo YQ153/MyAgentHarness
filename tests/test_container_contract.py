@@ -10,6 +10,7 @@ WHY 值得钉：这几条一旦被改坏，症状都不会立刻出现在测试�
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ def _read(name: str) -> str:
 
 
 def test_image_runs_as_non_root() -> None:
-    dockerfile = _read("Dockerfile")
+    dockerfile = _read("docker/app.Dockerfile")
 
     assert "USER app" in dockerfile, "运行阶段必须切到非 root 用户"
     # 非 root 的前提是那个用户真的被建出来，且属主交给了它
@@ -29,7 +30,7 @@ def test_image_runs_as_non_root() -> None:
 
 
 def test_healthcheck_probes_liveness_not_readiness() -> None:
-    dockerfile = _read("Dockerfile")
+    dockerfile = _read("docker/app.Dockerfile")
 
     assert "HEALTHCHECK" in dockerfile
     # WHY 必须是 /health：/ready 会查数据库，依赖抖动会让编排系统反复重启容器，
@@ -46,8 +47,20 @@ def test_secrets_are_excluded_from_build_context() -> None:
     assert ".env" in dockerignore
 
 
+def test_compose_pins_project_name() -> None:
+    compose = _read("docker/compose.yml")
+
+    # WHY 钉项目名：compose 默认用「compose 文件所在目录名」当项目名，而本文件位于
+    # docker/ 下——不写死 name 的话项目名会从 myagentharness 变成 docker，卷名随之变成
+    # docker_agent-data，已有部署会表现为「数据凭空消失」（实际是新建了一个空卷）。
+    # 这条断言保护的是一次纯目录搬迁不该带走的副作用。
+    assert re.search(r"^name:\s*myagentharness\s*$", compose, flags=re.MULTILINE), (
+        "compose 必须显式写 name: myagentharness，否则搬迁目录会静默换掉卷名"
+    )
+
+
 def test_compose_persists_state_in_one_volume() -> None:
-    compose = _read("docker-compose.yml")
+    compose = _read("docker/compose.yml")
 
     assert "/app/.data" in compose
     # WHY 断的是「会话专属目录也在那个卷里」：不绑定工作空间的会话，其文件根落在
@@ -57,14 +70,14 @@ def test_compose_persists_state_in_one_volume() -> None:
 
 
 def test_compose_binds_to_loopback_by_default() -> None:
-    compose = _read("docker-compose.yml")
+    compose = _read("docker/compose.yml")
 
     # 默认不暴露到局域网：要暴露时应当是一处刻意的改动，而不是默认行为
     assert "127.0.0.1:8000:8000" in compose
 
 
 def test_identity_provider_does_not_mount_the_docker_socket() -> None:
-    compose = _read("docker-compose.yml")
+    compose = _read("docker/compose.yml")
 
     # WHY 这条要在测试里钉死：挂 docker.sock 进容器等价于把宿主的 root 交出去。
     # 本项目目前不需要它；一旦有人为了「在容器里跑 docker」把它挂上，这条会立刻失败。

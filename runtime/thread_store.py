@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from runtime.skill_presets import PRESET_ID_RE
 from runtime.sqlite_lifecycle import open_sqlite_store
 from text_utils import build_title, collapse_whitespace
 from thread_utils import normalize_thread_id
@@ -39,6 +40,15 @@ logger = logging.getLogger(__name__)
 _MAX_TITLE_CHARS = 200
 _MAX_LIMIT = 200
 _MAX_TURN_DELTA = 100
+_MAX_ID_SCAN = 2000
+"""``list_thread_ids`` 一次最多枚举的会话 ID 数。
+
+WHY 不复用 ``_MAX_LIMIT``：那个上限管的是「清单页大小」（一次展示多少条），而这里管的是
+「按工作空间做批量动作时一次能扫多少条」。前者调小是展示决策，若共用同一个常量，改展示
+分页会连带把批量操作的扫描范围也缩小——那会让「按工作空间删除」在翻页之后悄悄漏删。
+"""
+_MAX_PRESET_CHARS = 64
+"""场景预设 ID 的长度上限（与 ``runtime.skill_presets.PRESET_ID_RE`` 的 64 位一致）。"""
 
 
 def normalize_search_query(query: str | None) -> str | None:
@@ -93,7 +103,8 @@ CREATE TABLE IF NOT EXISTS thread_meta (
     archived_at   TEXT NOT NULL DEFAULT '',
     tags          TEXT NOT NULL DEFAULT '',
     workspace     TEXT NOT NULL DEFAULT '',
-    workspace_bound INTEGER NOT NULL DEFAULT 0
+    workspace_bound INTEGER NOT NULL DEFAULT 0,
+    preset        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_thread_meta_updated_at
     ON thread_meta (updated_at DESC, thread_id DESC);
@@ -160,11 +171,16 @@ _MIGRATIONS = [
     """
     ALTER TABLE thread_meta ADD COLUMN workspace_bound INTEGER NOT NULL DEFAULT 0;
     """,
+    # 场景预设：与文件根**在同一条 UPSERT 里**锁定。空串表示「不限定」——老库升级后全部
+    # 为空串，与升级前「没有场景概念」的行为完全一致，因此不需要回填。
+    """
+    ALTER TABLE thread_meta ADD COLUMN preset TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 _COLUMNS = (
     "thread_id, owner_id, title, created_at, updated_at, turn_count, "
-    "archived, archived_at, current_branch, tags, workspace, workspace_bound"
+    "archived, archived_at, current_branch, tags, workspace, workspace_bound, preset"
 )
 
 _MAX_TAG_CHARS = 32
@@ -258,6 +274,8 @@ def _build_filters(
     query: str | None,
     include_archived: bool,
     tag: str | None = None,
+    workspace: str | None = None,
+    workspace_bound: bool | None = None,
 ) -> tuple[str, list[Any]]:
     """把查询条件编译成 WHERE 子句与参数。
 
@@ -267,6 +285,10 @@ def _build_filters(
 
     WHY 标签过滤也加在这里而不是另开一个编译点：同一条约束——过滤条件一旦有第二份
     实现，总数与条数就会在某个组合下分叉，而那种缺陷只在「翻页翻空」时暴露。
+
+    WHY 工作空间过滤用 ``_normalize_workspace`` 归一后再比较：这一列是**路径相等性**
+    的判据（写入时由同一个函数归一），原样拼进 WHERE 会让 ``./proj`` 与 ``C:\\proj``
+    指向同一个目录却匹配不到——现象是「按工作空间删除时一条都没删到」，而接口返回成功。
     """
     conditions: list[str] = []
     params: list[Any] = []
@@ -275,6 +297,14 @@ def _build_filters(
     # 这个功能等于没做。
     if not include_archived:
         conditions.append("archived = 0")
+
+    if workspace is not None:
+        conditions.append("workspace = ?")
+        params.append(_normalize_workspace(workspace))
+
+    if workspace_bound is not None:
+        conditions.append("workspace_bound = ?")
+        params.append(1 if workspace_bound else 0)
 
     if tag:
         # 规范形式前后都带逗号，故模式两侧都要逗号；标签同样要转义，
@@ -356,6 +386,30 @@ def _normalize_workspace(workspace: str | None) -> str:
     return str(Path(workspace).expanduser().resolve())
 
 
+def _normalize_preset(preset: str | None) -> str:
+    """规整场景预设 ID：空值 → 空串（不限定）；否则去空白并校验字符集。
+
+    WHY 在存储层就校验字符集：这个值会进 API 响应、日志与筛选参数，允许任意字符串就会出现
+    「``coding`` 与 `` Coding `` 被存成两个事实」而查询按精确匹配——表现为「场景明明存在却
+    匹配不上」。规则与 ``runtime.skill_presets`` 同源（同一份正则，见那里的 WHY）。
+
+    Raises:
+        ValueError: 取值不是字符串、超长，或含非法字符。
+    """
+    if preset is None:
+        return ""
+    if not isinstance(preset, str):
+        raise ValueError(f"preset 必须是字符串，实际：{type(preset).__name__}")
+    cleaned = preset.strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) > _MAX_PRESET_CHARS:
+        raise ValueError(f"preset 超过 {_MAX_PRESET_CHARS} 字符：{cleaned!r}")
+    if not PRESET_ID_RE.match(cleaned):
+        raise ValueError(f"preset 只能是小写字母、数字与单个连字符：{cleaned!r}")
+    return cleaned
+
+
 class ThreadMetaStore:
     """会话元数据的读写门面。
 
@@ -409,6 +463,7 @@ class ThreadMetaStore:
         owner_id: str = "",
         workspace: str = "",
         workspace_bound: bool = False,
+        preset: str = "",
     ) -> dict[str, Any]:
         """登记一个新会话；已存在时保持原记录不变（幂等）。
 
@@ -418,6 +473,7 @@ class ThreadMetaStore:
             owner_id: 会话所有者标识；认证关闭时为空串。
             workspace: 会话的文件根绝对路径；空串表示尚未确定（会话尚未产生交互）。
             workspace_bound: 该根是否由用户显式选定。
+            preset: 场景预设 ID；空串表示不限定（接受全部技能）。
 
         Returns:
             该会话的完整元数据字典。
@@ -430,6 +486,7 @@ class ThreadMetaStore:
         normalized_id = self._validate_thread_id(thread_id)
         normalized_title = _normalize_title(title)
         normalized_workspace = _normalize_workspace(workspace)
+        normalized_preset = _normalize_preset(preset)
         now = _utc_now()
 
         async with self._lock:
@@ -438,8 +495,8 @@ class ThreadMetaStore:
                     """
                     INSERT INTO thread_meta
                         (thread_id, owner_id, title, created_at, updated_at,
-                         turn_count, workspace, workspace_bound)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                         turn_count, workspace, workspace_bound, preset)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
                     ON CONFLICT(thread_id) DO NOTHING
                     """,
                     (
@@ -450,6 +507,7 @@ class ThreadMetaStore:
                         now,
                         normalized_workspace,
                         int(workspace_bound),
+                        normalized_preset,
                     ),
                 ) as cursor:
                     inserted = cursor.rowcount > 0
@@ -484,6 +542,7 @@ class ThreadMetaStore:
         owner_id: str = "",
         workspace: str = "",
         workspace_bound: bool = False,
+        preset: str = "",
     ) -> dict[str, Any] | None:
         """记录一轮对话：刷新活动时间、累加轮次，并在标题为空时补写标题。
 
@@ -503,6 +562,9 @@ class ThreadMetaStore:
             owner_id: 新建会话时的所有者；已存在会话不会被覆盖所有者。
             workspace: 本条会话的文件根绝对路径；**已有取值的会话不会被改写**。
             workspace_bound: 该根是否由用户显式选定；同样只在首次写入时生效。
+            preset: 场景预设 ID；**已有取值时不会被改写**。空串表示「不限定」——因此
+                「首轮没选场景、之后补选」是被允许的（场景只决定技能集，不会让已有产物
+                失联，与文件根那种"换了就找不到文件"的风险不同）。
 
         Returns:
             更新后的元数据；``None`` 表示该会话此前未登记且本次未能写入。
@@ -519,6 +581,7 @@ class ThreadMetaStore:
 
         normalized_title = _normalize_title(title_hint)
         normalized_workspace = _normalize_workspace(workspace)
+        normalized_preset = _normalize_preset(preset)
         now = _utc_now()
 
         async with self._lock:
@@ -527,8 +590,8 @@ class ThreadMetaStore:
                     """
                     INSERT INTO thread_meta
                         (thread_id, owner_id, title, created_at, updated_at,
-                         turn_count, workspace, workspace_bound)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         turn_count, workspace, workspace_bound, preset)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         turn_count = thread_meta.turn_count + ?,
@@ -550,6 +613,13 @@ class ThreadMetaStore:
                             WHEN thread_meta.workspace = '' OR thread_meta.workspace IS NULL
                                 THEN excluded.workspace_bound
                             ELSE thread_meta.workspace_bound
+                        END,
+                        -- 场景同样「只在为空时写入」：首轮没选场景的会话允许之后补选；
+                        -- 一旦选定就不再改写（同一工作空间换场景会让视图互相覆盖）。
+                        preset = CASE
+                            WHEN thread_meta.preset = '' OR thread_meta.preset IS NULL
+                                THEN excluded.preset
+                            ELSE thread_meta.preset
                         END
                     """,
                     (
@@ -561,6 +631,7 @@ class ThreadMetaStore:
                         turn_delta,
                         normalized_workspace,
                         int(workspace_bound),
+                        normalized_preset,
                         turn_delta,
                     ),
                 ) as cursor:
@@ -903,6 +974,85 @@ class ThreadMetaStore:
             return 0
         return int(row[0])
 
+    async def list_thread_ids(
+        self,
+        *,
+        owner_id: str | None = None,
+        include_unowned: bool = False,
+        workspace: str | None = None,
+        workspace_bound: bool | None = None,
+        include_archived: bool = True,
+        limit: int = 500,
+    ) -> list[str]:
+        """按过滤条件枚举会话 ID（只取主键，不含展示字段）。
+
+        WHY 单独一个方法而不是复用 ``list_threads``：这里服务的是「按工作空间批量清理」的
+        目标解析，调用方要的是**全部**命中项。而 ``list_threads`` 是分页清单——照它逐页取
+        ID 会让两页之间存在被新会话插入的窗口，也就可能漏删或重复删；它还会把每一行的
+        全部列读出来，对「只要主键」这件事是纯浪费。
+
+        WHY 默认包含已归档（与 ``list_threads`` 的默认相反）：归档是**清单可见性**的开关，
+        而清理的语义是「把这个工作空间下的会话都收掉」。沿用「默认排除」会把已归档的会话
+        留在库里，于是清完之后它们又会出现在勾了「含已归档」的清单里。
+
+        Args:
+            owner_id: 只枚举该所有者的会话；``None`` 表示不限制。
+            include_unowned: 是否同时枚举 ``owner_id=''`` 的会话。
+            workspace: 工作空间绝对路径；``None`` 表示不按路径过滤（路径归一后做精确比较）。
+            workspace_bound: 根是否由用户显式选定；``None`` 表示不按归属过滤。
+            include_archived: 是否连同已归档的会话一起枚举。
+            limit: 最多返回多少条，1..``_MAX_ID_SCAN``。调用方若要判断「是否还有更多」，
+                应当传「上限 + 1」再看返回长度。
+
+        Returns:
+            命中的会话 ID，按最近活动时间倒序（与清单同序，便于日志对齐）。
+
+        Raises:
+            ValueError: ``limit`` 非法，或 ``workspace`` 不是字符串（由 ``_normalize_workspace`` 抛出）。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError(f"limit 必须是整数，实际：{type(limit).__name__}")
+        if limit < 1 or limit > _MAX_ID_SCAN:
+            raise ValueError(f"limit 必须在 1..{_MAX_ID_SCAN} 之间，实际：{limit}")
+
+        where, params = _build_filters(
+            owner_id=owner_id,
+            include_unowned=include_unowned,
+            query=None,
+            include_archived=include_archived,
+            workspace=workspace,
+            workspace_bound=workspace_bound,
+        )
+        sql = f"""
+            SELECT thread_id FROM thread_meta
+            {where}
+            ORDER BY updated_at DESC, thread_id DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        async with self._lock:
+            try:
+                async with self._conn.execute(sql, tuple(params)) as cursor:
+                    rows = await cursor.fetchall()
+            except Exception:
+                logger.exception(
+                    "枚举会话 ID 失败：workspace=%s bound=%s archived=%s",
+                    workspace,
+                    workspace_bound,
+                    include_archived,
+                )
+                raise
+
+        ids = [str(row[0]) for row in rows]
+        logger.debug(
+            "会话 ID 枚举完成：%d 条（workspace=%s bound=%s）",
+            len(ids),
+            workspace,
+            workspace_bound,
+        )
+        return ids
 
     async def set_tags(self, thread_id: str, tags: list[str] | None) -> dict[str, Any] | None:
         """整体替换某会话的标签。

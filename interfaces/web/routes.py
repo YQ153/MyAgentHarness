@@ -26,13 +26,17 @@ from application.dto import (
     ThreadExport,
     ThreadSummary,
     ToolListResult,
+    UsageSeries,
     UsageSummary,
+    WorkspaceDeleteResult,
     WorkspacePickResult,
 )
 from application.errors import (
+    ErrorCode,
     InterruptExpiredError,
     NotFoundError,
     RunRejectedError,
+    SessionPresetLockedError,
     SessionRootLockedError,
     SessionRootNotReadyError,
     SessionRootUnavailableError,
@@ -53,6 +57,7 @@ from application.thread_service import ThreadService
 from application.tool_catalog import ToolCatalog
 from application.usage_service import UsageService
 from interfaces.web.deps import get_session_registry, require_state, resolve_scoped_services
+from interfaces.web.errors import ApiError
 from interfaces.web.schemas import (
     ChatRequest,
     DeleteResponse,
@@ -119,9 +124,7 @@ def _validate_thread_id(thread_id: str) -> str:
     try:
         return normalize_thread_id(thread_id)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
+        raise ApiError(ErrorCode.THREAD_ID_INVALID, str(exc)) from exc
 
 
 # ------------------------------------------------------------------ 路由
@@ -271,6 +274,37 @@ async def get_usage_summary(
         ) from exc
 
 
+@router.get("/usage/series", response_model=UsageSeries)
+async def get_usage_series(
+    thread_id: str | None = Query(default=None, description="限定会话；不传表示全部"),
+    days: int | None = Query(default=None, ge=1, description="统计窗口天数；不传取配置默认值"),
+    limit: int | None = Query(default=None, ge=1, description="返回条数上限；不传取服务默认值"),
+    usage: UsageService = Depends(get_usage),
+) -> UsageSeries:
+    """按时间正序返回逐次模型调用的用量（「按次」视角）。
+
+    WHY 与 ``/usage`` 分开而不是给它加一个参数：两者返回形状不同（分档聚合 vs
+    逐条记录），合并后响应模型只能写成联合体，前端每次都要先判断拿到的是哪种。
+
+    WHY 这里只写 ``ge=1``：上限（200）由服务层给出，因为同一条上限也要约束 CLI
+    与测试这两个绕过 HTTP 的入口；在路由里重复写一遍数字，迟早与服务层漂开——
+    而漂开的表现是「接口放行、服务层 400」这种自相矛盾的响应。
+    """
+    try:
+        return await usage.series(thread_id=thread_id, days=days, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("用量序列查询失败")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+
 @router.get("/memories", response_model=MemoryListResult)
 async def list_memories(
     memories: MemoryService = Depends(get_memory_service),
@@ -384,6 +418,12 @@ async def update_thread(
             detail="title / archived / tags 至少要提供一项",
         )
 
+    # WHY 先给初值：三个分支是「各自独立、命中即赋值」的，而类型检查器无法从上面那句
+    # 「至少提供一项」的校验推出「三支必居其一」，于是把 ``result`` 判成可能未绑定。
+    # 用「初值 + 出口校验」把这条不变量固定下来，而不是把返回类型放宽成
+    # ``ThreadSummary | None``——那等于把一个不可达分支泄漏给调用方，让每个调用点
+    # 都去处理一种永不出现的情况。
+    result: ThreadSummary | None = None
     try:
         # WHY 三项各自独立判定，而不是 if / elif 串起来：一次请求可以同时改名与打标签，
         # 它们互不依赖；用 else 串联会让「只传 tags」的请求走进归档分支，把
@@ -404,6 +444,16 @@ async def update_thread(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         ) from exc
+
+    if result is None:
+        # 走到这里意味着「入参校验」与「赋值分支」已经不同步（新增可更新字段时最容易
+        # 漏掉一半）。这是内部不变量被破坏，记日志后按 500 回，而不是把 None 当作
+        # 一次成功的更新回给前端——那会让界面显示出一个空标题的会话。
+        logger.error("更新会话未命中任何可更新字段：thread=%s", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="会话更新未生效：请求未命中任何可更新字段",
+        )
 
     return result
 
@@ -478,6 +528,61 @@ async def import_thread(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         ) from exc
+
+
+@router.delete("/threads", response_model=WorkspaceDeleteResult)
+async def delete_workspace_threads(
+    workspace: str | None = Query(
+        default=None,
+        description="工作空间绝对路径；不传表示不按路径过滤（此时必须给出 bound）",
+    ),
+    bound: bool | None = Query(
+        default=None,
+        description=(
+            "根是否由用户显式选定：true = 用户选定的工作空间，false = 应用为会话建的专属目录；"
+            "不传表示不按归属过滤"
+        ),
+    ),
+    include_archived: bool = Query(
+        default=True, description="是否连同已归档的会话一起删除"
+    ),
+    threads: ThreadService = Depends(get_threads),
+    runs: RunService = Depends(get_runs),
+) -> WorkspaceDeleteResult:
+    """删除某个工作空间下的**全部**会话（元数据 + 检查点 + 附件）。
+
+    WHY 放在集合资源上而不是 ``/threads/{thread_id}``：它处理的是一批会话，而「哪一批」由
+    查询参数定义——这与界面上「一个工作空间分组」的口径逐字对应。让前端先把整组 ID 拉全
+    再逐条删是错的：清单接口分页，两页之间还有被新会话插入的窗口，会有漏删。
+
+    WHY 必须给过滤条件：不带条件的 ``DELETE /api/threads`` 等于清空全部会话，而它离一次
+    误操作（前端漏拼一个参数）只有一步之遥。服务层对这种请求直接 400（详见
+    ``ThreadService.delete_threads_by_workspace``）。
+
+    WHY 不删磁盘目录：这一组里的根可能是用户自己的项目目录。界面的确认框已写明这一点。
+    """
+    try:
+        result = await threads.delete_threads_by_workspace(
+            workspace=workspace,
+            workspace_bound=bound,
+            include_archived=include_archived,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("按工作空间删除会话失败：workspace=%s bound=%s", workspace, bound)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+    # WHY 逐条清理挂起审批登记：与单条删除同口径（``delete_thread`` 也做这一步）。留着它们，
+    # 「待审批数」会永久多算一批永不存在的会话——指标一旦失真就没人再信它。
+    # WHY 不区分结果分类：``clear_hitl_pending`` 对本就没有挂起的会话是 no-op，按分类跳过
+    # 只会多一处「哪些分类要清」的口径，而那处口径没有任何依据。
+    for item in result.items:
+        runs.clear_hitl_pending(item.thread_id)
+
+    return result
 
 
 @router.get("/threads/{thread_id}", response_model=list[HistoryMessage])
@@ -566,8 +671,19 @@ async def run_agent(
     # WHY 附件服务在这里现取、而不是走 ``get_attachments`` 依赖：附件必须与运行落在
     # **同一个**工作区，而本次请求要用的工作区在 body 里（不是查询参数）。走依赖会读到
     # 另一个值——新会话的附件当场「不存在」，而它明明刚上传成功。
+    #
+    # WHY 连 ``preset`` 一起传（漏过一处，症状是「预设技能一个都不生效」）：这一步是**装配**
+    # 该根的地方（技能视图在这里按工作空间 + 场景重建），而图里的技能来源就是挂载出来的
+    # ``/.skills-active``。只传工作空间、不传场景，视图会按「不限定」建好；随后 ``stream``
+    # 带着场景去取图，图却照着那份「不限定」的视图运行——日志上一切正常（视图重建那条 INFO
+    # 只在这里打印），表现是场景形同虚设。
     attachments = (
-        await resolve_scoped_services(request, thread_id=normalized, requested=body.workspace)
+        await resolve_scoped_services(
+            request,
+            thread_id=normalized,
+            requested=body.workspace,
+            preset=body.preset,
+        )
     ).attachments
 
     try:
@@ -584,8 +700,14 @@ async def run_agent(
             content,
             model_name=body.model,
             workspace=body.workspace,
+            preset=body.preset,
         )
-    except (SessionRootLockedError, SessionRootNotReadyError, SessionRootUnavailableError) as exc:
+    except (
+        SessionPresetLockedError,
+        SessionRootLockedError,
+        SessionRootNotReadyError,
+        SessionRootUnavailableError,
+    ) as exc:
         # WHY 409：三种都是「状态不允许这次操作」——已锁定（这条会话的根定了）、还没
         # 就绪（这条会话还没有根）、不可用（根目录不见了）。重试本请求无用，客户端应改用
         # 原根、新建会话，或把那个目录恢复回来。
@@ -603,9 +725,7 @@ async def run_agent(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
     except KeyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
-        ) from exc
+        raise ApiError(ErrorCode.UNKNOWN_MODEL, f"未知模型：{exc}") from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
@@ -660,9 +780,7 @@ async def resume_agent(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
     except KeyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
-        ) from exc
+        raise ApiError(ErrorCode.UNKNOWN_MODEL, f"未知模型：{exc}") from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
@@ -721,9 +839,7 @@ async def regenerate_reply(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
     except KeyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
-        ) from exc
+        raise ApiError(ErrorCode.UNKNOWN_MODEL, f"未知模型：{exc}") from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
@@ -770,9 +886,7 @@ async def edit_message(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
     except KeyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知模型：{exc}"
-        ) from exc
+        raise ApiError(ErrorCode.UNKNOWN_MODEL, f"未知模型：{exc}") from exc
     except NotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)

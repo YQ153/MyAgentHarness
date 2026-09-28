@@ -1,0 +1,12 @@
+# 场景预设：代码开发
+#
+# 字段与校验规则见 runtime/skill_presets.py。`skills` 是**技能名白名单**：名字从全部
+# 来源解析（内置 skills/builtin、本场景目录 skills/presets/coding/、用户工作区的
+# .harness/skills/），同名时优先级 用户 > 预设 > 内置。
+#
+# `include_general` 默认为 true：**通用技能**（skills/builtin/ 下的 code-review、
+# project-scaffold、doc-to-markdown）不需要写进白名单就会自动进入本场景。所以这里只写
+# 本场景自带的技能——把它们也列进来是无害冗余，但删掉也不会失效。
+title = "代码开发"
+description = "面向编程任务：代码审查、项目脚手架、提交信息规范、文档转换"
+skills = ["commit-message"]

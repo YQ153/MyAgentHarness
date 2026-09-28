@@ -16,11 +16,12 @@ WHY 两个工具分开注册：检索需要密钥（缺了就不注册，清单�
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from urllib.parse import urljoin
 
 import httpx
@@ -89,11 +90,18 @@ class SearchResult(NamedTuple):
     snippet: str
 
 
-SearchHandler = Callable[[httpx.AsyncClient, "AppConfig", str, int], Awaitable[list[SearchResult]]]
-"""检索 provider 的实现签名：``(client, config, query, limit) -> 结果列表``。
+SearchHandler = Callable[
+    [httpx.AsyncClient, "AppConfig", str, int, str],
+    Awaitable[list[SearchResult]],
+]
+"""检索 provider 的实现签名：``(client, config, query, limit, base_url) -> 结果列表``。
 
 WHY 单独起一个别名：``_SEARCH_PROVIDERS`` 表与适配器函数是成对演进的，签名写在一处
 才能让「新 provider 忘记对齐参数」在类型检查阶段就暴露。
+
+WHY ``base_url`` 由外部传入而不是适配器自己去取默认地址：那样每个适配器都会各存一份
+「官方地址」，与 ``SearchProvider.default_base_url`` 形成两份真相——新增 provider 时
+改了一处忘了另一处，症状是请求发往 A、错误文案却指向 B。地址只能有一个来源。
 """
 
 
@@ -131,6 +139,116 @@ def _render_results(query: str, results: list[SearchResult]) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ 传输层重试
+
+_T = TypeVar("_T")
+
+_RETRYABLE_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+"""哪些传输层故障值得重试。
+
+WHY 按「请求是否抵达服务端」而不是「异常是否罕见」划界：以上几类都是流量在本机或
+链路中断掉的情形——TCP/TLS 握手失败、读写超时、连接被对端重置——重发一次不会造成
+重复副作用。``httpx.TransportError`` 的其余子类（不支持的协议、非法 URL）以及所有
+状态码错误一律不重试：前者重试会得到同一个结果，后者可能已经把这次请求记进了账单。
+"""
+
+_RETRY_BASE_DELAY_SECONDS = 0.5
+"""退避基数（秒）：第 n 次失败后等待 ``base * 2 ** n``。"""
+
+_RETRY_MAX_DELAY_SECONDS = 4.0
+"""退避上限（秒）。
+
+WHY 要封顶：工具处在模型同步等待的一次调用里，一次联网失败最多应当拖住整轮几秒，
+再久用户也早就察觉了；封顶也让多个工具同时重试时不至于叠加成一个巨大的停顿。
+"""
+
+
+def _describe_transport_error(exc: httpx.HTTPError) -> str:
+    """把 httpx 异常渲染成一句有指向的诊断文本。
+
+    WHY 不能直接用 ``str(exc)``：``httpx.ConnectTimeout`` 的消息体是空的，于是回传
+    给模型的文案成了「ConnectTimeout: 」——既说不出哪个上游断了，也说不出该往哪里
+    查。这里在详情为空时显式标注，模型与运维至少能读到异常类型。
+    """
+    detail = str(exc).strip()
+    if not detail:
+        return f"{type(exc).__name__}（httpx 未携带详情）"
+    return f"{type(exc).__name__}: {detail}"
+
+
+def _backoff_delay(attempt: int) -> float:
+    """返回第 ``attempt`` 次失败后的等待秒数；``attempt`` 从 0 起算。
+
+    WHY 指数而不是固定间隔：抖动通常持续几百毫秒到几秒，固定间隔会让第二次尝试大概率
+    撞在同一段抖动上；指数退避用第二轮的那点延迟换回一条干净的连接。
+    """
+    return min(_RETRY_BASE_DELAY_SECONDS * (2**attempt), _RETRY_MAX_DELAY_SECONDS)
+
+
+async def _request_with_retry(
+    *,
+    operation: str,
+    target: str,
+    max_retries: int,
+    call: Callable[[], Awaitable[_T]],
+) -> _T:
+    """执行 ``call``，遇到传输层瞬态故障时按指数退避重试。
+
+    WHY 重试放在工具层而不是交给 ``httpx.AsyncHTTPTransport(retries=…)``：后者只覆盖
+    连接池层面的连接建立，对「已发出请求的读超时」无能为力，也不能留痕。这里同时覆盖
+    检索与抓取两条链路，并把**重试成功的那一次**也记下来——否则网络抖动在日志里永远
+    只表现为一次偏慢的请求，而没有证据说明它曾经失败过。
+
+    Args:
+        operation: 动作名，用于日志与错误文案（如 ``检索`` / ``抓取``）。
+        target: 目标地址；仅用于诊断，不含密钥。
+        max_retries: 额外尝试次数上限；``0`` 表示不重试。
+        call: 发请求的协程工厂；每次调用都会重建一条连接。
+
+    Returns:
+        ``call`` 的返回值。
+
+    Raises:
+        ValueError: ``max_retries`` 为负。
+        UpstreamServiceError: 全部尝试都失败，或遇到了不该重试的 ``httpx.HTTPError``。
+    """
+    if max_retries < 0:
+        raise ValueError(f"max_retries 不能为负：{max_retries}")
+
+    attempt = 0
+    while True:
+        try:
+            result = await call()
+        except httpx.HTTPError as exc:
+            if attempt < max_retries and isinstance(exc, _RETRYABLE_TRANSPORT_ERRORS):
+                delay = _backoff_delay(attempt)
+                logger.warning(
+                    "%s请求遇到传输层故障，%.1f 秒后重试（第 %d 次，上限 %d）：目标=%s 异常=%s",
+                    operation,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                    target,
+                    _describe_transport_error(exc),
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
+            raise UpstreamServiceError(
+                f"{operation}请求失败：{_describe_transport_error(exc)}"
+                f"（目标 {target}，共尝试 {attempt + 1} 次）"
+            ) from exc
+        if attempt:
+            logger.info("%s请求重试成功：目标=%s 第 %d 次尝试", operation, target, attempt + 1)
+        return result
+
+
 # ------------------------------------------------------------------ 检索 provider
 
 
@@ -164,6 +282,16 @@ def _search_base_url(config: AppConfig, default: str) -> str:
     """取检索服务地址：配置优先，其次 provider 官方地址。"""
     configured = (config.web_search_base_url or "").strip()
     return (configured or default).rstrip("/")
+
+
+def _search_endpoint(base_url: str) -> str:
+    """检索请求的完整地址，供日志与错误文案指认目标。
+
+    WHY 要单独算一份：``httpx`` 的超时类异常不携带地址（``ConnectTimeout`` 连消息体
+    都是空的），而错误的下一步动作是「去查这个上游为什么连不上」——没有地址就只能翻
+    源码。这里不带密钥：它与重试日志一同进日志库，密钥不该出现在那里。
+    """
+    return f"{base_url}/search"
 
 
 def _require_http_url(url: str, setting: str) -> str:
@@ -211,14 +339,14 @@ def _parse_results(payload: Any) -> list[SearchResult]:
 
 
 async def _search_tavily(
-    client: httpx.AsyncClient, config: AppConfig, query: str, limit: int
+    client: httpx.AsyncClient, config: AppConfig, query: str, limit: int, base_url: str
 ) -> list[SearchResult]:
     """Tavily：托管检索服务。
 
     说明：本适配器按 ``POST /search`` 且密钥置于请求体的既有口径实现，
     未在本机对真实服务做过端到端验证（仓库内无可用密钥）——本条已在计划中登记。
     """
-    base = _require_http_url(_search_base_url(config, _TAVILY_BASE_URL), "WEB_SEARCH_BASE_URL")
+    base = _require_http_url(_search_base_url(config, base_url), "WEB_SEARCH_BASE_URL")
     response = await client.post(
         f"{base}/search",
         json={
@@ -233,12 +361,12 @@ async def _search_tavily(
 
 
 async def _search_searxng(
-    client: httpx.AsyncClient, config: AppConfig, query: str, limit: int
+    client: httpx.AsyncClient, config: AppConfig, query: str, limit: int, base_url: str
 ) -> list[SearchResult]:
     """SearXNG：自建元搜索，不需要密钥，但必须在实例上开启 JSON 输出。"""
     # ``_require_http_url`` 除非地址以 http(s):// 开头否则必抛错，故返回值非空，
     # 无需再判一次「地址没配」——那是 ``_search_unavailable_reason`` 的职责。
-    base = _require_http_url(_search_base_url(config, ""), "WEB_SEARCH_BASE_URL")
+    base = _require_http_url(_search_base_url(config, base_url), "WEB_SEARCH_BASE_URL")
     response = await client.get(f"{base}/search", params={"q": query, "format": "json"})
     _raise_for_upstream(response, "SearXNG")
     return _parse_results(response.json())[:limit]
@@ -254,9 +382,22 @@ def _raise_for_upstream(response: httpx.Response, name: str) -> None:
         )
 
 
+class SearchProvider(NamedTuple):
+    """一个检索 provider 的静态描述。
+
+    WHY 把实现与默认地址绑成一条记录而不是两张平行的表：地址是「这个 provider 要往
+    哪儿发请求」的一部分，分开放会让新增 provider 时忘更新其中一张，症状是错误文案
+    里的目标与实际请求地址不一致——排查时最难认出来的一类错。
+    """
+
+    handler: SearchHandler
+    default_base_url: str
+    """官方地址；``""`` 表示该 provider 无官方地址，必须由配置显式提供。"""
+
+
 _SEARCH_PROVIDERS = {
-    "tavily": _search_tavily,
-    "searxng": _search_searxng,
+    "tavily": SearchProvider(handler=_search_tavily, default_base_url=_TAVILY_BASE_URL),
+    "searxng": SearchProvider(handler=_search_searxng, default_base_url=""),
 }
 """provider 名到实现的映射。
 
@@ -398,15 +539,19 @@ async def _fetch_text(
 # ------------------------------------------------------------------ 工具构造
 
 
-def _build_search_tool(config: AppConfig, handler: SearchHandler) -> BaseTool:
+def _build_search_tool(config: AppConfig, handler: SearchHandler, base_url: str) -> BaseTool:
     """构造检索工具。
 
     Args:
         config: 应用配置。
         handler: provider 的实现；由调用方按同一张表解析后传入，避免工具内部
             再判一次 provider 合法性（那会变成一条永远不可达的分支）。
+        base_url: 已解析的服务地址（配置优先于 provider 默认）；既用于发请求，
+            也用于失败时的诊断指向。
     """
     limit = config.web_search_max_results
+    max_retries = config.web_search_max_retries
+    endpoint = _search_endpoint(base_url)
 
     @tool
     async def web_search(query: str) -> str:
@@ -423,10 +568,12 @@ def _build_search_tool(config: AppConfig, handler: SearchHandler) -> BaseTool:
             timeout=config.web_search_timeout_seconds,
             headers={"User-Agent": config.web_user_agent or _DEFAULT_USER_AGENT},
         ) as client:
-            try:
-                results = await handler(client, config, normalized, limit)
-            except httpx.HTTPError as exc:
-                raise UpstreamServiceError(f"检索请求失败：{type(exc).__name__}: {exc}") from exc
+            results = await _request_with_retry(
+                operation="检索",
+                target=endpoint,
+                max_retries=max_retries,
+                call=lambda: handler(client, config, normalized, limit, base_url),
+            )
         return _render_results(normalized, results[:limit])
 
     return web_search
@@ -438,6 +585,7 @@ def _build_fetch_tool(config: AppConfig) -> BaseTool:
     max_redirects = config.web_fetch_max_redirects
     max_chars = config.web_fetch_max_chars
     user_agent = config.web_user_agent
+    max_retries = config.web_fetch_max_retries
 
     @tool
     async def web_fetch(url: str) -> str:
@@ -450,17 +598,23 @@ def _build_fetch_tool(config: AppConfig) -> BaseTool:
         if not target:
             raise WebToolError("URL 不能为空")
         try:
-            final_url, text, _truncated = await _fetch_text(
-                target,
-                timeout=timeout,
-                max_redirects=max_redirects,
-                max_chars=max_chars,
-                user_agent=user_agent,
+            # WHY 重试整次抓取而不是某一跳：每次 ``_fetch_text`` 都会新建一条连接，
+            # 于是重试自带「换新连接重来」的效果；而 SSRF 校验是无副作用的，重复执行
+            # 不会放宽判定。
+            final_url, text, _truncated = await _request_with_retry(
+                operation="抓取",
+                target=target,
+                max_retries=max_retries,
+                call=lambda: _fetch_text(
+                    target,
+                    timeout=timeout,
+                    max_redirects=max_redirects,
+                    max_chars=max_chars,
+                    user_agent=user_agent,
+                ),
             )
         except OutboundAddressRejected as exc:
             raise WebToolError(f"抓取被出站安全策略拒绝：{exc}") from exc
-        except httpx.HTTPError as exc:
-            raise UpstreamServiceError(f"抓取请求失败：{type(exc).__name__}: {exc}") from exc
 
         if final_url != target:
             return f"（经重定向到达 {final_url}）\n\n{text}"
@@ -491,8 +645,11 @@ def register_tools(registry: ToolRegistry, config: AppConfig | None = None) -> N
     reason = _search_unavailable_reason(config)
     if reason is None:
         provider = (config.web_search_provider or "none").strip().lower()
+        spec = _SEARCH_PROVIDERS[provider]
         registry.register(
-            _build_search_tool(config, _SEARCH_PROVIDERS[provider]),
+            _build_search_tool(
+                config, spec.handler, _search_base_url(config, spec.default_base_url)
+            ),
             source=ToolSource.CUSTOM,
         )
     else:

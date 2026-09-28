@@ -28,10 +28,25 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING
 
+from config import HARNESS_DIR_NAME
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
+
+_HIDDEN_ROOT_ENTRIES = frozenset({HARNESS_DIR_NAME})
+"""列**工作区根**时不返回的条目名（应用自己的数据目录）。
+
+WHY 需要隐藏（2026-09-22 新增）：应用数据（技能库 / 技能视图 / 工具留存 / 知识库索引）
+回到了工作区内的 ``.harness/``，而文件面板列的就是真实目录——不隐藏的话，用户每次打开
+面板都会先看到一屏「自己没建过的目录」；而技能视图每次重建都会刷新它的时间戳，看起来
+像项目里有东西在不停变动。
+
+WHY 只过滤**根层**、且按名字过滤：``.harness`` 是应用在根下固定的落点（名字来自
+``config``，与 ``SessionRoot.storage_dir`` 同源）；在深层按名字过滤会误伤用户自己的同名
+目录。
+"""
 
 TEXT_SUFFIXES = frozenset(
     {
@@ -318,8 +333,13 @@ def list_directory(
             # WHY 用 scandir 的 DirEntry 转 Path：Windows 上 DirEntry 已带类型
             # 信息，省掉一次 stat 系统调用；而构造条目仍需 lstat（要大小与时间）。
             entry = _entry_of(Path(child.path), virtual_dir=normalized)
-            if entry is not None:
-                entries.append(entry)
+            if entry is None:
+                continue
+            # WHY 在**根层**跳过应用数据目录：它的存在不该出现在面板里（见
+            # ``_HIDDEN_ROOT_ENTRIES`` 的 WHY）。深层同名目录不过滤——那可能是用户自己的。
+            if normalized == "/" and entry.name in _HIDDEN_ROOT_ENTRIES:
+                continue
+            entries.append(entry)
 
     entries.sort(key=lambda item: (not item.is_dir, item.name.lower()))
 

@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 # UnicodeEncodeError，把一次成功的验收变成假失败。
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from agent.run_context import AgentRunContext  # noqa: E402
 from agent.tooling import build_tool_bundle  # noqa: E402
 from bootstrap.core import build_app_context  # noqa: E402
 from config import AppConfig  # noqa: E402
@@ -43,6 +44,7 @@ from knowledge_runtime import (  # noqa: E402
     knowledge_db_path,
     peek_service,
 )
+from langchain.tools import ToolRuntime  # noqa: E402
 from llm.embed_process import default_embed_python  # noqa: E402
 
 _DOC = """# 登录服务运维手册
@@ -64,35 +66,63 @@ WHY 特意选它：若检索只是关键词碰巧命中，这条查询不会命�
 """
 
 
+def _session_root(config: AppConfig, name: str) -> pathlib.Path:
+    """取一个冒烟用的会话根。
+
+    WHY 不再读某个「启动默认工作区」：新模型下每个会话的根由它自己决定——用户选的
+    工作空间，或应用为它建的专属目录。本脚本是一段「手工会话」，因此显式取一个专属
+    目录（与 ``scripts/smoke_sandbox.py`` 同一口径）。
+
+    Args:
+        config: 应用配置。
+        name: 会话标识，用它派生专属目录名。
+
+    Returns:
+        会话根路径（目录由调用方按需创建）。
+    """
+    return config.session_dir(name)
+
+
 async def _run(config: AppConfig) -> int:
     """装配 → 索引 → 检索，返回退出码。"""
-    _session_root(config, "smoke-knowledge").mkdir(parents=True, exist_ok=True)
-    (_session_root(config, "smoke-knowledge") / "login.md").write_text(_DOC, encoding="utf-8")
+    root = _session_root(config, "smoke-knowledge")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "login.md").write_text(_DOC, encoding="utf-8")
 
     print("[1/5] 经 build_app_context 装配（与 CLI / Web 启动同一条路径）")
     async with build_app_context(config) as context:
-        capabilities = context.knowledge.capabilities()
-        print(f"      AppContext.knowledge 就位：{knowledge_db_path(config)}")
+        # WHY 按会话根装配而不是取 ``context`` 上的字段：``AppContext`` 是**应用级**
+        # 依赖集合，故意没有 ``knowledge``（它按文件根各有一份，启动时一个根都不存在）。
+        # 本脚本是一段手工会话，因此显式用自己的根装配——这也正是工具侧与接口的取法。
+        knowledge = await ensure_service(config, workspace=root)
+        capabilities = knowledge.capabilities()
+        print(f"      知识库就位：{knowledge_db_path(config, root)}")
         print(
             f"      向量检索={capabilities['vector_enabled']} "
             f"嵌入={capabilities['embedding_backend']}"
         )
-        if peek_service() is not context.knowledge:
-            print("[FAIL] 工具侧句柄与 AppContext 里的不是同一个实例")
+        if peek_service(root) is not knowledge:
+            print("[FAIL] 工具侧句柄与本次装配的不是同一个实例")
             return 1
 
         print("[2/5] 索引工作区")
-        summary = await context.knowledge.index_workspace()
+        summary = await knowledge.index_workspace()
         print(
             f"      扫描 {summary['scanned']}，新索引 {summary['indexed']}，"
             f"未变化 {summary['unchanged']}，跳过 {summary['skipped']}"
         )
-        if summary["indexed"] != 1:
-            print(f"[FAIL] 期望索引 1 个文件，实际 {summary['indexed']}")
+        # WHY 断言「新索引 + 未变化」而不是只看新索引：自动同步在装配时就跑过首轮，
+        # 很可能已经把这份文档索引好了，于是这里的手动索引会如实返回 ``unchanged``。
+        # 两种结果都说明索引已到位，只有两者都为 0 才是真没索引上。
+        if summary["indexed"] + summary["unchanged"] != 1:
+            print(
+                f"[FAIL] 期望库里有 1 个文件，实际新索引 {summary['indexed']}、"
+                f"未变化 {summary['unchanged']}"
+            )
             return 1
 
         print(f"[3/5] 服务层检索：{_QUERY!r}")
-        direct = await context.knowledge.search(_QUERY)
+        direct = await knowledge.search(_QUERY)
         if not direct["hits"]:
             print("[FAIL] 服务层没有检索到任何片段")
             return 1
@@ -111,7 +141,21 @@ async def _run(config: AppConfig) -> int:
             return 1
 
         search_tool = next(item for item in bundle.tools if item.name == "search_documents")
-        rendered = await search_tool.ainvoke({"query": _QUERY})
+        # WHY 手工构造 ``ToolRuntime``：工具声明了 ``runtime: ToolRuntime`` 参数，平时由图
+        # 在调用时注入；冒烟直接 ``ainvoke`` 不经过图，必须自己带上。带上它才有意义——
+        # 工具正是靠 ``context.workspace`` 决定查哪一个工作区的库，因此这一步同时验了
+        # 「工具取的是本轮工作区的索引」，而不是恰好拿到启动时的那一个。
+        runtime = ToolRuntime(
+            state={},
+            context=AgentRunContext(workspace=str(root)),
+            config={},
+            stream_writer=lambda *_args, **_kwargs: None,
+            tool_call_id="smoke-knowledge",
+            # WHY 显式给 ``store=None``：它是必填位置参数（知识库工具用不到 Store，
+            # 但不给就构造不出来）。
+            store=None,
+        )
+        rendered = await search_tool.ainvoke({"query": _QUERY, "runtime": runtime})
         if "/login.md" not in rendered:
             print("[FAIL] 工具结果里没有来源文件：")
             print(rendered[:400])
@@ -168,6 +212,11 @@ def main(argv: list[str]) -> int:
             skill_dirs=[root / "skills"],
             embedding_backend=args.backend,
             embedding_python=python,
+            # WHY 显式把权重缓存指到项目自己的 ``.data/embed-cache``：本脚本的数据目录是
+            # 临时目录，若按「缓存随数据目录」的默认推导，每次跑都会得到一个空缓存、
+            # 于是每次都要重新下载 90 MB（离线环境下直接失败）。冒烟要验的是**链路**，
+            # 不是下载，因此复用已经下好的那一份。
+            embedding_cache_dir=str(ROOT / ".data" / "embed-cache"),
             # WHY 只用真实启用路径来注册工具：直接调 register_tools 会绕开
             # 「模块导入 / 钩子签名判定 / 冲突检查」这几个环节，而问题往往就出在那里。
             custom_tool_modules=["knowledge_tools"],

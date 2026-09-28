@@ -71,6 +71,8 @@ _ALLOWED_RUNTIME_IMPORTS: dict[str, frozenset[str]] = {
     "runtime.knowledge_store": frozenset({"ChunkInput", "KnowledgeHit"}),
     # 运行限流器：由 RunRegistry 自建，理由见 run_registry.py 的构造注释
     "runtime.rate_limiter": frozenset({"RateLimiter"}),
+    # 场景预设（TOML）的加载与数据类
+    "runtime.skill_presets": frozenset({"PresetCatalog", "SkillPreset", "load_presets"}),
     # 技能状态常量（SkillStateStore 本身已端口化为 SkillState）
     "runtime.skill_store": frozenset({"DEFAULT_ENABLED", "GLOBAL_SCOPE"}),
     # 技能视图：只读的派生产物读写

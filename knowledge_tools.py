@@ -122,10 +122,25 @@ def _build_search_tool(config: AppConfig) -> object:
         if not hits:
             return _NO_HITS_TEMPLATE.format(query=result["query"])
 
+        # WHY 按字符预算逐条装填而不是一次拼完再截断：预算的目的是「少给几条」
+        # 而不是「把最后一条切一半」——半条片段既不可读，模型也无法引用它的来源。
+        budget = config.knowledge_search_max_chars
         lines = [f"检索到 {len(hits)} 个相关片段："]
+        injected = 0
         for index, hit in enumerate(hits, start=1):
             heading = f" · {hit['heading']}" if hit["heading"] else ""
-            lines.append(f"\n[{index}] {hit['source_path']}{heading}\n{_truncate(hit['body'])}")
+            line = f"\n[{index}] {hit['source_path']}{heading}\n{_truncate(hit['body'])}"
+            # WHY 首条不受预算约束：一条都不给时模型只会重试同样的检索词，
+            # 有限「超一点」好过把检索能力整体废掉。
+            if injected > 0 and injected + len(line) > budget:
+                lines.append(
+                    f"\n（已达单次检索的注入预算 {budget} 字符，"
+                    f"其余 {len(hits) - index + 1} 条未注入；"
+                    f"如需其余内容，请用更具体的检索词再查）"
+                )
+                break
+            lines.append(line)
+            injected += len(line)
 
         # WHY 把降级写进结果：语义检索失败时关键词结果照常返回，但模型与用户都该知道
         # 「这次没走语义」——否则「某天开始搜得不准」没有任何线索。

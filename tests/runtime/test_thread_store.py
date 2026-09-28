@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import os
+
 import aiosqlite
 import pytest
 
@@ -404,3 +406,78 @@ async def test_open_migrates_legacy_table(tmp_path):
     assert record["archived"] is False
     assert record["archived_at"] == ""
     assert [row["thread_id"] for row in rows] == ["legacy"]
+
+
+# ------------------------------------------------------------------ 按工作空间枚举 ID
+
+
+async def test_list_thread_ids_filters_by_workspace_and_includes_archived(thread_store):
+    """按工作空间枚举默认连已归档一起给出。
+
+    WHY 与 ``list_threads`` 的默认相反：这个方法服务的是「按工作空间做批量动作」的目标解析，
+    归档只改变清单可见性。沿用「默认排除」会让已归档的会话被静默漏掉——用户清完这一组，
+    勾上「含已归档」又看到它，而两次操作之间没有任何提示。
+    """
+    await thread_store.create("t1", workspace="/proj", workspace_bound=True)
+    await thread_store.create("t2", workspace="/proj", workspace_bound=True)
+    await thread_store.create("t3", workspace="/other", workspace_bound=True)
+    await thread_store.set_archived("t2", True)
+
+    ids = await thread_store.list_thread_ids(workspace="/proj", workspace_bound=True)
+    visible = await thread_store.list_thread_ids(
+        workspace="/proj", workspace_bound=True, include_archived=False
+    )
+
+    assert sorted(ids) == ["t1", "t2"]
+    assert visible == ["t1"]
+
+
+async def test_list_thread_ids_matches_normalized_path(thread_store):
+    """未归一的写法（尾部多余的 ``.``）也要命中。
+
+    WHY 单列一条：被比较的是字符串，而接口收到的路径可能是粘贴来的。差一个 ``.`` 就匹配
+    不到，接口仍然返回成功（0 条）——用户看到的是「删除成功了，但会话还在」。
+    """
+    await thread_store.create("t1", workspace="/proj", workspace_bound=True)
+
+    ids = await thread_store.list_thread_ids(
+        workspace=f"/proj{os.sep}.", workspace_bound=True
+    )
+
+    assert ids == ["t1"]
+
+
+async def test_list_thread_ids_filters_by_bound_without_path(thread_store):
+    """只给 ``workspace_bound`` 时按归属枚举：「未绑定」那一组的路径彼此不同。
+
+    WHY 单列一条：界面上「未绑定工作空间」分组只能按归属过滤（没有共同路径前缀）；
+    误把它的删除请求实现成路径过滤，会一条都命中不到，而接口返回成功。
+    """
+    await thread_store.create("m1", workspace="/sessions/m1", workspace_bound=False)
+    await thread_store.create("m2", workspace="/sessions/m2", workspace_bound=False)
+    await thread_store.create("b1", workspace="/users/proj", workspace_bound=True)
+
+    ids = await thread_store.list_thread_ids(workspace_bound=False)
+
+    assert sorted(ids) == ["m1", "m2"]
+
+
+async def test_list_thread_ids_respects_limit(thread_store):
+    for index in range(3):
+        await thread_store.create(f"t{index}", workspace="/proj", workspace_bound=True)
+
+    ids = await thread_store.list_thread_ids(workspace="/proj", limit=2)
+
+    assert len(ids) == 2
+
+
+async def test_list_thread_ids_rejects_bad_limit(thread_store):
+    """上限校验必须在语句执行之前：非法取值拼进 LIMIT 只会得到一条数据库层异常。"""
+    for bad in (0, -1, thread_store_module._MAX_ID_SCAN + 1, "x", True):
+        with pytest.raises(ValueError):
+            await thread_store.list_thread_ids(limit=bad)
+
+
+async def test_list_thread_ids_rejects_non_string_workspace(thread_store):
+    with pytest.raises(ValueError, match="workspace"):
+        await thread_store.list_thread_ids(workspace=123)

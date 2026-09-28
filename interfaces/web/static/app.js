@@ -20,6 +20,9 @@
   /** 会话清单一次拉取的条数上限（后端硬上限为 200）。 */
   const THREAD_PAGE_SIZE = 50;
 
+  /** 「按次」视角一次拉取的调用条数；与后端默认值一致（服务层硬上限 200）。 */
+  const USAGE_SERIES_LIMIT = 50;
+
   /** 与后端 uuid4().hex 一致的会话 ID 形状，用于校验 URL 片段。 */
   const THREAD_HASH_PATTERN = /^#\/c\/([A-Za-z0-9_-]{1,128})$/;
 
@@ -49,6 +52,8 @@
     workspaceClear: document.getElementById('workspace-clear'),
     workspacePick: document.getElementById('workspace-pick'),
     workspacePickStatus: document.getElementById('workspace-pick-status'),
+    presetPicker: document.getElementById('preset-picker'),
+    presetSelect: document.getElementById('preset-select'),
     workspaceBrowseOpen: document.getElementById('workspace-browse'),
     workspaceBrowseModal: document.getElementById('workspace-browse-modal'),
     workspaceBrowseClose: document.getElementById('workspace-browse-close'),
@@ -76,6 +81,17 @@
     skillsRefresh: document.getElementById('skills-refresh'),
     skillsCaps: document.getElementById('skills-caps'),
     skillsList: document.getElementById('skills-list'),
+    usageOpen: document.getElementById('usage-open'),
+    usageModal: document.getElementById('usage-modal'),
+    usageClose: document.getElementById('usage-close'),
+    usageRefresh: document.getElementById('usage-refresh'),
+    usageView: document.getElementById('usage-view'),
+    usageScope: document.getElementById('usage-scope'),
+    usageDays: document.getElementById('usage-days'),
+    usageGroupBy: document.getElementById('usage-groupby'),
+    usageGroupByField: document.getElementById('usage-groupby-field'),
+    usageCaps: document.getElementById('usage-caps'),
+    usageList: document.getElementById('usage-list'),
     attach: document.getElementById('attach'),
     attachInput: document.getElementById('attach-input'),
     attachmentStrip: document.getElementById('attachment-strip'),
@@ -115,6 +131,16 @@
      * 等于把「用户没选」偷偷变成「用户选了配置里那个」，而两者本该落到不同的根上。
      */
     workspaceChoice: null,
+  /**
+   * 本次新建会话选择的**场景预设 ID**；``null`` 表示不限定（接受全部技能）。
+   *
+   * WHY 与 workspaceChoice 一样只存在本地、直到首条消息才交给服务端：场景与文件根在
+   * 同一条记录里锁定，之后不可变更（要换场景请新建会话）——因为技能视图按工作空间物化，
+   * 同一工作空间换场景会让两条会话的视图互相覆盖。
+   */
+  presetChoice: null,
+  /** 可选的场景清单（来自 ``GET /api/presets``）；空数组表示产品没交付任何场景。 */
+  presets: [],
     /**
      * 浏览弹窗的当前一层：``{path, parent, roots, entries}``。
      *
@@ -146,6 +172,20 @@
     attachLimits: null,
     /** 模型别名 → 是否接受图片输入；来自 /api/models。 */
     modelVision: {},
+    /**
+     * 最近一次加载的用量汇总；``null`` 表示尚未加载或加载失败。
+     * WHY 缓存它而不是每次重画都拉一遍：面板上的三个下拉框都会触发重载，
+     * 而重画（切换维度后的渲染）与重拉是两件事——混在一起会让「刷新」按钮失去意义。
+     */
+    usage: null,
+    /**
+     * 最近一次加载的**逐次调用**序列；``null`` 表示当前不是该视角或加载失败。
+     *
+     * WHY 与 ``usage`` 分开存而不是共用一个字段：两个视角的响应形状不同
+     * （分档聚合 vs 逐条记录），共用会让「面板该按哪种形状渲染」只能靠猜，
+     * 而猜错的表现是渲染出空列表——看起来和「这段时间没有用量」一模一样。
+     */
+    usageSeries: null,
   };
 
   /* ------------------------------------------------------------------ 工具函数 */
@@ -211,8 +251,18 @@
     if (state.threadId) {
       return path + separator + 'thread_id=' + encodeURIComponent(state.threadId);
     }
-    if (!state.workspaceChoice) return path;
-    return path + separator + 'workspace=' + encodeURIComponent(state.workspaceChoice);
+    // 草稿态：工作空间与场景都可能还没选（两者互相独立），所以分别拼接而不是提前返回。
+    // WHY 要把场景带上：技能面板应当按**即将使用的那套技能**展示——用户选了场景却在面板里
+    // 看不到技能集变化的话，"选场景"这件事在界面上就没有任何反馈。
+    const parts = [];
+    if (state.workspaceChoice) {
+      parts.push('workspace=' + encodeURIComponent(state.workspaceChoice));
+    }
+    if (state.presetChoice) {
+      parts.push('preset=' + encodeURIComponent(state.presetChoice));
+    }
+    if (!parts.length) return path;
+    return path + separator + parts.join('&');
   }
 
   async function api(path, options) {
@@ -363,14 +413,65 @@
 
   /* ------------------------------------------------------------------ 会话清单 */
 
+  /** 给当前会话那一行加高亮。 */
   function markActiveThread() {
-    Array.from(els.threadList.children).forEach((node) => {
+    // WHY 用选择器而不是遍历直接子节点：清单按工作空间分组之后，条目是分组的孙节点——
+    // 只看直接子节点会让「当前会话」永远不高亮，而那看起来像「点了没反应」。
+    Array.from(els.threadList.querySelectorAll('.thread-item')).forEach((node) => {
       const id = node.dataset ? node.dataset.threadId : null;
       node.classList.toggle('active', Boolean(id) && id === state.threadId);
     });
   }
 
-  /** 会话条目的行内操作：重命名 / 归档（已归档时是恢复）。 */
+  /**
+   * 取工作空间的短标签（路径最后一段）。
+   *
+   * WHY 需要它：完整路径会挤满 232px 宽的侧栏并省略成一串看不出尾部的字符，而目录名才是
+   * 用户认出「这是哪个项目」的那一部分。完整路径仍然放进 `title`，悬停可查。
+   */
+  function workspaceLabel(path) {
+    // WHY 先把 `\` 换成 `/` 再切分：Windows 路径用反斜杠，而它在 JS 字符串里是转义符——
+    // 直接按它切分要写两层反斜杠，写错时的表现是「整个路径都成了名字」，且不报错。
+    const normalized = String(path || '').split('\\').join('/');
+    const parts = normalized.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(path || '');
+  }
+
+  /**
+   * 按工作空间把会话清单分组。
+   *
+   * WHY 用「是否绑定工作空间」分两类、而不是一律按路径分：没绑定工作空间的会话各自落在
+   * 应用为它建的专属目录里（路径各不相同），按路径分组会让每一条会话各成一"组"，等于没
+   * 分组。它们对用户的含义是同一件事——「这条会话没有对应的项目目录」，因此归到同一组。
+   *
+   * WHY 保持传入顺序（清单已按最近活动倒序）：先出现的组就是最近用过的工作空间，用户找
+   * 「刚才那个项目」时不必先扫一遍所有分组标题。
+   */
+  function groupThreads(items) {
+    const groups = new Map();
+    items.forEach((item) => {
+      // WHY 绑定但路径为空的行归到「未绑定」：根还没确定的会话（尚未产生第一条交互）
+      // 落在哪里本来就还没有答案，给它单独一组只会多出一个没有名字的分组。
+      const bound = item.workspace_bound === true && Boolean(item.workspace);
+      const key = bound ? `bound:${item.workspace}` : 'unbound';
+      let group = groups.get(key);
+      if (!group) {
+        group = {
+          key: key,
+          bound: bound,
+          workspace: bound ? item.workspace : '',
+          label: bound ? workspaceLabel(item.workspace) : '未绑定工作空间',
+          title: bound ? item.workspace : '这些会话使用应用为它们创建的专属目录',
+          items: [],
+        };
+        groups.set(key, group);
+      }
+      group.items.push(item);
+    });
+    return Array.from(groups.values());
+  }
+
+  /** 会话条目的行内操作：重命名 / 归档（已归档时是恢复）/ 删除。 */
   function threadActions(item) {
     const actions = el('div', 't-actions');
 
@@ -391,7 +492,73 @@
     });
     actions.appendChild(archive);
 
+    const remove = el('button', 'icon-action danger-action', '删除');
+    remove.type = 'button';
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation();
+      deleteThread(item);
+    });
+    actions.appendChild(remove);
+
     return actions;
+  }
+
+  /** 渲染一条会话条目。 */
+  function renderThreadItem(item) {
+    const node = el('div', 'thread-item');
+    node.dataset.threadId = item.thread_id;
+
+    const head = el('div', 't-head');
+    head.appendChild(el('div', 't-title', item.title || '未命名会话'));
+    // 归档条目只有勾了「含已归档」才会出现，必须带标记，否则用户会以为
+    // 清单里混进了不该出现的东西
+    if (item.archived) head.appendChild(el('span', 't-badge', '已归档'));
+    node.appendChild(head);
+
+    const sub = [formatTime(item.updated_at)];
+    if (item.turn_count > 0) sub.push(`${item.turn_count} 轮`);
+    node.appendChild(el('div', 't-sub', sub.filter(Boolean).join(' · ')));
+    node.appendChild(threadActions(item));
+
+    node.addEventListener('click', () => {
+      // 运行中禁止切换：事件流绑定在当前会话上，换 ID 会把输出渲染进错误的窗口
+      if (state.running) return;
+      navigate(`#/c/${item.thread_id}`);
+    });
+    return node;
+  }
+
+  /**
+   * 渲染一个工作空间分组（标题 + 该组下的会话 + 组级删除）。
+   *
+   * WHY 组标题要同时给出短名与完整路径（后者在 `title` 里）：短名是用户认出项目的那一部分，
+   * 但不同父目录下可能有同名项目——只显示短名时，「我要删的是哪一份」无从确认。
+   */
+  function renderThreadGroup(group) {
+    const node = el('div', 't-group');
+
+    const head = el('div', 't-group-head');
+    const title = el('div', 't-group-title', group.label);
+    title.title = group.title;
+    head.appendChild(title);
+    // WHY 徽标的 title 写明「当前清单」：清单是一次 50 条的分页结果，而整组删除覆盖的是
+    // 该工作空间下的**全部**会话。不写这一句，用户会把徽标的数字当成「会被删掉的条数」。
+    const count = el('span', 't-group-count', String(group.items.length));
+    count.title = '当前清单中显示的条数';
+    head.appendChild(count);
+
+    const remove = el('button', 'icon-action danger-action', '删除');
+    remove.type = 'button';
+    remove.title = '删除该工作空间下的全部会话（磁盘上的目录不会被删除）';
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation();
+      deleteWorkspaceGroup(group);
+    });
+    head.appendChild(remove);
+    node.appendChild(head);
+
+    group.items.forEach((item) => node.appendChild(renderThreadItem(item)));
+    return node;
   }
 
   function renderThreads(items) {
@@ -402,28 +569,10 @@
       return;
     }
 
-    items.forEach((item) => {
-      const node = el('div', 'thread-item');
-      node.dataset.threadId = item.thread_id;
-
-      const head = el('div', 't-head');
-      head.appendChild(el('div', 't-title', item.title || '未命名会话'));
-      // 归档条目只有勾了「含已归档」才会出现，必须带标记，否则用户会以为
-      // 清单里混进了不该出现的东西
-      if (item.archived) head.appendChild(el('span', 't-badge', '已归档'));
-      node.appendChild(head);
-
-      const sub = [formatTime(item.updated_at)];
-      if (item.turn_count > 0) sub.push(`${item.turn_count} 轮`);
-      node.appendChild(el('div', 't-sub', sub.filter(Boolean).join(' · ')));
-      node.appendChild(threadActions(item));
-
-      node.addEventListener('click', () => {
-        // 运行中禁止切换：事件流绑定在当前会话上，换 ID 会把输出渲染进错误的窗口
-        if (state.running) return;
-        navigate(`#/c/${item.thread_id}`);
-      });
-      els.threadList.appendChild(node);
+    // WHY 永远分组（而不是再加一个「分组 / 平铺」开关）：工作空间是这份清单唯一的结构性
+    // 维度，而平铺时「这几条会话改的是同一个项目」只能靠用户逐条点开确认。
+    groupThreads(items).forEach((group) => {
+      els.threadList.appendChild(renderThreadGroup(group));
     });
 
     markActiveThread();
@@ -467,6 +616,114 @@
     } catch (err) {
       appendError((archived ? '归档' : '恢复') + '失败：' + err.message);
     }
+  }
+
+  /**
+   * 删除一条会话（不可撤销：检查点与附件一并清理）。
+   *
+   * WHY 要二次确认：与归档不同，这一步会连检查点一起销毁，没有任何界面能把它找回来；
+   * 而两个按钮挨在一起，误点的代价远高于多点一次确认。
+   */
+  async function deleteThread(item) {
+    if (state.running) {
+      appendNotice('会话正在运行，请先停止再删除。');
+      return;
+    }
+    const label = item.title || '未命名会话';
+    if (
+      !window.confirm(
+        `删除会话「${label}」？\n\n该会话的历史记录、检查点与附件都会被清理，且不可恢复。\n（工作空间目录本身不会被删除。）`
+      )
+    ) {
+      return;
+    }
+
+    try {
+      await api(`/api/threads/${encodeURIComponent(item.thread_id)}`, { method: 'DELETE' });
+      await afterThreadRemoval([item.thread_id]);
+    } catch (err) {
+      appendError('删除会话失败：' + err.message);
+    }
+  }
+
+  /**
+   * 删除一个工作空间分组下的全部会话。
+   *
+   * WHY 由服务端按过滤条件解析目标、而不是把界面上这几条会话的 ID 发过去：清单是分页的
+   * （一次 50 条），而「这个工作空间下的会话」可能更多——按当前这一页发 ID，删掉的是
+   * 「我看见的那几条」，用户以为清空了、实际没有，且下一次刷新才会发现。
+   *
+   * WHY 连已归档的一起删（`include_archived=true`）：归档只是「从清单里收起来」，不是
+   * 另一个工作空间。留下一批已归档的会话，用户下次勾上「含已归档」会看到这个组又回来了。
+   * 这一点在确认框里写明，不能只写在代码里。
+   */
+  async function deleteWorkspaceGroup(group) {
+    if (state.running) {
+      appendNotice('会话正在运行，请先停止再删除。');
+      return;
+    }
+    const where = group.bound
+      ? `工作空间「${group.label}」\n${group.workspace}`
+      : '「未绑定工作空间」的会话（应用为它们创建的专属目录）';
+    if (
+      !window.confirm(
+        `删除 ${where} 下的全部会话？\n\n` +
+          `该工作空间下的所有会话都会被清理——包括已归档的、以及未显示在此列表中的（本列表目前显示 ${group.items.length} 条）。\n` +
+          '历史记录、检查点与附件一并删除，且不可恢复。磁盘上的目录不会被删除。'
+      )
+    ) {
+      return;
+    }
+
+    // WHY 只带 bound 或 workspace：两者是同一组的两种形态（绑定到某个目录 / 未绑定），
+    // 而服务端在两者都不给时会以 400 拒绝——那正是为了防止这里漏拼参数变成「清空全部」。
+    const params = new URLSearchParams();
+    params.set('bound', group.bound ? 'true' : 'false');
+    if (group.bound && group.workspace) params.set('workspace', group.workspace);
+    params.set('include_archived', 'true');
+
+    try {
+      const response = await api(`/api/threads?${params.toString()}`, { method: 'DELETE' });
+      const payload = await response.json();
+      const removed = (payload.items || []).map((entry) => entry.thread_id);
+      await afterThreadRemoval(removed);
+      appendNotice(describeWorkspaceDeletion(payload, group));
+    } catch (err) {
+      appendError('删除工作空间下的会话失败：' + err.message);
+    }
+  }
+
+  /**
+   * 把整组删除的结果说清楚。
+   *
+   * WHY 不只报「已删除 N 条」：`partial`（检查点残留）与 `failed` 都意味着**结果与用户
+   * 的预期不同**——前者会留下读得到的历史，后者会话还在清单里。只报成功条数，用户会
+   * 把「删了 10 条但还剩 2 条」当成界面没刷新。
+   */
+  function describeWorkspaceDeletion(payload, group) {
+    const where = group.bound ? `工作空间「${group.label}」` : '未绑定工作空间的会话';
+    const parts = [`${where}：已删除 ${payload.deleted} 条会话`];
+    if (payload.not_found) parts.push(`${payload.not_found} 条本就已被删除`);
+    if (payload.partial) parts.push(`${payload.partial} 条的历史残留未清掉（见审计日志）`);
+    if (payload.failed) parts.push(`${payload.failed} 条删除失败（见审计日志）`);
+    return parts.join('，') + '。';
+  }
+
+  /**
+   * 会话被删除后的界面收尾。
+   *
+   * WHY 收成一个函数：单条删除与整组删除要做的是同样两件事——若被删的正是当前打开的会话就
+   * 退回草稿态（它的历史已不存在，留在那个 ID 上只会让下一次发送失败），然后刷新清单。
+   * 两处各写一遍迟早漏掉其中一步，而漏掉「退回草稿态」的表现是界面看起来正常、下一次发送
+   * 才报错，排查方向完全指不到删除这一侧。
+   */
+  async function afterThreadRemoval(threadIds) {
+    if (state.threadId && threadIds.indexOf(state.threadId) !== -1) {
+      // navigate 会触发 hashchange → syncWithUrl → startDraft，界面由此回到干净状态。
+      // 它只清消息区、不碰清单，因此下面这次刷新不会被它覆盖掉。
+      navigate('');
+    }
+    await loadThreads();
   }
 
   async function loadThreads() {
@@ -638,6 +895,26 @@
   }
 
   /**
+   * 把气泡里尚未渲染的 Mermaid 代码块换成图。
+   *
+   * WHY 单独一层、且不 await：图是正文的锦上添花（渲染失败时 MermaidView 内部已经
+   * 把源码原样留下并写明原因），因此它既不该挡住消息区的后续渲染，也不该在渲染器
+   * 缺席（脚本没挂上、或内置发行文件缺失）时让正文跟着消失——那两种情况下这里
+   * 直接返回，用户看到的只是没有图的代码块，而不是一片空白。
+   *
+   * @param {Element} scope 助手气泡（图会就地替换其中的代码块）。
+   */
+  function enhanceDiagrams(scope) {
+    if (!window.MermaidView || typeof window.MermaidView.enhance !== 'function') return;
+    // WHY 仍然挂一个 catch：MermaidView 承诺「不把异常抛给调用方」，但它是第三方资源的
+    // 接缝——真漏出来一个未处理的拒绝，表现是一整轮对话静默停在这里。
+    window.MermaidView.enhance(scope).catch((err) => {
+      // 只记日志、不打扰用户：气泡里的代码块仍然完好，用户没有任何需要处理的动作。
+      console.warn('Mermaid 渲染未完成：', err);
+    });
+  }
+
+  /**
    * 渲染历史消息。
    * WHY 按 role 而不是按事件重放：历史来自检查点的最终状态，
    * 其中的 token 早已合并成完整文本，重放事件流既慢也没有对应数据。
@@ -694,6 +971,9 @@
         }
         bubble.appendChild(body);
         els.messages.appendChild(bubble);
+        // 历史里的图也要画出来：只在流式路径上接线的话，表现是「刷新前有图、刷新后
+        // 变成一堆代码」——那种「半接线」用户很难描述，只会以为图渲染不可靠。
+        enhanceDiagrams(bubble);
       }
       (message.tool_calls || []).forEach((call, index) => {
         appendToolCard({
@@ -899,6 +1179,9 @@
           state.assistantBody.innerHTML = window.Markdown.render(
             state.assistantBody.textContent
           );
+          // WHY 在这里就把气泡交出去、而不是等下面两行清空引用之后：图要写回这块气泡，
+          // 而那两个字段马上会被置空——那时再找「刚才那条消息」已经没有引用了。
+          enhanceDiagrams(state.assistantEl);
         }
         state.assistantEl = null;
         state.assistantBody = null;
@@ -1210,6 +1493,10 @@
     // 交给服务端——工作区只在**首条消息**上绑定，后续轮次带上它只会撞 409。
     const drafting = !state.threadId;
     const workspace = drafting ? state.workspaceChoice : null;
+    // 场景与工作空间一样只在**首条消息**上提交：两者都在那一刻锁定，之后不可变更。
+    // 直接读下拉框的值而不是 state.presetChoice，是为了避免"改了控件但状态没同步"这类
+    // 只在某条路径上出现的偏差——DOM 是用户唯一真正操作过的地方。
+    const preset = drafting ? els.presetSelect.value || null : null;
 
     setRunning(true);
     try {
@@ -1248,6 +1535,8 @@
               attachment_ids: attachmentIds,
               // 只在新会话的首条消息上带：服务端以它作为这条会话的绑定值
               workspace: workspace,
+              // 场景同理：与工作空间在同一条记录里锁定，之后给出不同的值会被 409 拒绝
+              preset: preset,
             }
           : {
               message_index: editing,
@@ -1409,6 +1698,11 @@
       els.attachInput.value = '';
     });
     els.modelSelect.addEventListener('change', updateAttachAvailability);
+    els.presetSelect.addEventListener('change', () => {
+      state.presetChoice = els.presetSelect.value || null;
+      // WHY 只记状态、不立刻拉面板：技能面板是弹窗、打开时才请求（请求会带上新的 preset）。
+      // 在这里主动刷新，等于用户每换一次场景就顺带拉一遍技能清单——而他此刻未必在看它。
+    });
 
     // 拖拽落点覆盖消息区与输入区：只认其中一个会让「拖到对话框上」变成浏览器
     // 直接打开该文件。必须 preventDefault 才能接管这个默认行为。
@@ -1821,6 +2115,14 @@
       if (!item.enabled) {
         main.appendChild(el('div', 'knowledge-sub', '已停用，Agent 不会加载它'));
       }
+      // 场景归因要说出来：不在本场景内的技能本来就不进视图，启停对它这次的加载没有意义；
+      // 而靠「通用技能」身份进来的那些，白名单里没有它也是正常的——不写这句，用户会以为
+      // 场景配置漏了。
+      if (!item.in_preset) {
+        main.appendChild(el('div', 'knowledge-sub', '不在本场景内，不会进入本次会话的技能视图'));
+      } else if (item.admitted_by === 'general') {
+        main.appendChild(el('div', 'knowledge-sub', '通用技能：场景自动启用（白名单里没写也生效）'));
+      }
       row.appendChild(main);
 
       const toggle = el(
@@ -1879,6 +2181,279 @@
     els.skillsClose.addEventListener('click', closeSkillsModal);
     els.skillsRefresh.addEventListener('click', () => loadSkills());
     els.skillsModal.querySelector('.modal-backdrop').addEventListener('click', closeSkillsModal);
+  }
+
+  /* ------------------------------------------------------------------ 用量面板 */
+
+  /**
+   * 把命中率渲染成可读文本。
+   *
+   * WHY 必须区分「未知」与「0%」：provider 未上报缓存字段时服务端给出 null，而
+   * 「确实一次都没命中」是 0——两者的结论相反（前者不能用来否定缓存收益，后者可以）。
+   * 把它们显示成同一个数字，正是本面板要消除的那种误判。
+   */
+  function formatHitRate(rate) {
+    if (rate === null || rate === undefined) return '未知';
+    return `${(rate * 100).toFixed(1)}%`;
+  }
+
+  /**
+   * token 数的千分位显示。
+   * WHY：一轮对话动辄几十万 token，不分组时「1234567」要靠数位数才能读出量级。
+   */
+  function formatTokens(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '0';
+    return number.toLocaleString('zh-CN');
+  }
+
+  function openUsageModal() {
+    els.usageModal.style.display = '';
+    // WHY 打开时对齐「范围」选项：没有会话就选不了「当前会话」，而服务端对不存在的
+    // thread_id 会回 404——留着这个可选项，用户选中后拿到的报错与「用量为空」看不出区别。
+    const hasThread = Boolean(state.threadId);
+    els.usageScope.disabled = !hasThread;
+    if (!hasThread) els.usageScope.value = 'all';
+    loadUsage();
+  }
+
+  function closeUsageModal() {
+    els.usageModal.style.display = 'none';
+  }
+
+  /** 当前视角：``aggregate``（聚合）或 ``series``（按次）。 */
+  function usageView() {
+    return els.usageView.value === 'series' ? 'series' : 'aggregate';
+  }
+
+  /**
+   * 两个视角共用的过滤参数（窗口 + 范围）。
+   *
+   * WHY 抽成一处：两个端点必须对「看的是哪段时间、哪条会话」给出完全一致的解释。
+   * 各拼一遍的话，某天给其中一处补了个参数，另一个视角的数字就悄悄对不上了——
+   * 而两边的代码看起来都对。
+   */
+  function usageParams() {
+    const params = new URLSearchParams({ days: els.usageDays.value });
+    // WHY 只在真的选了「当前会话」时才带 thread_id：带上它就把结果限定到一条会话，
+    // 而服务端会校验该会话是否存在——草稿态没有会话，带上必然 404。
+    if (els.usageScope.value === 'thread' && state.threadId) {
+      params.set('thread_id', state.threadId);
+    }
+    return params;
+  }
+
+  async function loadUsage() {
+    const view = usageView();
+    // 分组选择器只在聚合视角参与请求；按次视角下留着可点，会让人以为
+    // 「改了分组却没反应」是故障。
+    els.usageGroupByField.hidden = view !== 'aggregate';
+
+    els.usageCaps.innerHTML = '';
+    els.usageList.innerHTML = '';
+    els.usageList.appendChild(el('div', 'knowledge-empty', '加载中…'));
+
+    // WHY 只在这里兜一次错：两个子加载器只负责取数与渲染、失败一律上抛，
+    // 于是「加载中 → 失败」的界面切换只写一遍，不会在两个分支里各自漂移。
+    try {
+      if (view === 'series') {
+        await loadUsageSeries();
+      } else {
+        await loadUsageAggregate();
+      }
+    } catch (err) {
+      state.usage = null;
+      state.usageSeries = null;
+      els.usageCaps.innerHTML = '';
+      els.usageList.innerHTML = '';
+      els.usageList.appendChild(el('div', 'knowledge-empty', `加载失败：${err.message}`));
+    }
+  }
+
+  async function loadUsageAggregate() {
+    const params = usageParams();
+    params.set('group_by', els.usageGroupBy.value);
+    const response = await api(`/api/usage?${params.toString()}`);
+    state.usage = await response.json();
+    state.usageSeries = null;
+    renderUsage();
+  }
+
+  async function loadUsageSeries() {
+    const params = usageParams();
+    // WHY 条数不在界面上暴露：这是「最近发生了什么」的观察窗口，不是分页列表；
+    // 给一个可调数字只会让人以为要自己调参才能看全。
+    params.set('limit', String(USAGE_SERIES_LIMIT));
+    const response = await api(`/api/usage/series?${params.toString()}`);
+    state.usageSeries = await response.json();
+    state.usage = null;
+    renderUsageSeries();
+  }
+
+  function renderUsage() {
+    const payload = state.usage;
+    if (!payload) return;
+
+    els.usageCaps.innerHTML = '';
+    els.usageCaps.appendChild(el('span', 'knowledge-chip', `窗口 ${payload.window_days} 天`));
+    els.usageCaps.appendChild(el('span', 'knowledge-chip', `调用 ${payload.call_count} 次`));
+    els.usageCaps.appendChild(
+      el('span', 'knowledge-chip', `输入 ${formatTokens(payload.prompt_tokens)}`)
+    );
+    els.usageCaps.appendChild(
+      el('span', 'knowledge-chip', `输出 ${formatTokens(payload.completion_tokens)}`)
+    );
+    els.usageCaps.appendChild(
+      el('span', 'knowledge-chip', `合计 ${formatTokens(payload.total_tokens)} tokens`)
+    );
+    // WHY 命中率单独成枚 chip 并加样式：它是本面板唯一能回答「缓存到底有没有省到钱」
+    // 的数字；与其余 chip 长得一样时会被当成又一个统计量略过。
+    els.usageCaps.appendChild(
+      el(
+        'span',
+        'knowledge-chip usage-rate',
+        `缓存命中率 ${formatHitRate(payload.cache_hit_rate)}`
+      )
+    );
+
+    els.usageList.innerHTML = '';
+
+    const groups = payload.groups || [];
+    if (!groups.length) {
+      els.usageList.appendChild(el('div', 'knowledge-empty', '这个窗口内还没有用量记录。'));
+      return;
+    }
+
+    groups.forEach((group) => {
+      const row = el('div', 'knowledge-row');
+      const main = el('div', 'knowledge-main');
+      main.appendChild(el('div', 'knowledge-path', group.key || '（未标注）'));
+      main.appendChild(
+        el(
+          'div',
+          'knowledge-sub',
+          `输入 ${formatTokens(group.prompt_tokens)} · 输出 ${formatTokens(group.completion_tokens)}`
+            + ` · 合计 ${formatTokens(group.total_tokens)} tokens · 调用 ${group.call_count} 次`
+            + ` · 缓存命中 ${formatTokens(group.cache_hit_tokens)}（${formatHitRate(group.cache_hit_rate)}）`
+        )
+      );
+      row.appendChild(main);
+      els.usageList.appendChild(row);
+    });
+  }
+
+  /**
+   * 与后端同一口径的命中率：分母是 ``prompt_tokens``，输入为 0 时返回 ``null``。
+   *
+   * WHY 整体命中率不能对各行百分比取算术平均：那样一次 5 token、命中 0 的调用
+   * 与一次 10000 token、命中 9500 的调用会占相同权重，而它们的成本差着几个数量级。
+   * 必须按 token 加权（见 ``seriesHitRate``）。
+   */
+  function cacheRatio(promptTokens, cacheHitTokens) {
+    if (!promptTokens || promptTokens <= 0) return null;
+    return cacheHitTokens / promptTokens;
+  }
+
+  /** 序列的整体命中率（按 token 加权）。 */
+  function seriesHitRate(items) {
+    let prompt = 0;
+    let hit = 0;
+    (items || []).forEach((call) => {
+      prompt += Number(call.prompt_tokens) || 0;
+      hit += Number(call.cache_hit_tokens) || 0;
+    });
+    return formatHitRate(cacheRatio(prompt, hit));
+  }
+
+  /** ISO8601（UTC）→「MM-DD HH:MM」；解析不了时原样返回，不编造时间。 */
+  function formatClock(value) {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value || '';
+    const pad = (number) => String(number).padStart(2, '0');
+    return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`
+      + ` ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+  }
+
+  /**
+   * 命中率的横向内联条。
+   *
+   * WHY 用条而不只给数字：这一视角的全部意义是「看趋势」——一排条的长度变化，
+   * 比一列百分比更快暴露「从第几次开始掉下来」。
+   * WHY 未知（未上报）时不画填充：把「没有数据」画成一根空条，读起来就是
+   * 「命中率为 0」，而那是一个相反的结论。
+   */
+  function hitRateBar(rate) {
+    const bar = el('span', 'usage-bar');
+    const fill = el('span', 'usage-bar-fill');
+    if (rate !== null && rate !== undefined) {
+      fill.style.width = `${Math.round(rate * 100)}%`;
+    }
+    bar.appendChild(fill);
+    bar.title = `命中率 ${formatHitRate(rate)}`;
+    return bar;
+  }
+
+  function renderUsageSeries() {
+    const payload = state.usageSeries;
+    if (!payload) return;
+
+    els.usageCaps.innerHTML = '';
+    els.usageCaps.appendChild(el('span', 'knowledge-chip', `窗口 ${payload.window_days} 天`));
+    els.usageCaps.appendChild(el('span', 'knowledge-chip', `最近 ${payload.count} 次调用`));
+    if (payload.truncated) {
+      // WHY 必须显式提示：不说这句，「最近 50 次」看起来就是全部记录，
+      // 用户会据此以为更早的调用不存在——而趋势的判断恰恰依赖跨度。
+      els.usageCaps.appendChild(
+        el('span', 'knowledge-chip usage-truncated', '还有更早的记录未显示')
+      );
+    }
+    els.usageCaps.appendChild(
+      el('span', 'knowledge-chip usage-rate', `整体命中率 ${seriesHitRate(payload.items)}`)
+    );
+
+    els.usageList.innerHTML = '';
+    const items = payload.items || [];
+    if (!items.length) {
+      els.usageList.appendChild(el('div', 'knowledge-empty', '这个窗口内还没有调用记录。'));
+      return;
+    }
+
+    items.forEach((call, index) => {
+      const row = el('div', 'knowledge-row');
+      const main = el('div', 'knowledge-main');
+      // WHY 带序号且按时间正序：用户要读的是「第几次开始掉」，
+      // 而时间戳本身不便于数位置。
+      main.appendChild(
+        el(
+          'div',
+          'knowledge-path',
+          `#${index + 1} ${formatClock(call.created_at)} · ${call.model}`
+        )
+      );
+      main.appendChild(
+        el(
+          'div',
+          'knowledge-sub',
+          `输入 ${formatTokens(call.prompt_tokens)} · 输出 ${formatTokens(call.completion_tokens)}`
+            + ` · 缓存命中 ${formatTokens(call.cache_hit_tokens)}（${formatHitRate(call.cache_hit_rate)}）`
+        )
+      );
+      row.appendChild(main);
+      row.appendChild(hitRateBar(call.cache_hit_rate));
+      els.usageList.appendChild(row);
+    });
+  }
+
+  function bindUsageEvents() {
+    els.usageOpen.addEventListener('click', openUsageModal);
+    els.usageClose.addEventListener('click', closeUsageModal);
+    els.usageRefresh.addEventListener('click', () => loadUsage());
+    // WHY 四个选择器都直接重载：改变视角或维度后停在旧数据上，用户会以为选择没生效。
+    els.usageView.addEventListener('change', () => loadUsage());
+    els.usageScope.addEventListener('change', () => loadUsage());
+    els.usageDays.addEventListener('change', () => loadUsage());
+    els.usageGroupBy.addEventListener('change', () => loadUsage());
+    els.usageModal.querySelector('.modal-backdrop').addEventListener('click', closeUsageModal);
   }
 
   /* ------------------------------------------------------------------ 工作区面板 */
@@ -1981,6 +2556,9 @@ function clearWorkspacePreview() {
 function renderWorkspacePicker() {
   const drafting = !state.threadId;
   els.workspacePicker.hidden = !drafting;
+  // 场景选择器与工作空间选择器的显示时机**完全相同**（都只影响新建会话），所以在这里
+  // 一起刷新：两处各写一遍判断，迟早出现「一个收起来了、另一个还留着」。
+  renderPresetPicker(drafting);
   if (!drafting) return;
 
   const chosen = state.workspaceChoice;
@@ -1990,6 +2568,49 @@ function renderWorkspacePicker() {
   els.workspaceChoiceText.title = chosen || '';
   // 「不绑定」按钮只在已选时可用：没选的时候它什么也不做，留着反而像个必须点的步骤。
   els.workspaceClear.disabled = !chosen;
+}
+
+/**
+ * 渲染「本次会话场景」选择器。
+ *
+ * WHY 只在草稿态出现：场景与文件根在同一条记录里锁定，而技能视图按**工作空间**物化——
+ * 同一个工作空间换场景会让两条会话的视图互相覆盖，而两侧都不会报错。因此改场景的唯一
+ * 正确做法是新建会话，而不是就地改。
+ *
+ * WHY 没有任何场景时隐藏整个选择器：产品没交付场景（或预设目录为空）时，一个空下拉框
+ * 只会让人以为功能坏了。
+ */
+function renderPresetPicker(drafting) {
+  const available = state.presets.length > 0;
+  els.presetPicker.hidden = !drafting || !available;
+  if (!drafting || !available) return;
+  els.presetSelect.value = state.presetChoice || '';
+}
+
+/** 拉取场景清单并填充下拉框；失败只提示，不影响其余界面。 */
+async function loadPresets() {
+  try {
+    const response = await api('/api/presets');
+    const payload = await response.json();
+    state.presets = payload.items || [];
+    els.presetSelect.innerHTML = '';
+    const none = el('option', null, '不限定（接受全部技能）');
+    none.value = '';
+    els.presetSelect.appendChild(none);
+    state.presets.forEach((item) => {
+      const option = el('option', null, item.title + '（' + item.id + '）');
+      option.value = item.id;
+      option.title = item.description || '';
+      els.presetSelect.appendChild(option);
+    });
+    // 写坏的 preset.toml 会以 `problems` 下发：它们只会从下拉里静默消失，不提示的话
+    // 配置作者完全没有线索。
+    (payload.problems || []).forEach((problem) => {
+      appendNotice('场景配置有问题，已跳过：' + problem.directory + '（' + problem.reason + '）');
+    });
+  } catch (err) {
+    appendError('场景清单加载失败：' + err.message);
+  }
 }
 
 /* ------------------------------------------------------------------ 工作区浏览 */
@@ -2403,6 +3024,7 @@ function bindWorkspaceEvents() {
     bindWorkspaceEvents();
     bindKnowledgeEvents();
     bindSkillsEvents();
+    bindUsageEvents();
 
     // WHY 只注册不直接调用：navigate() 赋值 hash 同样会触发该事件，
     // 让「URL 变化 → 同步界面」成为唯一入口，避免两处逻辑漂移
@@ -2413,6 +3035,9 @@ function bindWorkspaceEvents() {
     await loadModels();
     // 上限在模型之后加载：两者都只影响输入区的可用性，而模型决定了「能不能传」
     await loadAttachmentLimits();
+    // 场景清单：只决定新建会话时下拉框里有什么；失败已在 loadPresets 内部兜住，
+    // 因此不阻塞首屏（一个可选的选择器加载失败，不该让整个界面停在白屏）。
+    await loadPresets();
     await loadThreads();
     // 刷新时按 URL 恢复：带会话 ID 则拉历史，否则进入草稿态（不创建任何东西）
     await syncWithUrl();

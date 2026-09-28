@@ -26,6 +26,7 @@ _BUILTIN_ORDER: tuple[str, ...] = (
     "read_file",
     "write_file",
     "edit_file",
+    "delete",
     "glob",
     "grep",
     "execute",

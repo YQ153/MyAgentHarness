@@ -526,6 +526,29 @@ class KnowledgeStore:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def list_source_paths(self, *, owner_id: str) -> list[str]:
+        """列出某主体已索引的**全部**源文件路径（不受条数上限约束）。
+
+        WHY 单独一个方法而不是给 :meth:`list_documents` 加一个「不限制」的开关：
+        后者是给面板看的、必须分页（一次最多 200 条）；而增量同步要的是「全部路径」
+        这个集合，用来找出「库里有、磁盘上已没有」的文档。让一个方法同时承担两种
+        语义，``limit`` 就变成了「要不要限制」的隐式开关——而同步漏掉第 201 条之后
+        的文档，表现是「删掉的文件还能被检索到」，没有任何报错。
+
+        Raises:
+            ValueError: ``owner_id`` 非法。
+            aiosqlite.Error: 数据库层异常，原样向上抛出。
+        """
+        owner = self._validate_owner(owner_id)
+        async with self._lock:
+            async with self._conn.execute(
+                "SELECT source_path FROM knowledge_documents WHERE owner_id = ? "
+                "ORDER BY source_path ASC",
+                (owner,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [str(row["source_path"]) for row in rows]
+
     async def search_vector(
         self, *, owner_id: str, vector: Sequence[float], limit: int = 10
     ) -> list[KnowledgeHit]:

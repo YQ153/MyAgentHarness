@@ -1,13 +1,17 @@
-"""根外存储：技能库 / 技能视图 / 工具留存搬出工作区之后的位置、迁移与挂载。
+"""工作区内的应用数据目录（``.harness/``）：位置、迁移与只读挂载。
 
-WHY 需要这一组用例：这次改动的**验收点**是「工作区里不再出现应用自己的目录」——而这件事
-一旦回退，表现只是「用户的项目里又多了几个名字」，没有任何报错。因此这里同时钉住四件事：
+WHY 需要这一组用例：2026-09-22 把技能库 / 技能视图 / 工具留存 / 知识库索引从
+``<数据目录>/roots/<根标识>/`` 搬回了**工作区内**的 ``.harness/``——理由是这些内容与
+工作空间强绑定（技能是「这个项目常用的套路」，留存是「这个项目的运行记录」），跟着项目走
+才能让换机器、换工作空间之后行为一致。
 
-1. 位置：存储目录由根派生、稳定、且不与别的根撞车；
-2. 不碰工作区：装配一个根之后，工作区里**只有用户自己的文件**；
-3. 迁移：旧位置（工作区里的 ``skills/``）的技能包要搬过来（技能是用户放进来的东西，
-   静默丢掉等于让它凭空消失）；
-4. 挂载：三个虚拟路径经只读挂载接回，Agent 与文件面板都读得到。
+这次调整的验收点因此有三条，且**任何一条回退都不会报错**：
+
+1. 位置：全部落在 ``<工作区>/.harness/`` 下，且只有一个入口名字（不是散开的三四个）；
+2. 迁移：两代旧位置（``<数据目录>/roots/<根标识>/`` 与更早的 ``<工作区>/skills/``）里的
+   技能包与留存都要搬过来——技能是用户放进来的东西，静默丢掉等于让它凭空消失；
+3. 只读：内容虽然在工作区内，但 Agent **改不动**（``/skills``、``/.harness/`` 等只读路由），
+   否则「Agent 能重写自己的技能库」这件事会以「行为忽然变了」的形式出现。
 """
 
 from __future__ import annotations
@@ -19,8 +23,14 @@ import pytest
 from langgraph.store.base import BaseStore
 
 from agent.backends import build_backend
-from application.session_registry import SessionRegistry
-from config import VIRTUAL_SKILLS, VIRTUAL_SKILL_VIEW, VIRTUAL_TOOL_OUTPUTS, SessionRoot
+from config import (
+    HARNESS_DIR_NAME,
+    VIRTUAL_HARNESS,
+    VIRTUAL_SKILLS,
+    VIRTUAL_SKILL_VIEW,
+    VIRTUAL_TOOL_OUTPUTS,
+    SessionRoot,
+)
 from runtime.store import open_store
 from runtime.thread_store import ThreadMetaStore
 from runtime.tool_outputs import tool_output_path, tool_output_virtual_path, write_tool_output
@@ -30,8 +40,8 @@ from tests.conftest import make_config, make_root
 
 _SKILL = "---\nname: {name}\ndescription: {name} 的说明\n---\n\n# {name}\n"
 
-_STORED_NAMES = ("skills", "skills-active", "tool-outputs")
-"""存储目录里的三个子目录名（见 ``config`` 的布局常量）。"""
+_STORED_NAMES = ("skills", "tool-outputs")
+"""``.harness/`` 下由 ``ensure_storage`` 直接建出来的两个子目录名。"""
 
 
 @pytest.fixture
@@ -56,29 +66,47 @@ def _names(directory: Path) -> set[str]:
 # ------------------------------------------------------------------ 位置
 
 
-def test_storage_dir_is_derived_from_the_root_and_stable(tmp_path: Path) -> None:
-    """同一个根恒得到同一个存储目录；不同的根不撞车；名字可读。"""
+def test_storage_dir_lives_inside_the_workspace(tmp_path: Path) -> None:
+    """存储目录固定在工作区内的 ``.harness/``：同一个根恒等，不同根各有一份。"""
     config = make_config(tmp_path)
     first = make_root(config, name="project-a")
     again = SessionRoot(config, first.root)
     other = make_root(config, name="project-b")
 
     assert first.storage_dir == again.storage_dir
+    assert first.storage_dir == first.root / HARNESS_DIR_NAME
+    assert other.storage_dir == other.root / HARNESS_DIR_NAME
     assert first.storage_dir != other.storage_dir
-    assert first.storage_dir.parent == config.roots_store_root
-    assert first.storage_dir.name.startswith("project-a-")
 
 
-def test_the_storage_dir_does_not_depend_on_the_data_directory_layout(tmp_path: Path) -> None:
-    """存储目录跟着数据目录走：换数据目录就换一片存储（备份只需搬一个目录）。"""
-    left = make_root(make_config(tmp_path / "left"))
-    right = make_root(make_config(tmp_path / "right"))
+def test_the_storage_dir_follows_the_workspace_not_the_data_directory(tmp_path: Path) -> None:
+    """同一个工作区在不同数据目录下得到同一个存储目录（存储跟着项目走）。
 
-    assert left.storage_dir != right.storage_dir
-    assert left.storage_dir.parent.parent == tmp_path / "left"
+    WHY 反向断言（这是本次调整的核心）：旧布局按数据目录派生存储位置，于是「换个数据目录
+    或换台机器」会让技能库看起来消失；现在它只取决于工作区。
+    """
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    left = SessionRoot(make_config(tmp_path / "left"), workspace)
+    right = SessionRoot(make_config(tmp_path / "right"), workspace)
+
+    assert left.storage_dir == right.storage_dir == workspace / HARNESS_DIR_NAME
 
 
-# ------------------------------------------------------------------ 不碰工作区
+def test_every_store_lives_under_the_single_harness_directory(tmp_path: Path) -> None:
+    """技能库 / 技能视图 / 工具留存 / 知识库索引都在 ``.harness/`` 下。
+
+    WHY 单列：它们曾分散在数据目录里（甚至分散到 ``roots/<根标识>/``），改回工作区时最
+    容易出现的偏差是「一半搬了、一半没搬」——而那种偏差不会报错，只表现为用户在某处找
+    不到自己的东西。
+    """
+    root = make_root(make_config(tmp_path))
+
+    assert root.skills_store == root.storage_dir / "skills"
+    assert root.skill_view_store == root.storage_dir / "skills-active"
+    assert root.tool_output_store == root.storage_dir / "tool-outputs"
+    assert root.knowledge_db == root.storage_dir / "knowledge.db"
+    assert root.storage_dir.parent == root.root
 
 
 def test_ensure_storage_creates_the_stores_but_not_the_view(tmp_path: Path) -> None:
@@ -92,71 +120,105 @@ def test_ensure_storage_creates_the_stores_but_not_the_view(tmp_path: Path) -> N
 
     root.ensure_storage()
 
-    assert _names(root.storage_dir) == {"skills", "tool-outputs"}
+    assert _names(root.storage_dir) == set(_STORED_NAMES)
     assert root.skill_view_store.exists() is False
 
 
-async def test_assembling_a_root_leaves_the_workspace_untouched(
+# ------------------------------------------------------------------ 装配后的工作区形态
+
+
+async def test_assembling_a_root_adds_the_harness_directory(
     tmp_path: Path, thread_store: ThreadMetaStore
 ) -> None:
-    """装配一个根之后，工作区里**只有用户自己的文件**。
+    """装配一个根之后，工作区里除了用户文件就多一个 ``.harness/``。
 
-    WHY 这是本次改动的验收点：技能库、技能视图与工具留存以前住在工作区里，于是「用户挑一个
-    仓库当工作空间」就等于「应用往里写三个名字」（污染他的版本控制）。回退这件事不会报错，
-    只会在某天被人发现项目里多了目录。
+    WHY 这是本次调整的验收点（2026-09-22）：应用数据回到工作区内是**有意**的取舍（要随
+    项目走），但必须只有一个名字、且内容都能在它下面找到——否则「应用往我的项目里写了
+    什么」就说不清了。
     """
     config = make_config(tmp_path)
     root = make_root(config)
     (root.root / "README.md").write_text("用户自己的文件\n", encoding="utf-8")
 
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
 
-    assert _names(root.root) == {"README.md"}, "工作区里不该出现应用自己的目录"
-    assert _names(root.storage_dir) >= {"skills", "tool-outputs"}
+    assert _names(root.root) == {"README.md", HARNESS_DIR_NAME}, "工作区里只该多出 .harness"
+    assert _names(root.storage_dir) >= set(_STORED_NAMES)
 
 
-async def test_the_skill_view_lands_in_storage_not_in_the_workspace(
+async def test_the_skill_view_lands_under_the_harness_directory(
     tmp_path: Path, thread_store: ThreadMetaStore
 ) -> None:
-    """装配会建出技能视图——它必须落在存储目录里。"""
+    """装配会建出技能视图——它落在 ``.harness/`` 下，而不是工作区根下。"""
     config = make_config(tmp_path)
     root = make_root(config)
 
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
 
     assert root.skill_view_store.is_dir()
+    assert root.skill_view_store.parent == root.storage_dir
     assert not (root.root / ".skills-active").exists()
 
 
-# ------------------------------------------------------------------ 迁移
+# ------------------------------------------------------------------ 迁移：更早的 <工作区>/skills
 
 
-async def test_legacy_skill_library_is_migrated_out_of_the_workspace(
+async def test_legacy_skill_library_is_migrated_into_the_harness(
     tmp_path: Path, thread_store: ThreadMetaStore
 ) -> None:
-    """旧位置（工作区里的 ``skills/``）的技能包要搬进存储目录，旧目录随之消失。"""
+    """工作区根下的 ``skills/``（更早的布局）里的技能包要搬进 ``.harness/skills``。"""
     config = make_config(tmp_path)
     root = make_root(config)
     package = _write_skill(root.root / "skills", "code-review")
 
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
 
     assert (root.skills_store / "code-review" / "SKILL.md").is_file()
     assert not package.exists()
     assert not (root.root / "skills").exists()
 
 
-async def test_an_empty_legacy_skill_library_is_removed(
+async def test_a_same_named_directory_without_skill_packages_is_left_alone(
     tmp_path: Path, thread_store: ThreadMetaStore
 ) -> None:
-    """空的旧技能目录也要清掉：留着会让用户看到「说搬走了却还在」。"""
+    """工作区里恰好叫 ``skills`` 的**普通**目录不动它。
+
+    WHY 单列（这是一条用户数据保护线）：``skills`` 是很常见的目录名，历史上出现过「打开
+    项目后应用把用户的目录搬走」——用户找不到自己的东西，而全程没有任何提示。因此只有
+    「含 ``SKILL.md`` 的子目录」才被当成技能库。
+    """
+    config = make_config(tmp_path)
+    root = make_root(config)
+    ordinary = root.root / "skills"
+    ordinary.mkdir()
+    (ordinary / "README.md").write_text("这不是技能包\n", encoding="utf-8")
+
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
+
+    assert (ordinary / "README.md").is_file(), "不含技能包的 skills/ 必须原样保留"
+
+
+async def test_an_empty_legacy_skill_library_is_left_alone(
+    tmp_path: Path, thread_store: ThreadMetaStore
+) -> None:
+    """空的 ``skills/`` 保持原样——它也可能是用户自己刚建的目录。"""
     config = make_config(tmp_path)
     root = make_root(config)
     (root.root / "skills").mkdir()
 
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
 
-    assert not (root.root / "skills").exists()
+    assert (root.root / "skills").is_dir()
 
 
 async def test_configured_skill_dirs_are_left_alone(
@@ -164,8 +226,8 @@ async def test_configured_skill_dirs_are_left_alone(
 ) -> None:
     """``SKILL_DIRS`` 显式指向工作区里的目录时：那是**用户配置的**路径，不能当旧位置搬走。
 
-    WHY 单列（实测踩到）：迁移逻辑按「``<根>/skills`` 存在且有内容」判断，而用户完全可能
-    正是把技能目录配在那儿——搬走会让配置里的路径凭空消失，症状是「技能一个都列不出来」。
+    WHY 单列（实测踩到）：迁移逻辑按「``<根>/skills`` 存在且像技能库」判断，而用户完全
+    可能正是把技能目录配在那儿——搬走会让配置里的路径凭空消失，症状是「技能一个都列不出来」。
     """
     config = make_config(tmp_path)
     root = make_root(config)
@@ -179,15 +241,68 @@ async def test_configured_skill_dirs_are_left_alone(
     assert not (root.storage_dir / "skills").exists(), "显式配置时不用我们那份技能库"
 
 
-# ------------------------------------------------------------------ 挂载
+# ------------------------------------------------------------------ 迁移：旧版根外存储
 
 
-def test_mount_table_covers_the_three_virtual_paths(tmp_path: Path) -> None:
-    """三个虚拟路径都挂在表上，并指向存储目录（巡检与面板都靠它）。"""
+async def test_the_old_root_store_is_migrated_into_the_workspace(
+    tmp_path: Path, thread_store: ThreadMetaStore
+) -> None:
+    """旧版根外存储（``<数据目录>/roots/<根标识>/``）里的技能库与留存要搬进 ``.harness/``。
+
+    WHY 单列：不搬等于「升级一次，用户的技能库与历史留存凭空消失」，而且没有任何报错——
+    只有日志里少了一行 INFO。
+    """
+    config = make_config(tmp_path)
+    root = make_root(config)
+    legacy = root.legacy_root_store_dir
+    _write_skill(legacy / "skills", "code-review")
+    legacy_tool = legacy / "tool-outputs" / "t1"
+    legacy_tool.mkdir(parents=True)
+    (legacy_tool / "0001-execute.txt").write_text("旧留存\n", encoding="utf-8")
+
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
+
+    assert (root.skills_store / "code-review" / "SKILL.md").is_file()
+    assert (root.tool_output_store / "t1" / "0001-execute.txt").is_file()
+    assert not legacy.exists(), "旧存储搬空后应被顺手清掉"
+
+
+async def test_a_non_empty_new_store_is_not_overwritten_by_the_old_one(
+    tmp_path: Path, thread_store: ThreadMetaStore
+) -> None:
+    """新位置已有技能库时，旧位置原样保留、只告警——不做静默合并。
+
+    WHY：合并两份技能库没有任何「正确」的规则（同名技能谁赢？），而静默覆盖会让用户以为
+    自己的改动丢了。两边都留着，由用户决定。
+    """
+    config = make_config(tmp_path)
+    root = make_root(config)
+    root.ensure_storage()
+    _write_skill(root.skills_store, "new-one")
+    legacy = root.legacy_root_store_dir
+    _write_skill(legacy / "skills", "old-one")
+
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
+
+    assert (root.skills_store / "new-one" / "SKILL.md").is_file()
+    assert not (root.skills_store / "old-one").exists(), "不合并：新位置不该多出旧技能"
+    assert (legacy / "skills" / "old-one" / "SKILL.md").is_file(), "旧位置必须原样保留"
+
+
+# ------------------------------------------------------------------ 挂载与只读
+
+
+def test_mount_table_covers_the_virtual_paths(tmp_path: Path) -> None:
+    """四个虚拟路径都挂在表上，并指向工作区内的应用数据目录。"""
     root = make_root(make_config(tmp_path))
 
     table = root.mount_table
 
+    assert table[f"{VIRTUAL_HARNESS}/"] == root.storage_dir
     assert table[f"{VIRTUAL_SKILLS}/"] == root.skills_store
     assert table[f"{VIRTUAL_SKILL_VIEW}/"] == root.skill_view_store
     assert table[f"{VIRTUAL_TOOL_OUTPUTS}/"] == root.tool_output_store
@@ -212,9 +327,13 @@ async def test_the_backend_exposes_the_skill_view_read_only(
     """经真实 ``build_backend``：技能视图读得到，写不动。"""
     config = make_config(tmp_path)
     root = make_root(config)
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
     _write_skill(root.skills_store, "code-review")
-    await _registry(config, thread_store).services_for(record={}, thread_id=None, requested=str(root.root))
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
     backend = build_backend(config, store, scope=root)
 
     downloaded = backend.download_files([f"{VIRTUAL_SKILL_VIEW}/code-review/SKILL.md"])
@@ -222,6 +341,29 @@ async def test_the_backend_exposes_the_skill_view_read_only(
     assert downloaded[0].error is None
     assert b"code-review" in (downloaded[0].content or b"")
     assert backend.write(f"{VIRTUAL_SKILLS}/code-review/SKILL.md", "改掉").error is not None
+
+
+async def test_the_backend_refuses_writes_through_the_harness_path(
+    tmp_path: Path, store: BaseStore, thread_store: ThreadMetaStore
+) -> None:
+    """Agent 也不能经 ``/.harness/...`` 改写自己的技能库。
+
+    WHY 单列（这是本次调整新增的绕行口）：应用数据现在物理上就在工作区内，而 ``/skills``
+    只覆盖它自己的前缀——没有 ``/.harness/`` 这条只读路由的话，Agent 换一条路径就能写到
+    同一批文件（``virtual_mode`` 只拦越界，不拦写）。
+    """
+    config = make_config(tmp_path)
+    root = make_root(config)
+    await _registry(config, thread_store).services_for(
+        record={}, thread_id=None, requested=str(root.root)
+    )
+    _write_skill(root.skills_store, "code-review")
+    backend = build_backend(config, store, scope=root)
+
+    assert backend.write(f"{VIRTUAL_HARNESS}/skills/code-review/SKILL.md", "改掉").error is not None
+    assert (root.skills_store / "code-review" / "SKILL.md").read_text(encoding="utf-8").count(
+        "改掉"
+    ) == 0
 
 
 async def test_tool_outputs_are_readable_by_their_virtual_path(

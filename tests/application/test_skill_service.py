@@ -18,8 +18,18 @@ from pathlib import Path
 import pytest
 
 from application.errors import NotFoundError
-from application.skill_service import SkillService
-from config import AppConfig
+from application.skill_service import (
+    ADMITTED_BY_EXCLUDED,
+    ADMITTED_BY_GENERAL,
+    ADMITTED_BY_UNRESTRICTED,
+    ADMITTED_BY_WHITELIST,
+    CATEGORY_GENERAL,
+    CATEGORY_PRESET,
+    CATEGORY_USER,
+    SkillService,
+)
+from config import AppConfig, SessionRoot
+from runtime.skill_presets import PRESET_FILE_NAME
 from runtime.skill_store import open_skill_store
 from tests.conftest import make_config, make_root
 
@@ -52,7 +62,7 @@ def _write_skill(config: AppConfig, name: str, *, body: str | None = None) -> No
 
 
 def _view_names(config: AppConfig) -> set[str]:
-    """技能视图里当前有哪些技能（视图在**根外存储**里，见 ``SessionRoot.skill_view_store``）。"""
+    """技能视图里当前有哪些技能（视图在工作区的 ``.harness/`` 下，见 ``SessionRoot.skill_view_store``）。"""
     view = make_root(config).skill_view_store
     return {child.name for child in view.iterdir() if child.is_dir()} if view.is_dir() else set()
 
@@ -266,8 +276,12 @@ async def test_builtin_skills_land_in_a_fresh_workspace_view(tmp_path: Path) -> 
     """
     workspace = tmp_path / "project"
     workspace.mkdir()
-    # 显式传空列表 = 用默认派生规则：随应用交付的内置目录 + 工作区内的 skills/
-    config = make_config(tmp_path, workspace=workspace, skill_dirs=[])
+    # 显式传空列表 = 用默认派生规则：通用目录 + 预设目录 + 工作区内的技能库。
+    # WHY 把预设目录指到一个不存在的目录：本用例只关心「通用技能能否走完加载链」，而随仓库
+    # 交付的预设（coding / writing）会带进它们自己的技能，让预期集合依赖于交付物内容。
+    config = make_config(
+        tmp_path, workspace=workspace, skill_dirs=[], presets_dir=tmp_path / "no-presets"
+    )
 
     async with open_skill_store(tmp_path / "skills-state.db") as store:
         skills = SkillService(config, scope=make_root(config), store=store)
@@ -281,3 +295,220 @@ async def test_builtin_skills_land_in_a_fresh_workspace_view(tmp_path: Path) -> 
     # 来源注明在视图之外的内置目录，用户据此能解释「这个技能是随产品来的」
     assert {item["source"] for item in listed["items"]} == {"/skills-builtin"}
     assert all(item["enabled"] for item in listed["items"])
+
+
+# --------------------------------------------------------------- 场景（预设）过滤
+
+
+def _preset_config(
+    tmp_path: Path,
+    *,
+    preset_id: str = "coding",
+    skills: tuple[str, ...] = ("keep",),
+    include_general: bool | None = None,
+) -> AppConfig:
+    """构造带**隔离预设目录**的配置（不碰随应用交付的那一份）。
+
+    WHY 技能目录走默认派生（不显式给 ``skill_dirs``）：这样通用技能目录也是来源之一，
+    「通用技能到底进不进视图」这条链路才真的被走到——显式指定一个目录会把通用目录排除掉。
+
+    WHY ``include_general`` 只在显式给出时才写进文件：缺省即开启这条规则本身需要用例覆盖，
+    若夹具总是把它写死成 ``true``，那条规则就再也没有人验了。
+    """
+    presets = tmp_path / "presets"
+    directory = presets / preset_id
+    directory.mkdir(parents=True, exist_ok=True)
+    listed = ", ".join(f'"{name}"' for name in skills)
+    lines = [f'title = "场景 {preset_id}"', f"skills = [{listed}]"]
+    if include_general is not None:
+        lines.append(f"include_general = {'true' if include_general else 'false'}")
+    (directory / PRESET_FILE_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return make_config(tmp_path, presets_dir=presets)
+
+
+def _scoped(config: AppConfig, preset_id: str) -> SessionRoot:
+    """把测试用的根绑定到某个场景上。"""
+    return SessionRoot(config, make_root(config).root, preset_id)
+
+
+async def test_preset_allowlist_filters_the_view(tmp_path: Path) -> None:
+    """视图只收场景白名单内的技能——白名单外的即使启用也不进。
+
+    WHY 这是场景体系的验收点：场景的全部含义就是「这项任务用这几项技能」。白名单不起作用
+    时，场景选择在界面上看得见、在行为上不存在。
+
+    WHY 这里显式关掉通用技能的自动准入：开着的时候通用技能会自动进来（那是另一条用例的
+    验收点），视图集合就不再正好等于白名单，这条断言也就失去了意义。
+    """
+    config = _preset_config(tmp_path, skills=("keep",), include_general=False)
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "keep")
+        _write_skill(config, "outside")
+        result = await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    assert set(result.copied) == {"keep"}
+    assert set(_view_names(config)) == {"keep"}
+    by_name = {item["name"]: item for item in listed["items"]}
+    assert by_name["keep"]["in_preset"] is True
+    assert by_name["keep"]["admitted_by"] == ADMITTED_BY_WHITELIST
+    assert by_name["outside"]["in_preset"] is False
+    assert by_name["outside"]["admitted_by"] == ADMITTED_BY_EXCLUDED
+
+
+async def test_general_skills_enter_the_view_without_being_listed(tmp_path: Path) -> None:
+    """默认（未关掉自动准入）时，通用技能不写进白名单也进视图。
+
+    WHY 这是开关的验收点：通用技能的定义就是「每个场景都能用」。要求每个场景都抄一遍通用
+    技能名，漏一个就是一次静默的能力缺失——既不报错，也没有任何线索。
+    """
+    config = _preset_config(tmp_path, skills=("keep",))
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "keep")
+        _write_skill(config, "outside")
+        result = await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    by_name = {item["name"]: item for item in listed["items"]}
+    assert "code-review" in set(result.copied)  # 白名单里没有它
+    assert by_name["code-review"]["category"] == CATEGORY_GENERAL
+    assert by_name["code-review"]["admitted_by"] == ADMITTED_BY_GENERAL
+    assert by_name["code-review"]["in_preset"] is True
+    # 用户技能没有通用身份：不在白名单里就是不在本场景内。
+    assert by_name["outside"]["admitted_by"] == ADMITTED_BY_EXCLUDED
+    assert "outside" not in set(result.copied)
+
+
+async def test_turning_off_the_switch_keeps_general_skills_out(tmp_path: Path) -> None:
+    """关掉自动准入后，通用技能不再自动进视图——本场景只认白名单里那几个名字。"""
+    config = _preset_config(tmp_path, skills=("keep",), include_general=False)
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "keep")
+        result = await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    assert set(result.copied) == {"keep"}
+    by_name = {item["name"]: item for item in listed["items"]}
+    assert by_name["code-review"]["admitted_by"] == ADMITTED_BY_EXCLUDED
+    assert by_name["code-review"]["in_preset"] is False
+
+
+async def test_a_user_override_of_a_general_skill_keeps_its_general_identity(
+    tmp_path: Path,
+) -> None:
+    """用户放一个同名技能覆盖通用技能，它仍然按「通用身份」准入。
+
+    WHY 按**名字**而不是按胜出来源判：清单已按「用户 > 预设 > 通用」去重，同名被覆盖之后
+    来源就变成用户目录。按来源判会把「我改了这个技能」变成「它从场景里消失了」——与用户
+    意图正好相反，而且没有任何报错。
+    """
+    config = _preset_config(tmp_path, skills=("keep",))
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "keep")
+        _write_skill(config, "code-review")  # 与内置通用技能同名
+        result = await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    by_name = {item["name"]: item for item in listed["items"]}
+    assert by_name["code-review"]["category"] == CATEGORY_USER  # 用户的覆盖了内置的
+    assert by_name["code-review"]["admitted_by"] == ADMITTED_BY_GENERAL
+    assert "code-review" in set(result.copied)
+
+
+async def test_without_a_preset_every_skill_is_unrestricted(tmp_path: Path) -> None:
+    """未绑定场景时没有白名单，归因一律是 ``unrestricted``（与白名单无关）。"""
+    config = _preset_config(tmp_path, skills=("keep",), include_general=False)
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=make_root(config), store=store)
+        _write_skill(config, "anything")
+        listed = await skills.list_skills()
+
+    assert listed["items"]
+    assert {item["admitted_by"] for item in listed["items"]} == {ADMITTED_BY_UNRESTRICTED}
+    assert all(item["in_preset"] for item in listed["items"])
+
+
+async def test_without_a_preset_every_enabled_skill_is_visible(tmp_path: Path) -> None:
+    """未绑定场景时不做白名单过滤——与改造前的行为一致（向后兼容）。"""
+    config = _preset_config(tmp_path, skills=("keep",))
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=make_root(config), store=store)
+        _write_skill(config, "keep")
+        _write_skill(config, "outside")
+        await skills.refresh_view()
+
+    # 断言包含关系而不是相等：随应用交付的通用技能**始终**在视图里（它们是每个场景的底座），
+    # 而交付物内容会随版本变化——把内置技能名抄进断言会让这条用例在无关改动上红。
+    assert {"keep", "outside"} <= set(_view_names(config))
+    # 而预设目录里的技能**不在**视图里：未绑定场景时它连来源都不是。
+    assert "from-preset" not in _view_names(config)
+
+
+async def test_an_unknown_preset_falls_back_to_unrestricted(tmp_path: Path) -> None:
+    """场景不存在时按「不限定」处理，而不是报错或清空视图。
+
+    WHY：场景 ID 是历史会话里记着的东西，而场景目录可能被删或改名——此时让这条会话打不开，
+    比「按不限定继续用」糟糕得多。
+    """
+    config = _preset_config(tmp_path, skills=("keep",))
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "removed"), store=store)
+        _write_skill(config, "outside")
+        await skills.refresh_view()
+        listed = await skills.list_skills()
+
+    # 同上：通用技能始终在，这里只断言"没有因为场景不存在而少掉用户技能"。
+    assert "outside" in _view_names(config)
+    assert listed["preset"] is None
+    assert listed["preset_id"] == "removed"
+
+
+async def test_preset_and_toggle_both_apply(tmp_path: Path) -> None:
+    """场景白名单与用户启停是两个独立维度：两者都满足才进视图。"""
+    config = _preset_config(tmp_path, skills=("a", "b"), include_general=False)
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "a")
+        _write_skill(config, "b")
+        await skills.set_enabled("b", False)
+
+    assert set(_view_names(config)) == {"a"}
+
+
+async def test_missing_skills_in_the_allowlist_are_reported(tmp_path: Path) -> None:
+    """白名单里写了、但来源中找不到的技能名要报出来。
+
+    WHY 单列：名字打错或技能包没交付时，视图会安静地少一项——那正是「我选了场景，Agent 却
+    不会那项技能」这种无从解释的现象。
+    """
+    config = _preset_config(tmp_path, skills=("keep", "ghost"))
+    async with open_skill_store(tmp_path / "s.db") as store:
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "keep")
+        listed = await skills.list_skills()
+
+    assert listed["missing_skills"] == ["ghost"]
+    assert listed["preset"]["id"] == "coding"
+
+
+async def test_skill_category_reflects_its_source(tmp_path: Path) -> None:
+    """分类由来源推导：通用 / 预设 / 用户三类各归各位。"""
+    config = _preset_config(tmp_path, skills=("from-preset",))
+    package = config.skill_presets_dir / "coding" / "from-preset"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text(_SKILL.format(name="from-preset"), encoding="utf-8")
+
+    async with open_skill_store(tmp_path / "s.db") as store:
+        # 绑定到该场景：预设目录只有在**当前场景**下才作为来源（否则会看到别的场景的技能）。
+        skills = SkillService(config, scope=_scoped(config, "coding"), store=store)
+        _write_skill(config, "from-user")
+        listed = await skills.list_skills()
+
+    categories = {item["name"]: item["category"] for item in listed["items"]}
+    assert categories["code-review"] == CATEGORY_GENERAL
+    assert categories["from-preset"] == CATEGORY_PRESET
+    assert categories["from-user"] == CATEGORY_USER

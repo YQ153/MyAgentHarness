@@ -196,6 +196,20 @@ class ThreadSummary(BaseModel):
     tags: list[str] = Field(default_factory=list, description="会话标签，按写入顺序排列")
     archived: bool = Field(default=False, description="是否已归档（软删除）")
     archived_at: str = Field(default="", description="归档时刻（ISO8601 UTC）；未归档为空串")
+    workspace: str = Field(
+        default="",
+        description=(
+            "会话的文件根绝对路径：用户显式选定的工作空间，或应用为它建的专属目录；"
+            "空串表示这个根还没确定（该会话尚未产生第一条交互）"
+        ),
+    )
+    workspace_bound: bool = Field(
+        default=False,
+        description=(
+            "根是否由用户显式选定：``True`` 表示这是可容纳多条会话的工作空间，"
+            "``False`` 表示这是应用为这条会话建的专属目录"
+        ),
+    )
 
 
 class ThreadListResult(BaseModel):
@@ -313,6 +327,31 @@ class DeleteResult(BaseModel):
         return self.outcome is DeleteOutcome.DELETED
 
 
+class WorkspaceDeleteResult(BaseModel):
+    """删除一个「工作空间分组」下全部会话的结果。
+
+    WHY 不返回 ``list[DeleteResult]`` 让调用方自己数：界面要回答的第一个问题是
+    「到底删干净了没有」，而「哪些算成功」这条口径一旦分叉（有人把 ``PARTIAL``
+    算成功、有人不算），同一次操作在日志与界面上就会有三种说法。汇总与逐条明细
+    一起给出，两者都来自同一处判定。
+    """
+
+    workspace: str = Field(
+        description="被清理的工作空间绝对路径；空串表示「未绑定工作空间」的那一组"
+    )
+    workspace_bound: bool = Field(
+        description="这一组的根是否由用户显式选定（False = 应用为这些会话建的专属目录）"
+    )
+    requested: int = Field(description="匹配到的会话条数")
+    deleted: int = Field(description="元数据与检查点都已清理的条数")
+    partial: int = Field(description="元数据已删除、检查点清理失败的条数")
+    not_found: int = Field(description="匹配到但已不存在（并发删除）的条数")
+    failed: int = Field(description="元数据删除失败的条数")
+    items: list[DeleteResult] = Field(
+        default_factory=list, description="逐条结果，按会话 ID 升序稳定排列，便于排查残留"
+    )
+
+
 class UsageGroup(BaseModel):
     """按某一维度聚合出的一档用量。"""
 
@@ -320,7 +359,15 @@ class UsageGroup(BaseModel):
     prompt_tokens: int = Field(description="输入 token 合计")
     completion_tokens: int = Field(description="输出 token 合计")
     total_tokens: int = Field(description="输入输出合计")
-    run_count: int = Field(description="该分组内的运行次数")
+    cache_hit_tokens: int = Field(default=0, description="输入中命中缓存的 token 合计")
+    cache_miss_tokens: int = Field(
+        default=0,
+        description="输入中未命中缓存的 token 合计；上游 SDK 未透传该字段时恒为 0（DeepSeek 即如此），此时未命中量按「输入 − 命中」估算",
+    )
+    cache_hit_rate: float | None = Field(
+        default=None, description="输入侧缓存命中率（0..1）；输入为 0 时为 None"
+    )
+    call_count: int = Field(description="该分组内的模型调用次数")
 
 
 class UsageSummary(BaseModel):
@@ -329,6 +376,10 @@ class UsageSummary(BaseModel):
     WHY 同时给出总计与分组：总计回答「这段时间花了多少」，分组回答
     「花在哪个模型 / 哪个会话 / 哪一天」。只给前者无法定位，只给后者
     需要调用方自己再算一遍总和。
+
+    WHY 还要给缓存命中：DeepSeek 的命中价是未命中的 1/50，因此「花了多少」
+    若不含命中率就无法解释——同样的总输入 token，命中与不命中的费用可以差
+    数十倍。``cache_hit_rate`` 为 ``None`` 表示这段时间没有可判定的输入。
     """
 
     window_days: int = Field(description="统计窗口天数")
@@ -338,8 +389,63 @@ class UsageSummary(BaseModel):
     prompt_tokens: int = Field(description="输入 token 合计")
     completion_tokens: int = Field(description="输出 token 合计")
     total_tokens: int = Field(description="输入输出合计")
-    run_count: int = Field(description="运行次数")
+    cache_hit_tokens: int = Field(default=0, description="输入中命中缓存的 token 合计")
+    cache_miss_tokens: int = Field(
+        default=0,
+        description="输入中未命中缓存的 token 合计；上游 SDK 未透传该字段时恒为 0（DeepSeek 即如此），此时未命中量按「输入 − 命中」估算",
+    )
+    cache_hit_rate: float | None = Field(
+        default=None, description="输入侧缓存命中率（0..1）；输入为 0 时为 None"
+    )
+    call_count: int = Field(description="窗口内的模型调用次数")
     groups: list[UsageGroup] = Field(description="按维度聚合的分档明细")
+
+
+class UsageCall(BaseModel):
+    """序列视角里的**一次模型调用**。
+
+    WHY 叫「调用」而不是「运行」：``usage_log`` 的一行对应一次模型调用
+    （2026-09-24 起由事件翻译器按响应 id 分段、``RunService`` 逐次落库），而
+    一次运行（stream / resume）可能产出多行——同一轮的多行共享同一个
+    ``trace_id``。把行称作「运行」会让人把行数当对话轮次；实测 ``turn_count``
+    为 2 的会话曾有远多于 2 的行数，差额正是中断恢复与轮内的多次调用。
+
+    WHY 与 ``UsageGroup`` 分开：分组行是「某一维度的合计」，这里是一行原始记录。
+    ``prompt_tokens`` 这样的字段名在两者里含义不同（合计 vs 单次），共用一个模型
+    会让「这个数加起来了没有」只能靠上下文猜。
+    """
+
+    created_at: str = Field(description="记录时间（ISO8601 UTC）")
+    thread_id: str = Field(description="会话 ID")
+    model: str = Field(description="模型别名")
+    prompt_tokens: int = Field(description="输入 token 数")
+    completion_tokens: int = Field(description="输出 token 数")
+    total_tokens: int = Field(description="输入输出合计")
+    cache_hit_tokens: int = Field(default=0, description="输入中命中缓存的 token 数")
+    cache_miss_tokens: int = Field(
+        default=0,
+        description="输入中未命中缓存的 token 数；上游 SDK 未透传该字段时恒为 0（DeepSeek 即如此），此时未命中量按「输入 − 命中」估算",
+    )
+    cache_hit_rate: float | None = Field(
+        default=None, description="该次调用的输入侧缓存命中率（0..1）；输入为 0 时为 None"
+    )
+
+
+class UsageSeries(BaseModel):
+    """按时间正序排列的逐次调用用量（「按次」视角）。
+
+    WHY 需要与聚合并存的另一个视角：聚合回答「一共花了多少」，序列回答「它是怎么
+    变成这个数的」。缓存命中率随轮次的变化只有后者能看出来——而「裁剪历史是否会
+    压低命中率」这类问题，恰恰只能靠趋势判断，合计数字再精确也回答不了。
+    """
+
+    window_days: int = Field(description="统计窗口天数")
+    since: str = Field(description="窗口起点（ISO8601 UTC，含）")
+    thread_id: str | None = Field(default=None, description="限定会话时为其 ID，否则为 None")
+    limit: int = Field(description="本次请求的条数上限")
+    count: int = Field(description="实际返回的条数")
+    truncated: bool = Field(description="是否因条数上限被截断（true 表示还有更早的记录未返回）")
+    items: list[UsageCall] = Field(description="按时间正序的逐次模型调用记录")
 
 
 class GovernanceReport(BaseModel):

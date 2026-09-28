@@ -89,7 +89,7 @@ async def test_default_window_comes_from_config(tmp_path: Path, usage_store: Usa
     assert summary.group_by == "model"
     assert summary.thread_id is None
     assert summary.total_tokens == 135
-    assert summary.run_count == 2
+    assert summary.call_count == 2
     assert summary.since  # 窗口起点必须回给调用方，否则前端无法解释数字口径
 
 
@@ -146,7 +146,7 @@ async def test_summary_covers_every_run(tmp_path: Path, usage_store: UsageStore)
     summary = await service.summarize()
 
     assert summary.total_tokens == 135
-    assert summary.run_count == 2
+    assert summary.call_count == 2
 
 
 async def test_thread_scope_requires_known_thread(tmp_path: Path, usage_store: UsageStore):
@@ -204,3 +204,84 @@ async def test_usage_store_failure_becomes_runtime_error(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="用量聚合失败"):
         await service.summarize()
+
+
+# ------------------------------------------------------------------ 按次视角
+
+
+async def test_series_returns_chronological_calls_with_rates(
+    tmp_path: Path, usage_store: UsageStore
+):
+    service, _ = _service(tmp_path, usage_store, records={"t1": {"thread_id": "t1"}})
+    await usage_store.record(
+        thread_id="t1", model="deepseek-flash", prompt_tokens=1000,
+        completion_tokens=10, cache_hit_tokens=900,
+    )
+    await usage_store.record(
+        thread_id="t1", model="deepseek-flash", prompt_tokens=2000,
+        completion_tokens=20, cache_hit_tokens=1000,
+    )
+
+    series = await service.series(thread_id="t1")
+
+    assert series.count == 2
+    assert series.truncated is False
+    assert series.limit == 50
+    assert series.thread_id == "t1"
+    # 正序：先发生的那次在前，趋势才读得出来
+    assert [item.prompt_tokens for item in series.items] == [1000, 2000]
+    assert series.items[0].total_tokens == 1010
+    assert series.items[0].cache_hit_rate == 0.9
+    assert series.items[1].cache_hit_rate == 0.5
+
+
+async def test_series_marks_truncation(tmp_path: Path, usage_store: UsageStore):
+    """WHY 必须能区分「就这么多」与「还有更早的」：把后者显示成前者，
+    用户会以为趋势就是从头开始的，而据此下的结论会完全相反。"""
+    service, _ = _service(tmp_path, usage_store)
+    for index in range(3):
+        await usage_store.record(
+            thread_id="t1", model="m", prompt_tokens=index + 1, completion_tokens=1
+        )
+
+    series = await service.series(limit=2)
+
+    assert series.count == 2
+    assert series.truncated is True
+    assert [item.prompt_tokens for item in series.items] == [2, 3]
+
+
+def test_series_rejects_bad_limit(tmp_path: Path, usage_store: UsageStore):
+    service, _ = _service(tmp_path, usage_store)
+
+    with pytest.raises(ValueError, match="limit"):
+        _run(service.series(limit=0))
+    with pytest.raises(ValueError, match="limit"):
+        _run(service.series(limit=201))
+    with pytest.raises(ValueError, match="limit"):
+        _run(service.series(limit="10"))
+
+
+async def test_series_requires_known_thread(tmp_path: Path, usage_store: UsageStore):
+    service, _ = _service(tmp_path, usage_store, records={"t1": {"thread_id": "t1"}})
+    await _seed(usage_store)
+
+    with pytest.raises(NotFoundError):
+        await service.series(thread_id="missing")
+
+
+async def test_series_store_failure_becomes_runtime_error(tmp_path: Path):
+    """WHY 覆盖底层故障：SQLite 报错必须转成带上下文的 RuntimeError 让路由回 500，
+    而不是把原始 ``OperationalError`` 泄漏到调用栈之外。"""
+
+    class FailingSeriesStore:
+        async def list_recent(self, **_: Any) -> tuple[list[dict[str, Any]], bool]:
+            raise sqlite3.OperationalError("database is locked")
+
+    config = make_config(tmp_path)
+    service = UsageService(
+        config, usage_store=FailingSeriesStore(), thread_store=StubThreadStore()
+    )
+
+    with pytest.raises(RuntimeError, match="用量序列查询失败"):
+        await service.series()

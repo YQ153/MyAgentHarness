@@ -1,0 +1,1472 @@
+<!DOCTYPE html>
+<!--
+  通用 Agent · 主页面设计稿 v2（按用户提供的参考图严格实现）
+
+  视觉基线（来自参考截图）：
+  - 近黑深色主题为默认；主操作用「白底黑字」胶囊按钮，不用彩色主色
+  - 三栏：左侧会话栏 / 居中正文列 / 右侧「任务 · 文件 · 日志」面板
+  - 工具调用是「一行式暗卡」：图标 + 名称 + 成功状态 + 右侧灰色等宽来源
+  - 审批卡用琥珀色描边表达「需要人介入」
+  - 输入区是一张圆角暗卡（内部无边框输入），下方一行快捷键提示
+  - 最底部一条 28px 细状态栏：运行状态 / 模型与 token / 工作空间
+
+  与参考图的三处有意偏差（业务不变量优先，其余全部对齐图片）：
+  1. 会话分组仍按「工作空间」而不是「今天/昨天」：整组删除入口锚在分组上，
+     按 RHS 时间分组后这个入口就没有落点了（分组样式与图片完全一致）。
+  2. 审批按钮保留本产品的四种决策（批准 / 按修改后执行 / 拒绝 / 我来代答），
+     不采用图片里的「仅本次允许 / 始终允许」——那是另一个产品的授权语义。
+  3. 不画「思考过程」折叠条：本产品不向浏览器暴露推理流，画了就是假功能。
+  4. 不显示任何后端不下发的字段（工具耗时、待办耗时、运行中子步骤）：
+     TOOL_RESULT 的 payload 是 name/status/preview/truncated/full_output_ref，
+     TODOS 只有 items[{content,status}]，画上去等于伪造数据。
+
+  本文件仍只是设计稿：没有取数与真实交互，双击即可打开，拖窗口看响应式。
+-->
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>通用 Agent · 主页面设计稿</title>
+<style>
+/* ==========================================================================
+   1. 设计令牌 —— 深色为默认（对齐参考图），亮色保留为第二主题
+   ========================================================================== */
+:root {
+  --mk-h: 48px;
+  --content: 720px;             /* 正文列宽度：参考图的正文列明显更窄更聚焦 */
+  --side-w: 224px;
+  --right-w: 300px;
+
+  --bg: #0a0a0b;
+  --panel: #101012;
+  --panel-2: #141416;
+  --card: #17171a;
+  --card-hover: #1d1d21;
+  --border: #26262b;
+  --border-soft: #1e1e22;
+  --text: #ececf0;
+  --muted: #8b8b94;
+  /* WHY 提到 #7a7a85：原先的 #5d5d66 在 #0a0a0b 上对比度约 3.2:1，
+     低于 WCAG AA 小字 4.5:1 —— 时间戳、pop-hint 都用它。 */
+  --faint: #7a7a85;
+
+  --accent: #ececf0;            /* 主操作就是「白」，参考图没有彩色主色 */
+  --accent-fg: #0a0a0b;
+  --accent-soft: #202024;
+
+  --ok: #34d399;
+  --ok-soft: rgba(52, 211, 153, .10);
+  --warn: #f5a623;
+  --warn-soft: rgba(245, 166, 35, .07);
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, .10);
+
+  --code-bg: #0d0d0f;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-sm: 8px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-lg: 0 1px 2px rgba(0, 0, 0, .4), 0 14px 36px rgba(0, 0, 0, .5);
+  --ann: rgba(245, 166, 35, .55);
+}
+[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #fbfcfd;
+  --card: #ffffff;
+  --card-hover: #f3f4f6;
+  --border: #e3e6ea;
+  --border-soft: #eceef1;
+  --text: #1f2328;
+  --muted: #6b7280;
+  --faint: #6f7580;
+  --accent: #1f2328;
+  --accent-fg: #ffffff;
+  --accent-soft: #eff4ff;
+  --ok: #15803d;
+  --ok-soft: #f0fdf4;
+  --warn: #b45309;
+  --warn-soft: #fffbeb;
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+  --code-bg: #f3f4f6;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, .06);
+  --shadow-lg: 0 1px 2px rgba(16, 24, 40, .06), 0 10px 30px rgba(16, 24, 40, .10);
+  --ann: rgba(37, 99, 235, .55);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  padding-top: var(--mk-h);
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 13.5px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* ==========================================================================
+   2. 设计稿控制条（非产品界面）
+   ========================================================================== */
+.mk-bar {
+  position: fixed; top: 0; left: 0; right: 0; height: var(--mk-h); z-index: 100;
+  display: flex; align-items: center; gap: 12px; padding: 0 14px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--muted); overflow-x: auto; white-space: nowrap;
+}
+.mk-title { font-weight: 600; color: var(--text); font-size: 13px; }
+.mk-sep { width: 1px; height: 22px; background: var(--border); flex: none; }
+.mk-spacer { flex: 1 1 auto; }
+.mk-group { display: inline-flex; align-items: center; gap: 6px; }
+.mk-btn {
+  display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel-2); color: var(--text); font-size: 12px; cursor: pointer; font-family: inherit;
+}
+.mk-btn:hover { border-color: var(--muted); }
+.mk-btn.on { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.mk-view {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  background: var(--accent-soft); font-variant-numeric: tabular-nums; font-weight: 600;
+}
+.mk-view b { color: var(--text); }
+
+/* ==========================================================================
+   3. 应用外壳：三栏（侧栏 / 正文 / 右侧面板）
+   ========================================================================== */
+.app {
+  position: relative;
+  display: grid;
+  /* WHY 只有两行：输入区与状态栏收进了主列，不再横跨左右侧栏 ——
+     两侧栏才能从顶栏下方一直撑到屏幕底部（第二行的 1fr 就是它们的高度）。 */
+  grid-template-rows: 52px minmax(0, 1fr);
+  height: calc(100vh - var(--mk-h));
+  width: 100%;
+  background: var(--bg);
+}
+.body {
+  display: grid;
+  grid-template-columns: var(--side-w) minmax(0, 1fr) var(--right-w);
+  min-height: 0;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  display: flex; align-items: center; gap: 12px; padding: 0 14px;
+  border-bottom: 1px solid var(--border-soft); background: var(--bg); min-width: 0;
+}
+.brand { display: flex; align-items: center; gap: 8px; flex: none; }
+.brand-logo {
+  width: 24px; height: 24px; border-radius: 7px; background: var(--card);
+  border: 1px solid var(--border); display: grid; place-items: center;
+  font-size: 12px; font-weight: 700; flex: none;
+}
+.brand-name { font-size: 13.5px; font-weight: 650; letter-spacing: -.01em; }
+.topbar-sep { color: var(--faint); flex: none; }
+.topbar-title {
+  flex: 0 1 auto; min-width: 0; max-width: 260px; font-size: 12.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar .spacer { flex: 1 1 auto; }
+.nav-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+.icon-btn {
+  width: 30px; height: 30px; border-radius: 8px; display: inline-grid; place-items: center;
+  background: transparent; border: 1px solid transparent; color: var(--muted); cursor: pointer;
+}
+.icon-btn:hover { background: var(--card); color: var(--text); border-color: var(--border); }
+.icon-btn:focus-visible { outline: 2px solid var(--muted); outline-offset: 1px; }
+.menu-btn { display: none; }
+/* WHY 基础样式必须写在媒体查询之前：下面「≤1279px 收起右面板」的查询会把
+   .rt-toggle 打开，若 display:none 写在它后面，同特异性下后者胜出，按钮将永远不见。 */
+.rt-toggle { display: none; }
+
+/* ---------- 右上角聚合入口 ----------
+   WHY 六个能力入口收成一个下拉：它们是「低频但必须找得到」的入口，并排占 6×30px
+   会把顶栏挤成两排；收进一个九宫格后，顶栏只剩 2 个图标，而入口仍能一次点达。
+   WHY 菜单内再分两组：前四个是「会改变 Agent 行为」的能力，后两个是「只看不改」的观测，
+   混在一列里会让人以为「用量」也能改点什么。 */
+.more-wrap { position: relative; flex: none; }
+.popover {
+  position: absolute; right: 0; top: 38px; z-index: 90; min-width: 218px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg); padding: 6px;
+}
+.popover[hidden] { display: none; }
+.pop-group { padding: 6px 9px 4px; font-size: 10.5px; color: var(--faint); }
+.pop-sep { height: 1px; background: var(--border-soft); margin: 5px 2px; }
+.pop-item {
+  display: flex; align-items: center; gap: 9px; width: 100%; height: 34px; padding: 0 9px;
+  border: none; background: transparent; color: var(--text); border-radius: 8px;
+  font-size: 12.5px; font-family: inherit; cursor: pointer; text-align: left;
+}
+.pop-item:hover { background: var(--card); }
+.pop-item:focus-visible { outline: 2px solid var(--muted); outline-offset: -2px; }
+.pop-item .icon { color: var(--muted); }
+.pop-item .grow { flex: 1 1 auto; }
+.pop-hint { font-size: 10.5px; color: var(--faint); }
+.pop-note {
+  padding: 0 9px 8px; font-size: 10.5px; line-height: 1.55; color: var(--faint);
+  white-space: normal; max-width: 250px;
+}
+.popover.up { top: auto; bottom: calc(100% + 8px); left: 0; right: auto; min-width: 244px; }
+
+/* 输入区里的工作区入口：做成 chip 而不是按钮组 —— 它显示的是「当前选了什么」，
+   三个动作（选择文件夹 / 浏览 / 不绑定）收在展开里，避免三个按钮长期占着输入行。 */
+.ws-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: 999px; background: transparent;
+  color: var(--muted); font-size: 11.5px; font-family: inherit; cursor: pointer; flex: none;
+  max-width: 220px;
+}
+.ws-chip:hover { color: var(--text); border-color: var(--muted); }
+.ws-chip:focus-visible { outline: 2px solid var(--muted); outline-offset: 1px; }
+/* 会话已锁定后入口禁用（不是隐藏）：隐藏会让人以为「这个会话没有工作区」，
+   禁用 + 文案里的「已锁定」才说明它存在但不可改。 */
+.ws-chip:disabled { opacity: .55; cursor: not-allowed; }
+.ws-chip #ws-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 左侧会话栏 ---------- */
+.sidebar {
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--border-soft); background: var(--bg); padding: 10px 8px 0;
+}
+.side-actions { display: flex; align-items: center; gap: 6px; padding: 0 2px 10px; }
+.new-pill {
+  flex: 1 1 auto; height: 34px; border-radius: 999px; border: none; cursor: pointer;
+  background: var(--accent); color: var(--accent-fg); font-size: 13px; font-weight: 600; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.new-pill:hover { filter: brightness(.94); }
+.new-pill:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.session-list { flex: 1 1 auto; overflow-y: auto; padding: 0 2px 10px; }
+.group-head {
+  display: flex; align-items: center; gap: 6px; padding: 12px 8px 4px;
+  font-size: 11px; color: var(--faint);
+}
+.group-head .grow { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-item {
+  display: block; width: 100%; text-align: left; padding: 7px 9px; margin-bottom: 1px;
+  border: 1px solid transparent; border-radius: 9px;
+  background: transparent; color: var(--text); font-family: inherit; font-size: 12.5px; cursor: pointer;
+}
+.thread-item:hover { background: var(--card); }
+.thread-item.active { background: var(--card-hover); border-color: var(--border); }
+.thread-item .t-row { display: flex; align-items: center; gap: 6px; }
+.thread-item .t-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-item .t-time { flex: none; font-size: 10.5px; color: var(--faint); }
+.side-foot { border-top: 1px solid var(--border-soft); padding: 6px 2px 8px; }
+.side-foot .icon-btn { width: 100%; justify-content: flex-start; display: inline-flex; gap: 8px; padding: 7px 9px; font-size: 12.5px; }
+.side-foot .icon-btn .icon { color: var(--muted); }
+
+/* ---------- 主内容 ---------- */
+.main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.chat { flex: 1 1 auto; overflow-y: auto; padding: 26px 24px 12px; }
+.chat > * { max-width: var(--content); margin-left: auto; margin-right: auto; }
+
+/* ---------- 右侧面板 ---------- */
+.rightbar {
+  border-left: 1px solid var(--border-soft); background: var(--bg);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.rt-tabs { display: flex; gap: 2px; padding: 10px 10px 0; border-bottom: 1px solid var(--border-soft); }
+.rt-tab {
+  flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 32px; border: none; border-radius: 8px 8px 0 0; background: transparent;
+  color: var(--muted); font-size: 12.5px; font-family: inherit; cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.rt-tab:hover { color: var(--text); }
+.rt-tab.on { color: var(--text); border-bottom-color: var(--text); }
+.rt-body { flex: 1 1 auto; overflow-y: auto; padding: 14px 12px; }
+.rt-pane { display: none; }
+.rt-pane.on { display: block; }
+
+.plan-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel-2); padding: 12px;
+}
+.plan-label { font-size: 11px; color: var(--faint); margin-bottom: 4px; }
+.plan-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+.plan-progress { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.bar { flex: 1 1 auto; height: 4px; border-radius: 999px; background: var(--card-hover); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }
+.bar.amber > i { background: var(--warn); }
+.plan-count { font-size: 11px; color: var(--muted); flex: none; }
+.plan-warn {
+  display: flex; align-items: center; gap: 6px; padding: 7px 9px; margin-bottom: 10px;
+  border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-size: 11.5px;
+}
+.step { display: flex; gap: 8px; padding: 7px 2px; font-size: 12.5px; align-items: flex-start; }
+.step .st-icon { flex: none; margin-top: 2px; color: var(--faint); }
+.step.done { color: var(--muted); }
+.step.done .st-icon { color: var(--ok); }
+.step.doing { color: var(--text); }
+.step.doing .st-icon { color: var(--warn); }
+.step .st-sub { display: block; font-size: 11px; color: var(--faint); margin-top: 1px; }
+.step-sub-card {
+  margin: 6px 0 4px 22px; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 9px; background: var(--card); font-size: 11.5px;
+  display: flex; align-items: center; gap: 7px; color: var(--muted);
+}
+.step-sub-card .grow { flex: 1 1 auto; min-width: 0; }
+.step-sub-card .btn { flex: none; }
+.rt-actions { display: flex; gap: 8px; margin-top: 12px; }
+.mini-row { display: flex; align-items: center; gap: 7px; padding: 6px 4px; font-size: 12px; color: var(--muted); }
+.mini-row .grow { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rt-empty { padding: 32px 12px; text-align: center; color: var(--faint); font-size: 12px; }
+
+/* ==========================================================================
+   4. 消息流
+   ========================================================================== */
+.msg { margin-bottom: 22px; }
+.msg.user { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.bubble-user {
+  max-width: 86%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
+  background: var(--card); border: 1px solid var(--border);
+}
+.msg-time { font-size: 10.5px; color: var(--faint); padding-right: 4px; }
+
+.assistant { display: flex; gap: 10px; }
+.ai-avatar {
+  width: 26px; height: 26px; border-radius: 8px; flex: none; margin-top: 2px;
+  background: var(--card); border: 1px solid var(--border);
+  display: grid; place-items: center; color: var(--muted);
+}
+.ai-body { flex: 1 1 auto; min-width: 0; }
+
+/* 工具调用：一行式暗卡（对齐参考图） */
+.tool-card {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2);
+  margin-bottom: 8px; overflow: hidden;
+}
+.tool-head {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px;
+  font-size: 12.5px; cursor: pointer; color: var(--text);
+}
+.tool-head:hover { background: var(--card); }
+.tool-head .t-name { font-weight: 500; flex: none; }
+.tool-head .t-status { flex: none; display: inline-flex; align-items: center; gap: 4px; color: var(--ok); font-size: 11.5px; }
+.tool-head .t-src {
+  flex: 1 1 auto; text-align: right; color: var(--faint); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tool-head .chev { color: var(--faint); flex: none; transition: transform .15s; }
+.tool-card.open .tool-head .chev { transform: rotate(90deg); }
+.tool-body { display: none; padding: 0 11px 11px; }
+.tool-card.open .tool-body { display: block; }
+.tool-args {
+  margin: 0; padding: 10px; background: var(--code-bg); border: 1px solid var(--border-soft);
+  border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; overflow-x: auto; white-space: pre; color: var(--muted);
+}
+.tool-out { margin: 8px 0 0; font-size: 11.5px; color: var(--faint); }
+
+/* 正文 Markdown */
+.md h4 { margin: 12px 0 6px; font-size: 13.5px; }
+.md p { margin: 0 0 8px; }
+.md ul { margin: 0 0 8px; padding-left: 18px; }
+.md li { margin-bottom: 4px; }
+.md b { font-weight: 600; }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--card); border: 1px solid var(--border-soft); padding: 1px 5px; border-radius: 5px; font-size: 11.5px; }
+.md pre {
+  margin: 0 0 8px; padding: 12px; overflow-x: auto;
+  background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 10px;
+  font-size: 11.5px; line-height: 1.55;
+}
+.md table { border-collapse: collapse; width: 100%; margin: 0 0 8px; font-size: 12px; }
+.md th, .md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.md th { background: var(--panel-2); font-weight: 600; }
+
+/* 人工审批卡：琥珀描边（对齐参考图的「需要授权」） */
+.approval {
+  border: 1px solid rgba(245, 166, 35, .45); border-radius: var(--radius);
+  background: var(--warn-soft); padding: 12px 14px; margin: 14px 0 4px;
+}
+.approval-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.approval-head .icon { color: var(--warn); }
+.approval-head b { color: var(--warn); font-weight: 600; }
+.approval-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+  color: var(--text); margin-bottom: 8px; word-break: break-all;
+}
+.approval-kv { font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
+.approval-detail { border-top: 1px dashed rgba(245, 166, 35, .3); margin-top: 10px; padding-top: 10px; }
+.approval .textarea, .approval .input { width: 100%; background: var(--code-bg); border-color: var(--border); }
+.approval .textarea { min-height: 76px; margin: 8px 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+
+/* 生成中文本区的占位光标 */
+.caret { display: inline-block; width: 7px; height: 14px; background: var(--text);
+  vertical-align: text-bottom; animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ==========================================================================
+   5. 输入区与状态栏
+   ========================================================================== */
+.composer-wrap { padding: 6px 24px 10px; background: var(--bg); }
+.composer {
+  max-width: var(--content); margin: 0 auto;
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--panel-2); padding: 10px 12px 8px;
+}
+.composer:focus-within { border-color: var(--muted); }
+.composer .textarea {
+  width: 100%; border: none; background: transparent; padding: 2px 4px 6px;
+  max-height: 40vh; min-height: 40px; color: var(--text);
+}
+.composer .textarea:focus { outline: none; }
+.composer-row { display: flex; align-items: center; gap: 6px; }
+.composer-row .grow { flex: 1 1 auto; }
+.model-chip {
+  display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 10px;
+  border: none; border-radius: 8px; background: transparent; color: var(--muted);
+  font-size: 12px; font-family: inherit; cursor: pointer; flex: none;
+}
+.model-chip:hover { background: var(--card); color: var(--text); }
+.btn-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 14px;
+  border-radius: 999px; border: none; cursor: pointer; font-family: inherit; font-size: 12.5px; font-weight: 600;
+}
+.btn-pill.primary { background: var(--accent); color: var(--accent-fg); }
+.btn-pill.primary:hover { filter: brightness(.94); }
+.btn-pill.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+.btn-pill.ghost:hover { color: var(--text); border-color: var(--muted); }
+.btn-pill.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+.btn-pill.danger:hover { background: var(--danger-soft); }
+.composer-hint {
+  max-width: var(--content); margin: 8px auto 0; text-align: center;
+  font-size: 11px; color: var(--faint);
+}
+.attach-strip { display: flex; gap: 8px; margin-bottom: 8px; }
+.thumb {
+  position: relative; width: 56px; height: 56px; border-radius: 10px;
+  border: 1px solid var(--border); overflow: hidden; background: var(--card);
+  display: grid; place-items: center; font-size: 9.5px; color: var(--muted); text-align: center; padding: 4px;
+}
+.thumb .x {
+  position: absolute; top: 2px; right: 2px; width: 15px; height: 15px; border-radius: 50%;
+  background: var(--danger); color: #fff; border: none; cursor: pointer; font-size: 10px; line-height: 1;
+}
+
+.statusbar {
+  display: flex; align-items: center; gap: 10px; padding: 0 14px;
+  border-top: 1px solid var(--border-soft); background: var(--bg);
+  font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden;
+}
+.statusbar .grow { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.status-dot.ok { background: var(--ok); }
+.status-dot.warn { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.status-dot.run { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+.status-warn { color: var(--warn); }
+
+/* ==========================================================================
+   6. 基础控件
+   ========================================================================== */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 30px; padding: 0 12px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  font-size: 12.5px; font-family: inherit; cursor: pointer; white-space: nowrap;
+}
+.btn:hover { background: var(--card-hover); border-color: var(--muted); }
+.btn:focus-visible { outline: 2px solid var(--muted); outline-offset: 1px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+.btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+.btn.danger:hover { background: var(--danger-soft); }
+.btn.sm { height: 26px; padding: 0 9px; font-size: 11.5px; }
+.btn.icon { width: 30px; padding: 0; }
+.input, .select, .textarea {
+  height: 30px; padding: 0 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font-size: 12.5px; font-family: inherit; min-width: 0;
+}
+.select { padding-right: 26px; appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b8b94' stroke-width='2.5' stroke-linecap='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 8px center;
+}
+.textarea { height: auto; padding: 8px 10px; resize: none; line-height: 1.6; }
+.input:focus, .select:focus, .textarea:focus { outline: none; border-color: var(--muted); }
+.input::placeholder, .textarea::placeholder { color: var(--faint); }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; background: var(--card); border: 1px solid var(--border-soft); color: var(--muted); white-space: nowrap;
+}
+.chip.ok { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+.chip.warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+.chip.danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.chip.mono { font-size: 10.5px; }
+.icon { width: 15px; height: 15px; flex: none; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.icon.sm { width: 13px; height: 13px; }
+.switch { position: relative; width: 32px; height: 18px; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--card-hover); transition: background .15s; }
+.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+  border-radius: 50%; background: var(--muted); transition: transform .15s; }
+.switch input:checked + span { background: var(--ok); }
+.switch input:checked + span::after { transform: translateX(14px); background: #0a0a0b; }
+
+/* ---------- 面板（Dialog / Sheet） ---------- */
+.overlay { position: fixed; inset: 0; z-index: 80; display: none; }
+.overlay.open { display: block; }
+.overlay .backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .6); }
+.modal {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(900px, calc(100vw - 48px)); max-height: min(80vh, 720px);
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden;
+}
+.modal.narrow { width: min(540px, calc(100vw - 48px)); }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 13px 16px; border-bottom: 1px solid var(--border); flex: none; }
+.modal-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.modal-body { padding: 14px 16px 18px; overflow-y: auto; }
+.modal-hint { margin: 0 0 12px; font-size: 11.5px; color: var(--muted); }
+.modal-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.field { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+.caps { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.row {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border: 1px solid var(--border-soft); border-radius: 10px;
+  background: var(--panel-2); margin-bottom: 6px;
+}
+.row .rmain { flex: 1 1 auto; min-width: 0; }
+.row .path { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .sub { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+.row .side { display: flex; align-items: center; gap: 8px; flex: none; }
+.audit-wrap { overflow: auto; border: 1px solid var(--border-soft); border-radius: 10px; }
+table.audit { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+table.audit th, table.audit td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
+table.audit th { background: var(--panel-2); font-weight: 600; position: sticky; top: 0; }
+table.audit td.mono { font-size: 10.5px; color: var(--muted); }
+.ws-body { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 12px; min-height: 320px; }
+.ws-tree { border: 1px solid var(--border-soft); border-radius: 10px; padding: 8px; overflow-y: auto; max-height: 420px; }
+.ws-row { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 7px;
+  font-size: 12px; cursor: pointer; white-space: nowrap; }
+.ws-row:hover { background: var(--card); }
+.ws-row.active { background: var(--accent-soft); }
+.ws-marker { width: 12px; color: var(--faint); flex: none; }
+.ws-name { overflow: hidden; text-overflow: ellipsis; }
+.ws-size { margin-left: auto; color: var(--faint); font-size: 10.5px; padding-left: 8px; }
+.ws-muted { color: var(--faint); cursor: default; }
+.ws-preview { border: 1px solid var(--border-soft); border-radius: 10px; padding: 12px; overflow: auto; max-height: 420px; }
+.ws-file-name { font-weight: 600; font-size: 12.5px; word-break: break-all; }
+.ws-file-sub { font-size: 10.5px; color: var(--faint); margin-top: 2px; margin-bottom: 8px; }
+.ws-text { margin: 0; padding: 10px; background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; white-space: pre-wrap; color: var(--muted); }
+.ws-path { margin: 0 0 8px; font-size: 11.5px; color: var(--muted); word-break: break-all; }
+
+/* ==========================================================================
+   7. 响应式
+   ≥1280 三栏 ｜ 768–1279 双栏（右面板收起） ｜ <768 单栏 + 抽屉
+   ========================================================================== */
+@media (max-width: 1279px) {
+  .body { grid-template-columns: 200px minmax(0, 1fr); }
+  .rightbar {
+    position: fixed; right: 0; top: var(--mk-h); bottom: 0; width: min(320px, 86vw); z-index: 70;
+    transform: translateX(100%); transition: transform .22s ease; box-shadow: var(--shadow-lg);
+    border-left: 1px solid var(--border);
+  }
+  .rightbar.open { transform: none; }
+  .rt-toggle { display: inline-grid; }
+}
+@media (max-width: 1023px) {
+  .nav-actions .btn .lbl, .nav-actions .lbl { display: none; }
+}
+@media (max-width: 767px) {
+  .body { grid-template-columns: minmax(0, 1fr); }
+  .sidebar {
+    position: fixed; left: 0; top: var(--mk-h); bottom: 0; width: 84%; max-width: 300px; z-index: 70;
+    transform: translateX(-100%); transition: transform .22s ease;
+    box-shadow: var(--shadow-lg); border-right: 1px solid var(--border); padding: 10px 8px 0;
+  }
+  .sidebar.open { transform: none; }
+  .menu-btn { display: inline-grid; }
+  .drawer-backdrop {
+    position: fixed; inset: var(--mk-h) 0 0; z-index: 65; background: rgba(0, 0, 0, .55); display: none;
+  }
+  .drawer-backdrop.open { display: block; }
+  .chat { padding: 18px 12px 10px; }
+  .composer-wrap { padding: 6px 12px 8px; }
+  /* WHY 工作区 chip 独占第二行：图片 + 模型 + 停止 + 发送 + chip 五个控件
+     在 390px 下必然溢出。让它换行，而不是把按钮挤变形。 */
+  .composer-row { flex-wrap: wrap; row-gap: 8px; }
+  .composer-row .grow { display: none; }
+  .composer-row .model-chip { order: 1; margin-left: auto; }
+  .composer-row .btn-pill { order: 2; }
+  .composer-row .more-wrap { order: 3; flex-basis: 100%; }
+  .topbar-sep { display: none; }
+  .topbar-title { max-width: 150px; }
+  .bubble-user { max-width: 94%; }
+  .statusbar .hide-sm { display: none; }
+  .modal { left: 0; right: 0; top: auto; bottom: 0; transform: none;
+    width: 100%; max-width: none; max-height: calc(100vh - var(--mk-h) - 24px);
+    border-radius: var(--radius) var(--radius) 0 0; }
+  .ws-body { grid-template-columns: minmax(0, 1fr); }
+  .ws-tree { max-height: 180px; }
+  .ws-preview { max-height: 240px; }
+}
+
+/* ==========================================================================
+   8. 标注层（看稿用，默认关闭）
+   ========================================================================== */
+.anno {
+  display: none; position: absolute; z-index: 40;
+  padding: 1px 6px; border-radius: 5px; font-size: 10.5px; line-height: 1.5;
+  color: var(--warn); background: var(--panel); border: 1px dashed var(--ann);
+  white-space: nowrap; pointer-events: none;
+}
+[data-ann="on"] .anno { display: inline-block; }
+[data-ann="on"] .has-box { outline: 1px dashed var(--ann); outline-offset: -1px; }
+.has-box { position: relative; }
+.anno.tl { top: 2px; left: 4px; }
+.anno.tr { top: 2px; right: 4px; }
+.anno.bl { bottom: 2px; left: 4px; }
+.anno.br { bottom: 2px; right: 4px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-blocks" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5c-1.7-1.5-4.5-1-5 1.5-1.5.4-2 2.4-1 3.6-.6 1.4.4 3 1.9 3.2.2 1.6 2 2.7 3.6 2.2.9-.3 1.7-.3 2.5 0 1.6.5 3.4-.6 3.6-2.2 1.5-.2 2.5-1.8 1.9-3.2 1-1.2.5-3.2-1-3.6C16.5 4 13.7 3.5 12 5z"/><path d="M12 5v14"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 21h18"/><path d="M7 21V11"/><path d="M12 21V7"/><path d="M17 21v-6"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 15l5-5 4 4 3-3 6 6"/><circle cx="8.5" cy="9.5" r="1.4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M22 2 11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2 12h2M20 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7.5"/><path d="M21 21l-4.3-4.3"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+  <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></symbol>
+  <symbol id="i-ruler" viewBox="0 0 24 24"><rect x="2" y="8" width="20" height="8" rx="1.5"/><path d="M6 8v3M10 8v4M14 8v3M18 8v4"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+</defs></svg>
+
+<!-- ===================== 设计稿控制条（非产品界面） ===================== -->
+<div class="mk-bar">
+  <span class="mk-title">通用 Agent · 主页面设计稿 v2（参考图风格）</span>
+  <span class="mk-sep"></span>
+  <span class="mk-group">
+    <span>状态</span>
+    <button class="mk-btn" id="mk-draft" type="button">草稿态 Home</button>
+    <button class="mk-btn on" id="mk-active" type="button">会话中</button>
+  </span>
+  <span class="mk-sep"></span>
+  <button class="mk-btn" id="mk-ann" type="button"><svg class="icon sm"><use href="#i-ruler"/></svg><span>标注层</span></button>
+  <span class="mk-spacer"></span>
+  <span class="mk-view" id="mk-view">— px · —</span>
+  <span>拖动窗口宽度看三档响应式</span>
+</div>
+
+<!-- ===================== 应用外壳 ===================== -->
+<div class="app has-box">
+  <span class="anno tl">外壳 100% 铺满视口</span>
+
+  <!-- ---------- 顶栏 ---------- -->
+  <header class="topbar">
+    <button class="icon-btn menu-btn" id="menu-btn" type="button" aria-label="打开会话列表"><svg class="icon"><use href="#i-menu"/></svg></button>
+    <div class="brand">
+      <span class="brand-logo">A</span>
+      <span class="brand-name">通用 Agent</span>
+    </div>
+    <!-- WHY 顶栏必须带会话标题：移动端侧栏是抽屉，没有它用户在会话中完全
+         不知道自己在哪条会话里。 -->
+    <span class="topbar-sep">/</span>
+    <span class="topbar-title" id="topbar-title">把原生前端迁到 React + Vite</span>
+    <div class="spacer"></div>
+    <div class="nav-actions">
+      <button class="icon-btn rt-toggle" id="rt-toggle" type="button" title="任务面板" aria-label="任务面板"><svg class="icon"><use href="#i-panel"/></svg></button>
+      <div class="more-wrap">
+        <button class="icon-btn" id="more-btn" type="button" title="更多能力"
+                aria-label="更多能力" aria-haspopup="menu" aria-expanded="false"
+                aria-controls="more-menu">
+          <svg class="icon"><use href="#i-blocks"/></svg>
+        </button>
+        <div class="popover" id="more-menu" role="menu" aria-label="更多能力" hidden>
+          <div class="pop-group">能力</div>
+          <button class="pop-item" type="button" role="menuitem" data-panel="memory">
+            <svg class="icon"><use href="#i-brain"/></svg><span class="grow">记忆</span><span class="pop-hint">3 条</span>
+          </button>
+          <button class="pop-item" type="button" role="menuitem" data-panel="workspace">
+            <svg class="icon"><use href="#i-folder"/></svg><span class="grow">工作区</span><span class="pop-hint">已锁定</span>
+          </button>
+          <button class="pop-item" type="button" role="menuitem" data-panel="knowledge">
+            <svg class="icon"><use href="#i-book"/></svg><span class="grow">知识库</span><span class="pop-hint">12 份</span>
+          </button>
+          <button class="pop-item" type="button" role="menuitem" data-panel="skills">
+            <svg class="icon"><use href="#i-blocks"/></svg><span class="grow">技能</span><span class="pop-hint">13 启用</span>
+          </button>
+          <div class="pop-sep"></div>
+          <div class="pop-group">观测 · 只读</div>
+          <button class="pop-item" type="button" role="menuitem" data-panel="audit">
+            <svg class="icon"><use href="#i-shield"/></svg><span class="grow">审计日志</span>
+          </button>
+          <button class="pop-item" type="button" role="menuitem" data-panel="usage">
+            <svg class="icon"><use href="#i-chart"/></svg><span class="grow">用量</span><span class="pop-hint">63.4%</span>
+          </button>
+        </div>
+      </div>
+      <button class="icon-btn" type="button" data-panel="settings" title="系统设置" aria-label="系统设置">
+        <svg class="icon"><use href="#i-gear"/></svg>
+      </button>
+      <button class="icon-btn" id="theme-btn" type="button" title="切换主题" aria-label="切换主题">
+        <svg class="icon"><use href="#i-sun"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="body">
+    <!-- ---------- 左侧会话栏 ---------- -->
+    <aside class="sidebar has-box" id="sidebar">
+      <span class="anno tr">Sidebar 224px · 占满屏幕高度</span>
+      <div class="side-actions">
+        <button class="new-pill" type="button"><svg class="icon sm"><use href="#i-plus"/></svg>新会话</button>
+      </div>
+
+      <div class="session-list">
+        <!-- WHY 仍按工作空间分组而不是图片里的「今天/昨天」：整组删除入口锚在分组上。
+             分组的视觉样式（小号灰字 + 右侧时间）与图片完全一致。 -->
+        <div class="group-head">
+          <svg class="icon sm"><use href="#i-folder"/></svg>
+          <span class="grow">MyAgentHarness</span>
+          <button class="icon-btn" type="button" title="删除该工作空间下的全部会话" aria-label="删除该工作空间下的全部会话" style="width:22px;height:22px"><svg class="icon sm"><use href="#i-trash"/></svg></button>
+        </div>
+        <button class="thread-item active" type="button">
+          <span class="t-row"><span class="t-title">把原生前端迁到 React + Vite</span><span class="t-time">2小时前</span></span>
+        </button>
+        <button class="thread-item" type="button">
+          <span class="t-row"><span class="t-title">知识库为什么只扫了 12 份</span><span class="t-time">昨天</span></span>
+        </button>
+
+        <div class="group-head">
+          <svg class="icon sm"><use href="#i-file"/></svg>
+          <span class="grow">会话专属目录</span>
+        </div>
+        <button class="thread-item" type="button">
+          <span class="t-row"><span class="t-title">API 接口联调问题</span><span class="t-time">10分钟前</span></span>
+        </button>
+        <button class="thread-item" type="button">
+          <span class="t-row"><span class="t-title">数据库连接脚本</span><span class="t-time">1小时前</span></span>
+        </button>
+        <button class="thread-item" type="button">
+          <span class="t-row"><span class="t-title">（无标题）</span><span class="t-time">9月8日</span></span>
+        </button>
+      </div>
+
+      <!-- 侧栏底部只放「右侧面板的三个页签」，不重复顶栏聚合菜单里的入口 ——
+           同一入口出现两处，改一处漏一处只是时间问题。 -->
+      <div class="side-foot">
+        <button class="icon-btn" type="button" data-rt="tasks"><svg class="icon"><use href="#i-list"/></svg>任务</button>
+        <button class="icon-btn" type="button" data-rt="files"><svg class="icon"><use href="#i-folder"/></svg>文件</button>
+        <button class="icon-btn" type="button" data-rt="audit"><svg class="icon"><use href="#i-shield"/></svg>审计</button>
+      </div>
+    </aside>
+
+    <!-- ---------- 主内容 ---------- -->
+    <main class="main has-box">
+      <span class="anno tr">正文列 720px 居中</span>
+
+      <!-- ===== 草稿态 Home ===== -->
+      <div class="chat" id="view-draft" hidden>
+        <div class="hero" style="max-width:var(--content);margin:0 auto;padding-top:6vh">
+          <h1 style="margin:0 0 6px;font-size:21px;font-weight:650;letter-spacing:-.01em">今天要做什么？</h1>
+          <p style="margin:0 0 22px;color:var(--muted);font-size:12.5px">
+            会话的文件根与场景在<b>第一条消息</b>时锁定 —— 换项目请新建会话。
+          </p>
+          <div class="cap-grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(215px,1fr))">
+            <button class="btn" type="button" style="justify-content:flex-start;height:auto;padding:12px;text-align:left">
+              <span style="display:block"><b style="display:flex;gap:7px;align-items:center"><svg class="icon sm" style="color:var(--muted)"><use href="#i-blocks"/></svg>选场景</b>
+              <span style="display:block;color:var(--muted);font-size:11.5px;margin-top:4px">决定这条会话启用哪些技能，选完即锁</span></span>
+            </button>
+            <button class="btn" type="button" style="justify-content:flex-start;height:auto;padding:12px;text-align:left">
+              <span style="display:block"><b style="display:flex;gap:7px;align-items:center"><svg class="icon sm" style="color:var(--muted)"><use href="#i-image"/></svg>上传图片</b>
+              <span style="display:block;color:var(--muted);font-size:11.5px;margin-top:4px">仅当模型 supports_vision 时可用</span></span>
+            </button>
+            <button class="btn" type="button" style="justify-content:flex-start;height:auto;padding:12px;text-align:left" data-panel="knowledge">
+              <span style="display:block"><b style="display:flex;gap:7px;align-items:center"><svg class="icon sm" style="color:var(--muted)"><use href="#i-book"/></svg>索引知识库</b>
+              <span style="display:block;color:var(--muted);font-size:11.5px;margin-top:4px">让 Agent 能检索到工作区里的文档</span></span>
+            </button>
+          </div>
+          <p style="margin:18px 0 8px;font-size:11px;color:var(--faint)">最近会话</p>
+          <button class="thread-item active" type="button" style="max-width:100%">
+            <span class="t-row"><span class="t-title">把原生前端迁到 React + Vite</span><span class="t-time">2小时前</span></span>
+          </button>
+          <button class="thread-item" type="button" style="max-width:100%">
+            <span class="t-row"><span class="t-title">知识库为什么只扫了 12 份</span><span class="t-time">昨天</span></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ===== 会话中 ===== -->
+      <div class="chat" id="view-active">
+        <div class="msg user">
+          <div class="bubble-user">帮我把 interfaces/web/static 下的原生前端迁到 React + Vite，后端接口一个都不要改。</div>
+          <span class="msg-time">01:20</span>
+        </div>
+
+        <div class="msg">
+          <div class="assistant">
+            <span class="ai-avatar"><svg class="icon sm"><use href="#i-terminal"/></svg></span>
+            <div class="ai-body">
+              <!-- WHY 工具卡只显示后端真正下发的字段：TOOL_RESULT 的 payload 是
+                   name / status / preview / truncated / full_output_ref —— 没有耗时。
+                   因此不画「成功 · 640ms」这类数字，那会是编造出来的字段。 -->
+              <div class="tool-card open">
+                <div class="tool-head" data-tool>
+                  <svg class="icon sm chev"><use href="#i-chev"/></svg>
+                  <svg class="icon sm" style="color:var(--muted)"><use href="#i-folder"/></svg>
+                  <span class="t-name">read_file</span>
+                  <span class="t-status"><svg class="icon sm"><use href="#i-check"/></svg>成功</span>
+                  <span class="t-src mono">interfaces/web/static/app.js</span>
+                </div>
+                <div class="tool-body">
+                  <pre class="tool-args">{ "path": "interfaces/web/static/app.js" }</pre>
+                  <p class="tool-out">输出 3048 行，工具结果较长 —— 完整内容在「工作区」面板查看。</p>
+                </div>
+              </div>
+
+              <div class="tool-card">
+                <div class="tool-head" data-tool>
+                  <svg class="icon sm chev"><use href="#i-chev"/></svg>
+                  <svg class="icon sm" style="color:var(--muted)"><use href="#i-search"/></svg>
+                  <span class="t-name">search_documents</span>
+                  <span class="t-status"><svg class="icon sm"><use href="#i-check"/></svg>成功</span>
+                  <span class="t-src mono">命中 8 条 · top_k=4</span>
+                </div>
+                <div class="tool-body">
+                  <pre class="tool-args">{ "query": "静态资源挂载 StaticFiles html=True" }</pre>
+                  <p class="tool-out">interfaces/web/app.py:162 · docs/architecture.html:1453</p>
+                </div>
+              </div>
+
+              <div class="approval">
+                <div class="approval-head">
+                  <svg class="icon"><use href="#i-alert"/></svg>
+                  <b>需要人工审批 · write_file</b>
+                </div>
+                <div class="approval-path mono">frontend/vite.config.ts</div>
+                <div class="approval-kv">说明：写入 Vite 配置，构建产物输出到 interfaces/web/static/dist</div>
+                <div class="approval-detail">
+                  <textarea class="textarea" spellcheck="false">{
+  "path": "frontend/vite.config.ts",
+  "content": "export default defineConfig({ ... })"
+}</textarea>
+                  <input class="input" placeholder="可选：补充说明（拒绝 / 代答时给模型的反馈）">
+                  <div class="approval-actions">
+                    <button class="btn-pill primary" type="button">批准</button>
+                    <button class="btn-pill ghost" type="button">按修改后执行</button>
+                    <button class="btn-pill ghost" type="button">我来代答</button>
+                    <button class="btn-pill danger" type="button">拒绝</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="md">
+                <p>我先整理了任务计划：<b>盘点接口面 → 搭工程骨架 → 迁移消息流 → 迁移面板</b>。</p>
+                <p>已完成前两步：</p>
+                <ul>
+                  <li>盘点到 <b>37 个业务端点 + 3 个运维端点</b>，URL 与响应体一个都不改</li>
+                  <li>工作区目录树缓存<b>按会话根解释</b>，换会话必须整份丢弃（generation 代号）</li>
+                </ul>
+                <p>作用域判定核心只有一个纯函数：</p>
+                <pre><code>export function isCurrent(scope: WorkspaceScope, generation: number): boolean {
+  // 代号不匹配说明期间换过会话：这份结果属于上一个根，调用方必须丢弃
+  return !!scope &amp;&amp; scope.generation === generation;
+}</code></pre>
+                <p>等待你对写入 <code>frontend/vite.config.ts</code> 的授权后继续<span class="caret"></span></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- ---------- 输入区（收进主列，不横跨左右侧栏） ---------- -->
+      <footer class="composer-wrap has-box">
+        <span class="anno bl">输入区圆角暗卡 · 上限 40vh</span>
+        <div class="attach-strip" id="attach-strip" style="max-width:var(--content);margin-left:auto;margin-right:auto">
+          <div class="thumb">架构图.png<div class="x">×</div></div>
+          <div class="thumb">截图.png<div class="x">×</div></div>
+        </div>
+        <div class="composer">
+          <textarea class="textarea" rows="1" placeholder="输入任务，Enter 发送，Shift + Enter 换行"></textarea>
+          <div class="composer-row">
+            <!-- 工作区选择入口：跟着输入框走 —— 它与「首条消息」同生命周期，
+                 放在侧栏里会让人以为随时可以改，而它选完即锁。 -->
+            <div class="more-wrap">
+              <button class="ws-chip" id="ws-chip" type="button"
+                      aria-haspopup="menu" aria-expanded="false" aria-controls="ws-menu"
+                      title="本次会话的工作空间">
+                <svg class="icon sm"><use href="#i-folder"/></svg>
+                <span id="ws-chip-text">未绑定工作空间</span>
+                <svg class="icon sm"><use href="#i-chev-down"/></svg>
+              </button>
+              <div class="popover up" id="ws-menu" role="menu" aria-label="本次会话工作空间" hidden>
+                <div class="pop-group">本次会话工作空间</div>
+                <div class="pop-note">不选：这条会话使用应用为它创建的专属目录。<b>首条消息发出后锁定</b>，换项目请新建会话。</div>
+                <button class="pop-item" type="button" role="menuitem" data-ws="pick"><svg class="icon"><use href="#i-folder"/></svg><span class="grow">选择文件夹…</span></button>
+                <button class="pop-item" type="button" role="menuitem" data-ws="browse"><svg class="icon"><use href="#i-search"/></svg><span class="grow">浏览…</span></button>
+                <button class="pop-item" type="button" role="menuitem" data-ws="clear"><svg class="icon"><use href="#i-x"/></svg><span class="grow">不绑定</span></button>
+              </div>
+            </div>
+            <button class="icon-btn" type="button" title="添加图片" aria-label="添加图片"><svg class="icon"><use href="#i-image"/></svg></button>
+            <span class="grow"></span>
+            <button class="model-chip" type="button">deepseek · V3 <svg class="icon sm"><use href="#i-chev-down"/></svg></button>
+            <button class="btn-pill danger" type="button" id="stop-btn"><svg class="icon sm"><use href="#i-stop"/></svg>停止</button>
+            <button class="btn-pill primary" type="button">发送</button>
+          </div>
+        </div>
+        <div class="composer-hint">Enter 发送 · Shift + Enter 换行 · 附件在发送时上传（草稿态还没有会话 ID）</div>
+      </footer>
+
+      <!-- ---------- 状态栏 ---------- -->
+      <div class="statusbar has-box">
+        <span class="status-dot warn"></span>
+        <span class="status-warn" id="status-run">需要你的授权才能继续 · 2/4 步</span>
+        <!-- WHY 写「本轮」而不是「本次会话」：USAGE 事件是每轮结束上报的**本轮累计**，
+             会话累计要另请 /api/usage?thread_id=。两个数混成一个会让人高估单轮成本。 -->
+        <span class="grow hide-sm mono" style="font-size:10.5px">模型: deepseek · 本轮 14,393 tokens（会话累计见「用量」）</span>
+        <span class="hide-sm" style="max-width:36%;overflow:hidden;text-overflow:ellipsis">工作空间：C:\Users\yan92\Documents\app-dev\MyAgentHarness（已锁定）</span>
+      </div>
+    </main>
+
+    <!-- ---------- 右侧任务面板 ---------- -->
+    <aside class="rightbar has-box" id="rightbar">
+      <span class="anno tl">右侧面板 300px · 占满屏幕高度 · &lt;1280 收起</span>
+      <div class="rt-tabs">
+        <button class="rt-tab on" type="button" data-rt="tasks"><svg class="icon sm"><use href="#i-list"/></svg>任务</button>
+        <button class="rt-tab" type="button" data-rt="files"><svg class="icon sm"><use href="#i-folder"/></svg>文件</button>
+        <button class="rt-tab" type="button" data-rt="audit"><svg class="icon sm"><use href="#i-shield"/></svg>审计</button>
+      </div>
+      <div class="rt-body">
+        <div class="rt-pane on" data-pane="tasks">
+          <div class="plan-card">
+            <div class="plan-label">任务计划</div>
+            <div class="plan-title">把原生前端迁到 React + Vite</div>
+            <div class="plan-progress">
+              <span class="bar amber"><i style="width:50%"></i></span>
+              <span class="plan-count">2/4</span>
+            </div>
+            <div class="plan-warn"><svg class="icon sm"><use href="#i-alert"/></svg>需要你的授权才能继续</div>
+            <div class="step done">
+              <svg class="icon sm st-icon"><use href="#i-check"/></svg>
+              <span>1. 盘点现有前端与接口面<span class="st-sub">完成</span></span>
+            </div>
+            <div class="step done">
+              <svg class="icon sm st-icon"><use href="#i-check"/></svg>
+              <span>2. 搭建 Vite + React 工程骨架<span class="st-sub">完成</span></span>
+            </div>
+            <div class="step doing">
+              <svg class="icon sm st-icon"><use href="#i-clock"/></svg>
+              <span>3. 迁移消息流与 SSE 解析<span class="st-sub">运行中 · 停在未决审批</span></span>
+              <!-- WHY 这里只做状态镜像、不放操作按钮：审批的唯一入口在消息流里。
+                   给同一件事两个按钮，用户会不确定「点右边这个算不算批准」。 -->
+              <div class="step-sub-card">
+                <svg class="icon sm"><use href="#i-alert"/></svg>
+                <span class="grow">等待你对 write_file 的审批</span>
+                <button class="btn sm" type="button" id="jump-approval">跳到审批</button>
+              </div>
+            </div>
+            <div class="step">
+              <svg class="icon sm st-icon"><use href="#i-clock"/></svg>
+              <span>4. 迁移六个能力面板<span class="st-sub">待执行</span></span>
+            </div>
+            <!-- WHY 明说数据来源：todos 事件的 payload 只有 {items:[{content,status}]}，
+                 后端不下发耗时，因此这里不显示「完成 · 10.5s」这类数字。 -->
+            <div class="rt-empty" style="text-align:left;padding:10px 2px 0">
+              状态来自 <code>todos</code> 事件快照（content + status），不含耗时。
+            </div>
+            <div class="rt-actions">
+              <button class="btn danger" type="button"><svg class="icon sm"><use href="#i-stop"/></svg>停止</button>
+              <button class="btn" type="button" data-panel="workspace"><svg class="icon sm"><use href="#i-folder"/></svg>查看产物</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="rt-pane" data-pane="files">
+          <!-- WHY 明写加载时机：常驻页签若一进页面就拉目录，会把既定的
+               「按需加载一层」取舍悄悄改成「打开就拉」。这里只在页签激活时拉一层。 -->
+          <div class="rt-empty" style="text-align:left;padding:0 2px 8px">
+            仅在本页签激活时拉取<b>一层</b>目录，不预加载整棵树。
+          </div>
+          <div class="mini-row"><svg class="icon sm"><use href="#i-folder"/></svg><span class="grow mono">frontend/</span></div>
+          <div class="mini-row" style="padding-left:20px"><svg class="icon sm"><use href="#i-file"/></svg><span class="grow mono">vite.config.ts</span><span>1.2 KB</span></div>
+          <div class="mini-row" style="padding-left:20px"><svg class="icon sm"><use href="#i-file"/></svg><span class="grow mono">package.json</span><span>0.8 KB</span></div>
+          <div class="mini-row"><svg class="icon sm"><use href="#i-folder"/></svg><span class="grow mono">interfaces/web/static/dist/</span></div>
+          <div class="mini-row" style="padding-left:20px"><svg class="icon sm"><use href="#i-file"/></svg><span class="grow mono">index.html</span><span>0.6 KB</span></div>
+          <div class="rt-empty" style="padding-top:18px">面板<b>只读</b> —— 改动请通过对话让 Agent 做，才会经过审批。</div>
+          <button class="btn sm" type="button" data-panel="workspace" style="width:100%">在完整面板中打开</button>
+        </div>
+
+        <!-- WHY 改名「审计」并写明全局：GET /api/audit 只有 actor_id / event_type /
+             limit / offset，没有 thread_id 过滤。在会话语境里叫「日志」会让人以为
+             「这是这条会话的日志」，而接口做不到。 -->
+        <div class="rt-pane" data-pane="audit">
+          <div class="rt-empty" style="text-align:left;padding:0 2px 8px">
+            全局审计 · 最近 4 条。<b>不按会话过滤</b>（端点没有会话维度）。
+          </div>
+          <div class="mini-row"><span class="grow">01:21:07 审批决策</span><span class="chip ok">成功</span></div>
+          <div class="mini-row"><span class="grow">01:20:52 write_file</span><span class="chip ok">成功</span></div>
+          <div class="mini-row"><span class="grow">01:20:11 search_documents</span><span class="chip ok">成功</span></div>
+          <div class="mini-row"><span class="grow">01:19:48 read_file</span><span class="chip ok">成功</span></div>
+          <button class="btn sm" type="button" data-panel="audit" style="width:100%;margin-top:8px">查看完整审计日志</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="drawer-backdrop" id="drawer-backdrop"></div>
+
+<!-- ===================== 面板样张（深色） ===================== -->
+<div class="overlay" id="ov-workspace">
+  <div class="backdrop" data-close></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="工作区">
+    <div class="modal-head">
+      <h3>工作区</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="ws-path mono">工作空间：C:\Users\yan92\Documents\app-dev\MyAgentHarness（已锁定：本条会话不再支持更换）</p>
+      <p class="modal-hint">Agent 的文件读写、命令产物都落在这个目录里。面板<b>只读</b> —— 要改动请通过对话让 Agent 做，这样才会经过人工审批。</p>
+      <div class="ws-body">
+        <div class="ws-tree">
+          <div class="ws-row"><span class="ws-marker">▾</span><span class="ws-name mono">/</span></div>
+          <div class="ws-row" style="padding-left:20px"><span class="ws-marker">▾</span><span class="ws-name mono">frontend</span></div>
+          <div class="ws-row" style="padding-left:34px"><span class="ws-marker">▸</span><span class="ws-name mono">src</span></div>
+          <div class="ws-row" style="padding-left:34px"><span class="ws-marker"> </span><span class="ws-name mono">vite.config.ts</span><span class="ws-size">1.2 KB</span></div>
+          <div class="ws-row active" style="padding-left:20px"><span class="ws-marker"> </span><span class="ws-name mono">README.md</span><span class="ws-size">12.8 KB</span></div>
+          <div class="ws-row ws-muted" style="padding-left:20px">（条目较多，仅显示前一部分）</div>
+        </div>
+        <div class="ws-preview">
+          <div class="ws-file-name mono">README.md</div>
+          <div class="ws-file-sub">12.8 KB · text/markdown · 仅显示前一部分</div>
+          <pre class="ws-text"># MyAgentHarness
+
+基于 deepagents 的通用任务助手，CLI 与 Web 双形态共享同一套内核。
+
+## 前端
+cd frontend &amp;&amp; npm ci &amp;&amp; npm run build</pre>
+          <button class="btn sm" type="button" style="margin-top:8px">加载更多（已显示 4096 字符）</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-knowledge">
+  <div class="backdrop" data-close></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="知识库">
+    <div class="modal-head">
+      <h3>知识库</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">索引工作区里的文本文档后，Agent 可通过 <code>search_documents</code> 检索到它们。索引只<b>读</b>工作区文件；「移除」只清掉索引，<b>不会删除源文件</b>。</p>
+      <div class="modal-toolbar">
+        <button class="btn primary" type="button">索引工作区</button>
+        <button class="btn" type="button"><svg class="icon sm"><use href="#i-refresh"/></svg>刷新</button>
+      </div>
+      <div class="caps">
+        <span class="chip ok">向量检索 已启用</span>
+        <span class="chip">嵌入后端 local</span>
+        <span class="chip">维度 768</span>
+        <span class="chip">top_k 4</span>
+      </div>
+      <div class="row"><div class="rmain"><div class="path mono">README.md</div><div class="sub">18 个分块 · 2026-09-24 10:12</div></div><div class="side"><button class="btn sm" type="button">移除</button></div></div>
+      <div class="row"><div class="rmain"><div class="path mono">docs/architecture.html</div><div class="sub">42 个分块 · 2026-09-24 10:12</div></div><div class="side"><button class="btn sm" type="button">移除</button></div></div>
+      <div class="row"><div class="rmain"><div class="path mono">application/dto.py</div><div class="sub">9 个分块 · 2026-09-23 16:40</div></div><div class="side"><button class="btn sm" type="button">移除</button></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-skills">
+  <div class="backdrop" data-close></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="技能">
+    <div class="modal-head">
+      <h3>技能</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">技能是 Agent 会加载的指令包，放在工作区的 <code>skills/</code> 目录里。启停<b>只对之后新建的会话生效</b>。</p>
+      <div class="modal-toolbar">
+        <button class="btn" type="button"><svg class="icon sm"><use href="#i-refresh"/></svg>刷新</button>
+        <span class="chip">场景：不限定</span>
+      </div>
+      <div class="row">
+        <div class="rmain"><div class="path mono">code-review</div><div class="sub">preset · 白名单准入</div></div>
+        <div class="side"><span class="chip">preset</span><label class="switch"><input type="checkbox" checked><span></span></label></div>
+      </div>
+      <div class="row">
+        <div class="rmain"><div class="path mono">shell-safety</div><div class="sub">general · 通用技能自动准入</div></div>
+        <div class="side"><span class="chip">general</span><label class="switch"><input type="checkbox" checked><span></span></label></div>
+      </div>
+      <div class="row">
+        <div class="rmain"><div class="path mono">legacy-migrator</div><div class="sub">user · 不在本场景内，不会进入视图</div></div>
+        <div class="side"><span class="chip danger">excluded</span><label class="switch"><input type="checkbox"><span></span></label></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-memory">
+  <div class="backdrop" data-close></div>
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-label="我的记忆">
+    <div class="modal-head">
+      <h3>我的记忆</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">Agent 写进 <code>/memories/</code> 的内容会跨会话保留。记错的内容在这里删掉 —— 删除会记入审计日志。</p>
+      <div class="modal-toolbar"><button class="btn" type="button"><svg class="icon sm"><use href="#i-refresh"/></svg>刷新</button></div>
+      <div class="row">
+        <div class="rmain"><div class="path mono">project/前端技术栈.md</div><div class="sub">前端已迁到 React 19 + Vite 7，产物落在 interfaces/web/static/dist</div></div>
+        <div class="side"><button class="btn sm danger" type="button">删除</button></div>
+      </div>
+      <div class="row">
+        <div class="rmain"><div class="path mono">prefs/回复语言.md</div><div class="sub">默认用简体中文回复；代码注释用中文，标识符用英文</div></div>
+        <div class="side"><button class="btn sm danger" type="button">删除</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-audit">
+  <div class="backdrop" data-close></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="审计日志">
+    <div class="modal-head">
+      <h3>审计日志</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">业务动作的留痕。<b>只读</b> —— 写入由服务端在业务动作里完成。</p>
+      <div class="modal-toolbar"><button class="btn" type="button"><svg class="icon sm"><use href="#i-refresh"/></svg>刷新</button></div>
+      <div class="audit-wrap">
+        <table class="audit">
+          <thead><tr><th>时间</th><th>类型</th><th>操作者</th><th>动作</th><th>结果</th><th>IP</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">09-25 01:21:07</td><td>审批决策</td><td>__anonymous__</td><td>approve · write_file</td><td><span class="chip ok">成功</span></td><td class="mono">127.0.0.1</td></tr>
+            <tr><td class="mono">09-25 01:20:52</td><td>工具调用</td><td>agent</td><td>write_file</td><td><span class="chip ok">成功</span></td><td class="mono">127.0.0.1</td></tr>
+            <tr><td class="mono">09-24 22:11:33</td><td>附件上传</td><td>__anonymous__</td><td>架构图.png · 218 KB</td><td><span class="chip ok">成功</span></td><td class="mono">127.0.0.1</td></tr>
+            <tr><td class="mono">09-24 19:48:41</td><td>会话删除</td><td>__anonymous__</td><td>delete_thread</td><td><span class="chip warn">部分成功</span></td><td class="mono">127.0.0.1</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-usage">
+  <div class="backdrop" data-close></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="用量">
+    <div class="modal-head">
+      <h3>用量</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">「聚合」看总量，「按次」看缓存命中率随轮次的趋势。DeepSeek 的命中价仅为未命中的 2%。</p>
+      <div class="modal-toolbar">
+        <label class="field">视角 <select class="select"><option>聚合</option><option>按次</option></select></label>
+        <label class="field">范围 <select class="select"><option>全部</option><option>当前会话</option></select></label>
+        <label class="field">窗口 <select class="select"><option>7 天</option><option selected>30 天</option><option>90 天</option></select></label>
+        <label class="field">分组 <select class="select"><option>模型</option><option>会话</option><option>日期</option></select></label>
+        <button class="btn" type="button"><svg class="icon sm"><use href="#i-refresh"/></svg>刷新</button>
+      </div>
+      <div class="caps">
+        <span class="chip">窗口 30 天</span>
+        <span class="chip">调用 128 次</span>
+        <span class="chip">合计 1,393,282 tokens</span>
+        <span class="chip ok">缓存命中率 63.4%</span>
+      </div>
+      <div class="row"><div class="rmain"><div class="path mono">#1 09-24 22:05 · deepseek</div><div class="sub">输入 28,410 · 输出 3,120 · 命中 21,004（73.9%）</div></div><div class="side"><span class="bar" style="width:84px;flex:none"><i style="width:73.9%"></i></span></div></div>
+      <div class="row"><div class="rmain"><div class="path mono">#3 09-25 01:18 · deepseek</div><div class="sub">输入 12,345 · 输出 2,048 · 命中 0（0.0%）</div></div><div class="side"><span class="bar" style="width:84px;flex:none"><i style="width:0%"></i></span></div></div>
+      <div class="row"><div class="rmain"><div class="path mono">#4 09-25 01:20 · deepseek</div><div class="sub">输入 9,120 · 输出 1,880 · 命中 未上报</div></div><div class="side"><span class="bar" style="width:84px;flex:none"><i style="width:0%"></i></span><span class="chip warn">未知</span></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ov-settings">
+  <div class="backdrop" data-close></div>
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-label="系统设置">
+    <div class="modal-head">
+      <h3>系统设置</h3>
+      <button class="icon-btn" type="button" data-close aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">这些值来自 <code>.env</code> / 配置中心，界面<b>只读</b> —— 改配置后需重启服务。</p>
+      <div class="pop-group" style="padding-left:0">外观</div>
+      <div class="row">
+        <div class="rmain"><div class="path">主题</div><div class="sub">跟随系统 / 深色 / 浅色</div></div>
+        <div class="side"><select class="select"><option>跟随系统</option><option selected>深色</option><option>浅色</option></select></div>
+      </div>
+      <div class="pop-group" style="padding-left:0">会话</div>
+      <div class="row"><div class="rmain"><div class="path">默认模型</div><div class="sub">DEFAULT_MODEL</div></div><div class="side"><span class="chip mono">deepseek</span></div></div>
+      <div class="row"><div class="rmain"><div class="path">会话文件根</div><div class="sub">未配置：每条会话使用专属目录</div></div><div class="side"><span class="chip">未绑定</span></div></div>
+      <div class="pop-group" style="padding-left:0">附件</div>
+      <div class="row"><div class="rmain"><div class="path">单文件上限</div><div class="sub">ATTACHMENT_MAX_BYTES</div></div><div class="side"><span class="chip mono">5 MB</span></div></div>
+      <div class="row"><div class="rmain"><div class="path">每会话上限</div><div class="sub">ATTACHMENT_MAX_PER_THREAD</div></div><div class="side"><span class="chip mono">8</span></div></div>
+      <div class="pop-group" style="padding-left:0">知识库</div>
+      <div class="row"><div class="rmain"><div class="path">嵌入后端</div><div class="sub">决定能否启用向量检索</div></div><div class="side"><span class="chip ok">local · 768 维</span></div></div>
+      <div class="row"><div class="rmain"><div class="path">检索返回条数</div><div class="sub">KNOWLEDGE_TOP_K</div></div><div class="side"><span class="chip mono">4</span></div></div>
+      <div class="pop-group" style="padding-left:0">运维</div>
+      <div class="row"><div class="rmain"><div class="path">审计保留期</div><div class="sub">AUDIT_RETENTION_DAYS；到期归档清理</div></div><div class="side"><span class="chip mono">30 天</span></div></div>
+      <div class="row"><div class="rmain"><div class="path">日志级别 / 格式</div><div class="sub">LOG_LEVEL · LOG_FORMAT</div></div><div class="side"><span class="chip mono">INFO · text</span></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* 设计稿交互：仅为看稿服务，不含任何业务逻辑。 */
+(function () {
+  'use strict';
+
+  var root = document.documentElement;
+  var draft = document.getElementById('view-draft');
+  var active = document.getElementById('view-active');
+  var strip = document.getElementById('attach-strip');
+  var stopBtn = document.getElementById('stop-btn');
+  var statusDot = document.querySelector('.status-dot');
+  var statusRun = document.getElementById('status-run');
+  var rightbar = document.getElementById('rightbar');
+  var wsChipEl = document.getElementById('ws-chip');
+  var wsChipTextEl = document.getElementById('ws-chip-text');
+  var topbarTitleEl = document.getElementById('topbar-title');
+
+  function setDraft(isDraft) {
+    draft.hidden = !isDraft;
+    active.hidden = isDraft;
+    strip.style.display = isDraft ? 'none' : 'flex';
+    stopBtn.style.display = isDraft ? 'none' : 'inline-flex';
+    document.getElementById('mk-draft').classList.toggle('on', isDraft);
+    document.getElementById('mk-active').classList.toggle('on', !isDraft);
+    if (isDraft) {
+      statusDot.className = 'status-dot ok';
+      /* 草稿态才能改工作空间：会话一旦产生首条消息，文件根就锁定且不可变更 */
+      wsChipEl.disabled = false;
+      wsChipTextEl.textContent = wsChoice || '未绑定工作空间';
+      topbarTitleEl.textContent = '新会话';
+      statusRun.textContent = '空闲';
+      statusRun.classList.remove('status-warn');
+      rightbar.classList.remove('open');
+    } else {
+      statusDot.className = 'status-dot warn';
+      wsChipEl.disabled = true;
+      /* 未绑定时锁定的不是某个工作空间，而是应用为这条会话建的专属目录 ——
+         这两种形态的文案必须分开，否则用户会以为自己在改自己的项目。 */
+      wsChipTextEl.textContent = (wsChoice || '会话专属目录') + '（已锁定）';
+      topbarTitleEl.textContent = '把原生前端迁到 React + Vite';
+      statusRun.textContent = '需要你的授权才能继续 · 2/4 步';
+      statusRun.classList.add('status-warn');
+    }
+  }
+
+  document.getElementById('mk-draft').addEventListener('click', function () { setDraft(true); });
+  document.getElementById('mk-active').addEventListener('click', function () { setDraft(false); });
+
+  document.getElementById('mk-ann').addEventListener('click', function () {
+    var on = root.getAttribute('data-ann') === 'on';
+    root.setAttribute('data-ann', on ? 'off' : 'on');
+    this.classList.toggle('on', !on);
+  });
+
+  /* 主题切换在产品界面右上角（不在设计稿控制条里 —— 它属于产品能力） */
+  var themeBtn = document.getElementById('theme-btn');
+  themeBtn.addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    // 图标表示「下一次点击会去哪」：当前深色 → 显示月亮（点了变深色）
+    themeBtn.querySelector('use').setAttribute('href', dark ? '#i-moon' : '#i-sun');
+  });
+
+  /* 工具卡折叠 */
+  document.querySelectorAll('[data-tool]').forEach(function (head) {
+    head.addEventListener('click', function () { head.parentElement.classList.toggle('open'); });
+  });
+
+  /* 右侧「跳到审批」：只滚动，不提交任何决策 */
+  var jumpBtn = document.getElementById('jump-approval');
+  if (jumpBtn) {
+    jumpBtn.addEventListener('click', function () {
+      var card = document.querySelector('.approval');
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
+  /* 右侧面板页签 */
+  document.querySelectorAll('.rt-tab').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      document.querySelectorAll('.rt-tab').forEach(function (t) { t.classList.toggle('on', t === tab); });
+      var name = tab.getAttribute('data-rt');
+      document.querySelectorAll('.rt-pane').forEach(function (p) {
+        p.classList.toggle('on', p.getAttribute('data-pane') === name);
+      });
+    });
+  });
+
+  /* 右侧面板开关（窄屏 / 侧栏入口） */
+  function toggleRight() {
+    if (window.innerWidth <= 1279) rightbar.classList.toggle('open');
+  }
+  document.getElementById('rt-toggle').addEventListener('click', toggleRight);
+  /* 侧栏底部的三项只是右侧面板的页签快捷方式：选中并把面板叫出来 */
+  document.querySelectorAll('.side-foot [data-rt]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var name = btn.getAttribute('data-rt');
+      document.querySelectorAll('.rt-tab').forEach(function (t) {
+        t.classList.toggle('on', t.getAttribute('data-rt') === name);
+      });
+      document.querySelectorAll('.rt-pane').forEach(function (p) {
+        p.classList.toggle('on', p.getAttribute('data-pane') === name);
+      });
+      toggleRight();
+    });
+  });
+
+  /* 右上角聚合菜单：开合 + 点外部关闭 */
+  var moreBtn = document.getElementById('more-btn');
+  var moreMenu = document.getElementById('more-menu');
+  function setMenu(open) {
+    moreMenu.hidden = !open;
+    moreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  /* 菜单键盘可用性：打开后焦点进入第一项，↑↓ 循环，Esc 关闭并把焦点还给按钮。
+     WHY 必须写进稿子：只做鼠标 hover/click 的菜单，在实现阶段极易被原样搬成
+     「点得动、键盘走不进去」的组件。 */
+  function menuItems(menu) {
+    return Array.prototype.slice.call(menu.querySelectorAll('.pop-item'));
+  }
+  function openMenu(menu, button, setOpen) {
+    setOpen(true);
+    var items = menuItems(menu);
+    if (items.length) items[0].focus();
+  }
+  function wireMenuKeys(menu, button, setOpen) {
+    menu.addEventListener('keydown', function (event) {
+      var items = menuItems(menu);
+      var index = items.indexOf(document.activeElement);
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        items[(index + 1) % items.length].focus();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        items[(index - 1 + items.length) % items.length].focus();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        setOpen(false);
+        button.focus();
+      }
+    });
+  }
+  wireMenuKeys(moreMenu, moreBtn, setMenu);
+
+  moreBtn.addEventListener('click', function (event) {
+    event.stopPropagation();
+    if (moreMenu.hidden) openMenu(moreMenu, moreBtn, setMenu);
+    else setMenu(false);
+  });
+
+  /* 输入区的工作区入口：三个动作只改本地选择（首条消息发出时才真正锁定） */
+  var wsChip = document.getElementById('ws-chip');
+  var wsMenu = document.getElementById('ws-menu');
+  var wsText = document.getElementById('ws-chip-text');
+  function setWsMenu(open) {
+    wsMenu.hidden = !open;
+    wsChip.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  wireMenuKeys(wsMenu, wsChip, setWsMenu);
+  wsChip.addEventListener('click', function (event) {
+    event.stopPropagation();
+    if (wsMenu.hidden) openMenu(wsMenu, wsChip, setWsMenu);
+    else setWsMenu(false);
+  });
+  /* wsChoice: null = 不绑定（会话专属目录），否则是选中的工作空间短名。
+     WHY 单独存一份：锁定后的文案要区分两种真实状态 ——
+     「MyAgentHarness（已锁定）」与「会话专属目录（已锁定）」，
+     只读 chip 当前显示文字是推不出「到底选没选」的。 */
+  var wsChoice = null;
+  document.querySelectorAll('#ws-menu [data-ws]').forEach(function (item) {
+    item.addEventListener('click', function () {
+      var action = item.getAttribute('data-ws');
+      wsChoice = action === 'clear' ? null : 'MyAgentHarness';
+      wsText.textContent = wsChoice || '未绑定工作空间';
+      setWsMenu(false);
+      wsChip.focus();
+    });
+  });
+
+  document.addEventListener('click', function (event) {
+    if (!moreMenu.hidden && !moreMenu.contains(event.target) && !moreBtn.contains(event.target)) {
+      setMenu(false);
+    }
+    if (!wsMenu.hidden && !wsMenu.contains(event.target) && !wsChip.contains(event.target)) {
+      setWsMenu(false);
+    }
+  });
+
+  /* 能力面板 */
+  function openPanel(name) {
+    var ov = document.getElementById('ov-' + name);
+    if (ov) ov.classList.add('open');
+  }
+  function closeAll() {
+    document.querySelectorAll('.overlay.open').forEach(function (el) { el.classList.remove('open'); });
+  }
+  document.querySelectorAll('[data-panel]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      openPanel(btn.getAttribute('data-panel'));
+      setMenu(false);           // 选完就收起：留着菜单挡在面板前面没有意义
+    });
+  });
+  document.querySelectorAll('[data-close]').forEach(function (el) { el.addEventListener('click', closeAll); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    setMenu(false);
+    setWsMenu(false);
+    closeAll();
+  });
+
+  /* 移动端抽屉 */
+  var sidebar = document.getElementById('sidebar');
+  var backdrop = document.getElementById('drawer-backdrop');
+  document.getElementById('menu-btn').addEventListener('click', function () {
+    sidebar.classList.add('open'); backdrop.classList.add('open');
+  });
+  backdrop.addEventListener('click', function () {
+    sidebar.classList.remove('open'); backdrop.classList.remove('open');
+  });
+
+  /* 视口指示 */
+  var view = document.getElementById('mk-view');
+  function renderView() {
+    var w = window.innerWidth;
+    var bp = w >= 1280 ? '三栏 ≥1280' : (w >= 768 ? '双栏 768–1279' : '单栏 <768');
+    view.innerHTML = '<b>' + w + 'px</b> · ' + bp;
+  }
+  window.addEventListener('resize', renderView);
+  renderView();
+  setDraft(false);
+})();
+</script>
+</body>
+</html>

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from application.errors import ThreadBusyError
 from application.events import AgentEvent, AgentEventType
+from application.usage import cache_hit_rate
 from bootstrap.core import build_app_context
 
 if TYPE_CHECKING:
@@ -62,10 +63,18 @@ def render_event(event: AgentEvent) -> None:
     elif event.event is AgentEventType.USAGE:
         # WHY CLI 也打印用量：命令行是排障与压测的主战场，
         # 「这次跑了多少 token」在这里比在网页上更常被问到。
+        # WHY 还要打印缓存命中率：DeepSeek 的命中价是未命中的 1/50，
+        # 「有没有省到钱」看的就是它；未上报时显示「未知」而不是 0%——
+        # 两者恰好会导出相反的结论。
+        prompt_tokens = int(payload.get("prompt_tokens") or 0)
+        cache_hit_tokens = int(payload.get("cache_hit_tokens") or 0)
+        rate = cache_hit_rate(prompt_tokens, cache_hit_tokens)
+        rate_text = f"{rate:.1%}" if rate is not None else "未知"
         print(
-            f"\n[用量] 输入 {payload.get('prompt_tokens', 0)} / "
+            f"\n[用量] 输入 {prompt_tokens} / "
             f"输出 {payload.get('completion_tokens', 0)} / "
-            f"合计 {payload.get('total_tokens', 0)} tokens",
+            f"合计 {payload.get('total_tokens', 0)} tokens / "
+            f"缓存命中 {cache_hit_tokens}（{rate_text}）",
             flush=True,
         )
     elif event.event is AgentEventType.DONE:

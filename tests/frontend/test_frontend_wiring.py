@@ -68,8 +68,31 @@ def test_index_loads_workspace_scope_before_app() -> None:
 
 
 def test_static_files_exist() -> None:
-    for name in ("index.html", "app.js", "markdown.js", "workspace_scope.js", "styles.css"):
+    for name in (
+        "index.html",
+        "app.js",
+        "markdown.js",
+        "mermaid_render.js",
+        "workspace_scope.js",
+        "styles.css",
+    ):
         assert (STATIC / name).is_file(), f"静态资源缺失：{name}"
+
+
+def test_index_loads_mermaid_module_before_app() -> None:
+    """Mermaid 后处理模块必须排在 ``app.js`` 之前。
+
+    WHY 与前面两条同一类接线错误：``app.js`` 在渲染助手消息时直接读全局
+    ``MermaidView``。脚本错序时不会报错（读到的只是 ``undefined``，而调用点本来就为
+    「渲染器缺席」留了分支），表现是「图全都不画、代码块倒是都在」——那与「模型没写
+    mermaid 代码块」在界面上完全一样。
+    """
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    assert 'src="/mermaid_render.js"' in html, "index.html 未挂载 mermaid_render.js"
+    assert html.index('src="/mermaid_render.js"') < html.index('src="/app.js"'), (
+        "mermaid_render.js 必须排在 app.js 之前，否则 app.js 拿不到全局 MermaidView"
+    )
 
 
 def test_app_renders_assistant_messages_through_the_renderer() -> None:
@@ -83,6 +106,32 @@ def test_app_renders_assistant_messages_through_the_renderer() -> None:
     assert script.count("window.Markdown.render(") >= 2, "历史与流式两条路径都应渲染 Markdown"
     # 兜底必须是 textContent：渲染器缺席时用 innerHTML 塞原文，等于把 XSS 面又打开
     assert "body.textContent = content;" in script
+
+
+def test_both_message_paths_enhance_diagrams() -> None:
+    """助手消息的两条渲染路径都必须触发图渲染，且缺席时不影响正文。
+
+    WHY 两条都要查：历史与流式是两段独立代码，只接一条的表现是「刷新前有图、刷新后
+    变成一堆代码块」——用户很难描述这种半接线，只会以为图渲染不可靠。
+
+    WHY 还要查那一层守卫：这段逻辑依赖一个**第三方**资源的接缝，它不在页面上时报错，
+    只在控制台里。守卫缺席时，一次「内置发行文件没随部署带过去」会把所有助手消息
+    变成空白——连文字都没了，而那是最难被归因到「图」的一件事。
+    """
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    for name in ("renderHistory", "handleEvent"):
+        assert "enhanceDiagrams(" in _function_source(script, name), (
+            f"{name} 未触发图渲染"
+        )
+
+    helper = _function_source(script, "enhanceDiagrams")
+    assert "window.MermaidView" in helper, "缺少「渲染模块不在」的守卫"
+    assert "catch(" in helper, (
+        "未处理 enhance 的拒绝：一次未捕获的拒绝会静默中断这一轮的收尾"
+    )
+    # 兜底必须是 textContent（与 Markdown 那条同一理由）；图渲染绝不能反过来去动正文
+    assert "innerHTML" not in helper, "图渲染不应改写正文的 innerHTML"
 
 
 def _function_source(script: str, name: str) -> str:
@@ -144,3 +193,91 @@ def test_both_session_switch_paths_reset_the_workspace_scope() -> None:
         assert "syncWorkspaceScope()" in body, (
             f"{name} 未同步工作区作用域——面板会继续列着上一条会话的目录"
         )
+
+
+def test_session_list_groups_by_workspace_and_offers_deletion() -> None:
+    """会话清单必须按工作空间分组，且单条与整组都有删除入口。
+
+    WHY 需要这条：这两件事**只**在界面上接线（后端端点各有专门用例），漏接的表现是
+    「按钮点了没反应」或「清单还是平铺的」——两者都不抛错、也不进日志，只能靠人点开
+    界面才发现。这里挡的是最粗的那一类：入口压根不存在。
+    """
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "groupThreads(" in _function_source(script, "renderThreads"), (
+        "renderThreads 未按工作空间分组"
+    )
+    assert "deleteThread(item)" in _function_source(script, "threadActions"), (
+        "会话条目缺少删除入口"
+    )
+    group_body = _function_source(script, "renderThreadGroup")
+    assert "deleteWorkspaceGroup(group)" in group_body, "分组标题缺少「删除该工作空间」入口"
+    assert "workspaceLabel(" in _function_source(script, "groupThreads"), (
+        "分组标题必须显示工作空间短名，否则只是一行路径"
+    )
+
+
+def test_workspace_group_deletion_covers_archived() -> None:
+    """整组删除必须显式要求包含已归档的会话。
+
+    WHY 需要这条：归档只是清单可见性，而「删除这个工作空间」的语义是「把它清空」。漏掉
+    这个参数时请求依然成功（删掉的是当前可见的那几条），用户下次勾上「含已归档」会看到
+    这一组又回来了——而他会以为是删除没生效。
+    """
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    body = _function_source(script, "deleteWorkspaceGroup")
+
+    assert "include_archived" in body, "整组删除未包含已归档的会话"
+    assert "bound" in body, "整组删除必须区分「绑定到某目录」与「未绑定」两种形态"
+
+
+def test_usage_panel_is_wired_to_both_viewpoints() -> None:
+    """用量面板的两个视角都必须真的取数、渲染，并把缓存命中率显出来。
+
+    WHY 需要这条：面板是纯接线（端点与聚合各有专门用例）。漏接的表现是「按钮点了没
+    反应」或「数字永远不动」——两者都不抛错、也不进日志，只能靠人点开界面才发现。
+
+    WHY 单独盯命中率：它是这个面板存在的理由——「DeepSeek 的缓存到底有没有收益」只能
+    由它回答。面板漏渲染它，判断依据就又回到了只能靠猜的状态（这正是本次修复的起点）。
+
+    WHY 两个视角都要断言：它们的取数端点不同，只接一个的表现是「切过去一片空白」，
+    而用户会先怀疑「这段时间没有用量」——归因方向完全错了。
+    """
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    aggregate_body = _function_source(script, "loadUsageAggregate")
+    assert "/api/usage?" in aggregate_body, "聚合视角未调用用量端点"
+    assert "group_by" in aggregate_body, "聚合视角未传分组维度，切换分组不会生效"
+
+    series_body = _function_source(script, "loadUsageSeries")
+    assert "/api/usage/series" in series_body, "按次视角未调用序列端点"
+    assert "limit" in series_body, "按次视角未传条数上限"
+
+    # 分派器必须按视角选端点，否则切换视角只是把同一份数据又取了一遍
+    load_body = _function_source(script, "loadUsage")
+    assert "usageView()" in load_body, "loadUsage 未读取视角"
+    assert "loadUsageSeries()" in load_body and "loadUsageAggregate()" in load_body, (
+        "loadUsage 未按视角分派到两个加载器"
+    )
+
+    for name in ("renderUsage", "renderUsageSeries"):
+        body = _function_source(script, name)
+        assert "cache_hit_rate" in body, f"{name} 未渲染缓存命中率"
+        assert "formatHitRate(" in body, f"{name} 命中率未经格式化：否则「未知」会显示成 0%"
+
+    # 「未知」与 0% 是两个相反结论，格式化函数必须显式区分它们
+    rate_body = _function_source(script, "formatHitRate")
+    assert "未知" in rate_body, "命中率格式化未区分「provider 未上报」与「确实没命中」"
+
+    # 按次视角的「趋势」靠内联条承载，漏画它就退化成一列数字
+    assert "hitRateBar(" in _function_source(script, "renderUsageSeries"), (
+        "按次视角未画命中率条——趋势会退化成一列数字"
+    )
+
+    assert "openUsageModal" in _function_source(script, "bindUsageEvents"), (
+        "用量入口按钮没有绑定打开事件"
+    )
+    assert "bindUsageEvents()" in _function_source(script, "init"), (
+        "init 未绑定用量面板事件——按钮会一直没反应"
+    )

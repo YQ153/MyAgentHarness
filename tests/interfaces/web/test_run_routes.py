@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from application.session_registry import SessionRegistry
+from config import SessionRoot
 from interfaces.web.routes import router
 from runtime.thread_store import ThreadMetaStore
 from tests.application.test_session_registry import _registry
@@ -123,3 +124,41 @@ def test_a_thread_id_with_a_separator_is_rejected_before_anything_is_created(
 
     assert response.status_code == 400, response.text
     assert not outside.exists(), "越界 ID 不得在工作区之外建出目录"
+
+
+def test_first_message_with_a_scenario_assembles_the_view_for_it(
+    tmp_path: Path, thread_store: ThreadMetaStore
+) -> None:
+    """首条消息带场景：附件那一步的根解析也必须带场景，技能视图要按它装配。
+
+    WHY 用真注册表：这个 bug 的成因正是「解析这一步漏了场景」，而替身按服务端口径实现了场景
+    传递——拿替身测只会证明替身能通过。WHY 断言磁盘上的视图：图里的技能来源就是挂载出来的
+    ``/.skills-active``，视图没对齐时预设技能一个都进不了上下文，而请求本身照样 200、日志上也
+    看不出异常（视图重建那条 INFO 只在装配时打印一次）。
+    """
+    presets = tmp_path / "presets"
+    package = presets / "coding" / "commit-message"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text(
+        "---\nname: commit-message\ndescription: 提交信息规范\n---\n\n# 提交信息\n",
+        encoding="utf-8",
+    )
+    (presets / "coding" / "preset.toml").write_text(
+        'title = "代码开发"\nskills = ["commit-message"]\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    config = make_config(tmp_path, presets_dir=presets)
+    registry = _registry(config, thread_store)
+    runs = StubRuns()
+    client = _client(config, registry, runs)
+
+    response = client.post(
+        "/api/threads/t1/runs",
+        json={"content": "你好", "workspace": str(workspace), "preset": "coding"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert runs.calls[0]["preset"] == "coding"
+    view = SessionRoot(config, workspace.resolve(), "coding").skill_view_store
+    assert "commit-message" in {child.name for child in view.iterdir()}

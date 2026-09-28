@@ -148,6 +148,13 @@ def build_interrupt_on(
     微 VM，审批才可以让位给隔离本身。用一个开关管所有档位，必然在弱档位
     上过松、强档位上过严。
 
+    WHY ``delete`` 独立于 ``execute`` 参与审批，且不会因 ``disabled`` 档位而
+    省略：``delete`` 是文件操作，在所有档位（local / sandbox / disabled）都
+    可用，并且会递归删除整个目录子树——这是不可恢复的操作。``disabled`` 档位
+    只是关闭了 shell 执行，文件删除能力依旧，故不能像 ``execute`` 那样在
+    ``disabled`` 下跳过审批；它仅在沙箱档位且显式 ``require_approval=False``
+    时随 ``execute`` 一起被关闭（那是有意关闭全部审批的整体开关）。
+
     Args:
         mode: 执行档位。
         tier: 沙箱档位，仅 ``sandbox`` 档位使用；``None`` 按 Tier 0 处理。
@@ -159,13 +166,23 @@ def build_interrupt_on(
     if mode is None:
         raise ValueError("mode 不能为 None")
 
+    # delete 在所有档位都需人工确认：递归删除整棵目录子树，不可恢复。
+    delete_interrupt = InterruptOnConfig(
+        allowed_decisions=["approve", "reject"],
+        description=(
+            "即将删除工作区中的文件或目录；删除目录时会递归移除其全部内容，"
+            "且不可恢复，请确认不会误删。"
+        ),
+    )
+
     if mode.value == "local":
-        logger.info("执行档位=local：execute 调用前需人工批准")
+        logger.info("执行档位=local：execute 与 delete 调用前需人工批准")
         return {
             "execute": InterruptOnConfig(
                 allowed_decisions=["approve", "reject"],
                 description="即将在本机执行 shell 命令，请确认命令内容安全。",
-            )
+            ),
+            "delete": delete_interrupt,
         }
 
     if mode.value == "sandbox":
@@ -175,16 +192,17 @@ def build_interrupt_on(
                 "仅依赖沙箱自身的资源管控"
             )
             return {}
-
         tier_value = tier.value if tier is not None else "auto"
         description = _SANDBOX_INTERRUPT_DESCRIPTIONS.get(tier_value, _DEFAULT_SANDBOX_DESCRIPTION)
-        logger.info("执行档位=sandbox（tier=%s）：execute 调用前需人工批准", tier_value)
+        logger.info("执行档位=sandbox（tier=%s）：execute 与 delete 调用前需人工批准", tier_value)
         return {
             "execute": InterruptOnConfig(
                 allowed_decisions=["approve", "reject"],
                 description=description,
-            )
+            ),
+            "delete": delete_interrupt,
         }
 
-    logger.info("执行档位=%s：execute 不开放审批通道", mode.value)
-    return {}
+    # disabled 档位：execute 不可用，但文件删除（含递归）依旧可用且危险，仍须审批。
+    logger.info("执行档位=%s：execute 不开放审批通道，delete 调用前需人工批准", mode.value)
+    return {"delete": delete_interrupt}

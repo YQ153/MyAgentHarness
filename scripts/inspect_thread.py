@@ -128,6 +128,21 @@ def resolve_agent_db(db_override: str | None) -> Path:
         return ROOT / _DEFAULT_DATA_DIR / "agent.db"
 
 
+_HARNESS_DIR_NAME = ".harness"
+"""应用数据目录名，与 ``config.HARNESS_DIR_NAME`` 同值。
+
+WHY 允许这份重复：与 ``_KNOWLEDGE_DB_PREFIX`` 同一理由——脚本要在依赖没装全时也能跑，
+因此这里不 import ``config``。
+"""
+
+_CURRENT_KNOWLEDGE_DB_NAME = "knowledge.db"
+"""**现行**布局里的知识库文件名（位于 ``<工作区>/.harness/`` 下）。
+
+WHY 固定文件名：每个根各有一个 ``.harness/``，撞名不可能发生；固定名字让「库在哪」这件事
+不需要再算一次 slug 就能说清。
+"""
+
+
 def knowledge_db_prefix() -> str:
     """知识库文件名前缀：优先取 ``knowledge_runtime`` 的常量，导入不了时用兜底值。
 
@@ -142,20 +157,35 @@ def knowledge_db_prefix() -> str:
     return KNOWLEDGE_DB_PREFIX
 
 
-def resolve_knowledge_dbs(agent_db: Path) -> list[Path]:
-    """列出这个数据目录下的全部知识库文件（**每个会话根一份**）。
+def resolve_knowledge_dbs(agent_db: Path, workspace: Path | None = None) -> list[Path]:
+    """列出可能的知识库文件：**现行**位置（工作区内）与**旧**位置（数据目录里）。
 
     WHY 返回列表而不是单个路径：知识库按会话的文件根隔离（库里以「根内虚拟路径」为键
     去重，两个项目的 ``/README.md`` 是同一个键）。因此「那个知识库」已经不存在了——
     写死一个文件名会让脚本查到一个空库，而症状看起来像「我什么都没索引」。
 
-    WHY 跟着主库推导：知识库与检查点库同处一个数据目录是一等约定（``knowledge_runtime``
-    的 docstring 写明），容器部署下两者同在一个可写卷里。
+    WHY 要同时找旧位置：2026-09-22 之前库在 ``<数据目录>/knowledge-<根标识>.db``，而升级后
+    的旧库要到「该根第一次被装配」时才搬走——取证脚本正好常在「还没打开过那条会话」时被跑，
+    那时库还在旧位置。
+
+    Args:
+        agent_db: 主库路径（用于定位数据目录里的旧库）。
+        workspace: 目标工作区；给了就优先看 ``<workspace>/.harness/knowledge.db``。
     """
-    return sorted(agent_db.parent.glob(f"{knowledge_db_prefix()}*.db"))
+    candidates: list[Path] = []
+    if workspace is not None:
+        current = Path(workspace).expanduser().resolve() / _HARNESS_DIR_NAME / (
+            _CURRENT_KNOWLEDGE_DB_NAME
+        )
+        if current.is_file():
+            candidates.append(current)
+    candidates.extend(sorted(agent_db.parent.glob(f"{knowledge_db_prefix()}*.db")))
+    return candidates
 
 
-def choose_knowledge_db(agent_db: Path, *, override: str | None) -> Path | None:
+def choose_knowledge_db(
+    agent_db: Path, *, override: str | None, workspace: Path | None = None
+) -> Path | None:
     """在「一个根一份库」的前提下挑出要查的那一个；挑不出来时返回 ``None``。
 
     WHY 要挑而不是随便取一个：库按会话的文件根隔离，取错一个会读到空表——而症状看起来
@@ -163,8 +193,9 @@ def choose_knowledge_db(agent_db: Path, *, override: str | None) -> Path | None:
     指定哪一个。
 
     Args:
-        agent_db: 主库路径（用于定位数据目录）。
+        agent_db: 主库路径（用于定位数据目录里的旧库）。
         override: 显式指定的知识库文件；给了就直接用它。
+        workspace: 目标工作区；给了就优先看它下面的 ``.harness/knowledge.db``。
 
     Returns:
         要查的库路径；无法唯一确定时返回 ``None``（并已打印候选）。
@@ -176,15 +207,16 @@ def choose_knowledge_db(agent_db: Path, *, override: str | None) -> Path | None:
             return None
         return chosen
 
-    candidates = resolve_knowledge_dbs(agent_db)
+    candidates = resolve_knowledge_dbs(agent_db, workspace)
     if not candidates:
-        print(f"数据目录里没有知识库文件：{agent_db.parent}")
-        print("（知识库在第一次索引之后才会出现；路径前缀见 knowledge_runtime.KNOWLEDGE_DB_PREFIX）")
+        print("没找到知识库文件。现行位置形如：<工作区>/.harness/knowledge.db")
+        print(f"（旧位置是数据目录下的 {knowledge_db_prefix()}*.db：{agent_db.parent}）")
+        print("可以用 --workspace <工作区> 指定根，或 --knowledge-db 直接指定文件。")
         return None
     if len(candidates) == 1:
         return candidates[0]
 
-    print(f"这个数据目录里有 {len(candidates)} 个知识库（每个会话根一份），请用 --knowledge-db 指定：")
+    print(f"找到 {len(candidates)} 个候选知识库（每个会话根一份），请用 --knowledge-db 指定：")
     for item in candidates:
         print(f"  {item}")
     return None
@@ -649,11 +681,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     knowledge_parser = subparsers.add_parser("knowledge", help="知识库规模与已索引文档")
     knowledge_parser.add_argument("--db", default=None, help="覆盖 agent.db 路径（默认取配置）")
     knowledge_parser.add_argument(
+        "--workspace",
+        default=None,
+        help=(
+            "目标工作区；给了就优先查它下面的 .harness/knowledge.db"
+            "（2026-09-22 起知识库住在工作区内）"
+        ),
+    )
+    knowledge_parser.add_argument(
         "--knowledge-db",
         default=None,
         help=(
-            "指定要查的知识库文件；不传时若数据目录里只有一个就用它，"
-            "有多个会把候选列出来（知识库按会话的文件根各一份）"
+            "指定要查的知识库文件；不传时按「工作区内的现行位置 → 数据目录里的旧位置」"
+            "依次找，候选多于一个会把清单列出来（知识库按会话的文件根各一份）"
         ),
     )
 
@@ -678,7 +718,9 @@ def main(argv: list[str] | None = None) -> int:
 
     agent_db = resolve_agent_db(args.db)
     if args.command == "knowledge":
-        chosen = choose_knowledge_db(agent_db, override=args.knowledge_db)
+        chosen = choose_knowledge_db(
+            agent_db, override=args.knowledge_db, workspace=args.workspace
+        )
         if chosen is None:
             return 2
         target = chosen
