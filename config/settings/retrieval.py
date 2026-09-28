@@ -6,6 +6,11 @@
 （检索结果、嵌入向量与分块参数互相咬合），因此归为一个域。
 """
 
+# WHY 必须延迟求值注解：下面两个 ``@model_validator`` 的返回注解写的是**本类**
+# （``-> RetrievalSettings``），而类体执行期间这个名字还不存在——求值即得 NameError。
+# 与项目其余模块（``knowledge_service`` / ``knowledge_store`` 等）同一写法。
+from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -135,6 +140,20 @@ class RetrievalSettings(BaseModel):
     准备）。显式提供是为了让人能把模型装在自己选好的环境里，而不必迁就本项目的约定。
     """
 
+    embedding_cache_dir: str = ""
+    """``subprocess`` 档位下**模型权重**的缓存目录；留空时用 ``<数据目录>/embed-cache``。
+
+    WHY 需要显式一项：fastembed 的默认缓存落在系统临时目录（Windows 实测是
+    ``%TEMP%\\fastembed_cache``），会被「存储感知」/ 磁盘清理清掉。被清掉的表现**只是
+    「下次冷启动重新下载 90 MB」**（探针实测冷下载 84.5 s），没有任何报错指向「缓存没了」
+    ——那正是最难自查的一类退化。
+
+    WHY 与 ``embedding_python`` 同取数据目录作默认：两者都是「几百 MB、应随数据卷走」
+    的东西，分开落盘会让容器部署出现「venv 在数据卷、权重写进只读镜像层」的半吊子状态。
+
+    WHY 只作用于 ``subprocess`` 档位：``openai-compat`` 不发权重（模型由服务端持有）。
+    """
+
     # ---------------- 知识库（工作区文档索引与检索） ----------------
     knowledge_chunk_chars: int = Field(default=800, ge=100, le=8000)
     """单个分块的目标字符数。
@@ -175,6 +194,26 @@ class RetrievalSettings(BaseModel):
 
     WHY 必须有：分块数直接决定嵌入调用次数与向量表体积，而工作区里出现一份几 MB 的
     日志或生成文件是常事。超限时截断并记日志，而不是让一次索引把配额打满。
+    """
+
+    knowledge_auto_index: bool = True
+    """是否让知识库按间隔自动把索引与工作区对齐（新增 / 变更 / 删除）。
+
+    WHY 默认开启：在此之前索引只在「Agent 调 index_documents」或「人工点面板」时刷新，
+    于是文档改过之后检索到的是旧内容——而那个现象看起来只是「搜得不准」，没有任何
+    报错指向「索引没刷新」。这类「功能在、结果旧」的状态比报错更难自查。
+
+    WHY 仍然保留开关：扫描要遍历工作区（``rglob``），在放了几万个文件的目录里是
+    有成本的；把它做成开关，是为了让明确不需要的人能关掉，而不是默认替他决定。
+    """
+
+    knowledge_auto_index_interval_seconds: int = Field(default=300, ge=30, le=86400)
+    """自动对齐的间隔秒数。
+
+    WHY 下限 30 秒：比这更密的巡检只是把同一批文件的 ``stat`` 重复做一遍——内容指纹
+    比对发生在读取之后，密到一定程度收益只剩 IO 开销。
+
+    WHY 上限一天：间隔再长就与「手动点一下」没有区别了，而本项的用意正是免手动。
     """
 
     @field_validator("embedding_backend", mode="before")

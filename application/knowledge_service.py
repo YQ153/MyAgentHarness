@@ -69,6 +69,17 @@ WHY：这些目录动辄上万文件，且内容与「用户放进来的资料�
 （``.attachments`` / ``.tool_outputs`` 分别是上传字节与工具输出留存）。
 """
 
+_MAX_SYNC_DOCUMENTS_PER_RUN = 200
+"""单轮自动同步最多处理的文档数。
+
+WHY 需要额度：一轮同步可能面对「工作区首次装配」这种极端情况——那时每一份文档都要
+嵌入，一次跑完会长时间占住嵌入后端（索引期间检索要排队），而它跑在一个旁路巡检
+协程里，不该有本事把交互路径拖住。超出额度的留到下一轮，因此最终仍会全部索引完。
+
+WHY 不计入配置：它不是策略（不影响结果正确性，只影响「多久追平」），做成配置项
+只会多出一个没人知道该填多少的旋钮。
+"""
+
 _RRF_K = 60
 """倒数排名融合的平滑常数。
 
@@ -200,6 +211,19 @@ class KnowledgeService:
         self._store = store
         self._embeddings = embeddings
         self._root = scope.root
+        # WHY 一把锁管住「扫描并写索引」这两条路径：手动索引（面板按钮 / Agent 工具）
+        # 与后台自动同步可能同时发生，两者都会遍历工作区并重写同一批文档行。存储层的
+        # 事务能保证单次写入不坏，但两次并发的全量扫描会互相重复嵌入（白白调用模型），
+        # 且让「本轮新增了几份」这类汇总数字对不上。
+        self._index_lock = asyncio.Lock()
+        self._file_state: dict[str, tuple[int, int]] = {}
+        """虚拟路径 → ``(mtime_ns, size)``，用于跳过「连内容都不必读」的未变文件。
+
+        WHY 只在进程内缓存而不入库：它只是**加速用的提示**，真值永远是
+        :meth:`index_document` 里算出的内容指纹。写进库会让它变成一份必须与磁盘
+        保持一致的持久状态——而那正是最难保证的东西；进程重启时缓存为空，代价仅是
+        第一轮多读一次文件。
+        """
         logger.info(
             "KnowledgeService 就绪：workspace=%s 向量=%s 嵌入=%s",
             self._root,
@@ -314,12 +338,14 @@ class KnowledgeService:
         candidates = await asyncio.to_thread(self._discover)
         results: list[dict[str, Any]] = []
 
-        for virtual in candidates:
-            try:
-                results.append(await self.index_document(virtual, force=force))
-            except (UnsupportedDocumentError, WorkspacePathError, OSError) as exc:
-                logger.warning("跳过无法索引的文件：%s（%s）", virtual, exc)
-                results.append({"source_path": virtual, "status": "skipped", "detail": str(exc)})
+        async with self._index_lock:
+            for virtual in candidates:
+                try:
+                    results.append(await self.index_document(virtual, force=force))
+                except (UnsupportedDocumentError, WorkspacePathError, OSError) as exc:
+                    logger.warning("跳过无法索引的文件：%s（%s）", virtual, exc)
+                    results.append({"source_path": virtual, "status": "skipped", "detail": str(exc)})
+                self._remember(virtual)
 
         summary: dict[str, Any] = {"total": len(results), "scanned": len(candidates)}
         for status in ("indexed", "unchanged", "empty", "skipped"):
@@ -333,6 +359,112 @@ class KnowledgeService:
             summary["skipped"],
         )
         return summary
+
+    async def sync_workspace(self) -> dict[str, Any]:
+        """把索引与工作区**增量**对齐：新增与变更的重新索引，已删除的移除索引。
+
+        WHY 判变要分两级（文件签名 → 内容指纹）：指纹（sha256）要读完整个文件才算得
+        出来，而一轮同步面对的是工作区里的**全部**文件——每轮都全读一遍，代价随文件数
+        线性增长，且后台任务本就不该持续占着磁盘。``(mtime_ns, size)`` 是一次 ``stat``
+        就能拿到的便宜信号：它没变就跳过，它变了才去读内容。指纹仍由
+        :meth:`index_document` 在读完之后复核，因此「改了内容却没改 mtime」不会被漏掉
+        ——那种情况只是这一轮多读一次，结果依然正确。
+
+        WHY 还要处理删除：在此之前「文件从工作区删掉」不会让索引消失，于是检索会继续
+        返回一份已经不存在的文档，而 Agent 拿着它的内容去回答。这类「检索成功但内容
+        是幽灵」比检索失败更难发现。
+
+        Returns:
+            汇总字典：``scanned`` / ``indexed`` / ``unchanged`` / ``empty`` /
+            ``skipped`` / ``removed`` / ``pending``，以及逐条明细 ``items``。
+            ``pending`` 是本轮因额度未处理、留给下一轮的文件数。
+
+        Raises:
+            aiosqlite.Error: 数据库层异常，原样向上抛出（由后台任务的容错兜住）。
+        """
+        candidates = await asyncio.to_thread(self._discover)
+        results: list[dict[str, Any]] = []
+        pending = 0
+        removed = 0
+
+        async with self._index_lock:
+            indexed = set(await self._store.list_source_paths(owner_id=_OWNER_ID))
+            processed = 0
+
+            for virtual in candidates:
+                try:
+                    signature = await asyncio.to_thread(self._signature, virtual)
+                except (WorkspacePathError, OSError) as exc:
+                    logger.warning("同步时无法访问文件，跳过：%s（%s）", virtual, exc)
+                    results.append({"source_path": virtual, "status": "skipped", "detail": str(exc)})
+                    continue
+                if signature is None:
+                    # 扫描与 stat 之间被删掉了：下一轮的自然不在候选里，这里不必记一笔
+                    continue
+                if virtual in indexed and self._file_state.get(virtual) == signature:
+                    continue
+                if processed >= _MAX_SYNC_DOCUMENTS_PER_RUN:
+                    pending += 1
+                    continue
+                processed += 1
+                try:
+                    results.append(await self.index_document(virtual))
+                except (UnsupportedDocumentError, WorkspacePathError, OSError) as exc:
+                    logger.warning("同步时跳过无法索引的文件：%s（%s）", virtual, exc)
+                    results.append({"source_path": virtual, "status": "skipped", "detail": str(exc)})
+                    continue
+                self._remember(virtual)
+
+            # WHY 删除放在索引之后：先补齐新的、再清理消失的，任何时刻中断都不会出现
+            # 「文档已删但索引还在、且没有替代品」的窗口比必要更长。
+            for virtual in sorted(indexed - set(candidates)):
+                if await self.remove_document(virtual):
+                    removed += 1
+                    results.append({"source_path": virtual, "status": "removed"})
+                self._file_state.pop(virtual, None)
+
+        summary: dict[str, Any] = {
+            "scanned": len(candidates),
+            "removed": removed,
+            "pending": pending,
+            "items": results,
+        }
+        for status in ("indexed", "unchanged", "empty", "skipped"):
+            summary[status] = sum(1 for item in results if item.get("status") == status)
+        logger.info(
+            "知识库增量同步完成：root=%s 扫描 %d，新索引 %d，未变化 %d，移除 %d，"
+            "跳过 %d，留待下轮 %d",
+            self._root,
+            summary["scanned"],
+            summary["indexed"],
+            summary["unchanged"],
+            removed,
+            summary["skipped"],
+            pending,
+        )
+        return summary
+
+    def _signature(self, virtual: str) -> tuple[int, int] | None:
+        """取文件的 ``(mtime_ns, size)`` 签名；文件已不存在时返回 ``None``。
+
+        WHY 用两个字段而不是只要 mtime：某些写入方式（例如以相同长度覆写、或某些
+        同步工具回放）会让内容变了而 mtime 精度内看不出来；带上体积能挡掉其中一部分。
+        它终究只是提示——真正的判据是 :meth:`index_document` 里的内容指纹。
+        """
+        try:
+            absolute = resolve_in_workspace(self._root, virtual)
+            stat = absolute.stat()
+        except (OSError, WorkspacePathError):
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _remember(self, virtual: str) -> None:
+        """记下某文件的当前签名，供下一轮跳过它。"""
+        signature = self._signature(virtual)
+        if signature is None:
+            self._file_state.pop(virtual, None)
+            return
+        self._file_state[virtual] = signature
 
     def _discover(self) -> list[str]:
         """列出工作区里可索引的候选文件（虚拟路径）。

@@ -340,7 +340,15 @@ class KnowledgeIndex(Protocol):
         ...
 
     async def list_documents(self, *, owner_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        """列出某主体的已索引文档。"""
+        """列出某主体的已索引文档（分页，供面板使用）。"""
+        ...
+
+    async def list_source_paths(self, *, owner_id: str) -> list[str]:
+        """列出某主体已索引的**全部**源文件路径（不分页）。
+
+        供增量同步找出「库里有、磁盘上已没有」的文档；与分页版本不能合并，
+        理由见 ``runtime.knowledge_store.KnowledgeStore.list_source_paths``。
+        """
         ...
 
     async def stats(self, *, owner_id: str) -> dict[str, Any]:

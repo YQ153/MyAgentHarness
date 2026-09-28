@@ -22,6 +22,12 @@ WHY 嵌入后端仍然**全局共享一份**：子进程档位下它是一个常
 WHY 不做成导入期就构造的模块级单例：它需要 ``await``；而且构造失败应当落在**启动
 路径**上（能被看见、能拦住进程），而不是发生在某个模块被 import 的那一刻。
 
+**自动同步**：每个库装配完成后会挂上一个后台任务（``IntervalWorker``），按
+``KNOWLEDGE_AUTO_INDEX_INTERVAL_SECONDS`` 把索引与工作区对齐——新增、变更、删除都
+跟进，未变的跳过。任务随该库的退出栈一起停止（栈后进先出，因此先停任务、再关库），
+所以它不会越过连接的生命周期。关闭开关（``KNOWLEDGE_AUTO_INDEX=false``）即回到
+「手动点一下」的行为。
+
 数据库落在**工作区内**的 ``<工作区>/.harness/knowledge.db``（2026-09-22 改），与检查点等
 库**分开**：
 
@@ -49,6 +55,7 @@ from typing import TYPE_CHECKING
 from application.knowledge_service import KnowledgeService
 from config import SessionRoot
 from llm.embeddings import build_embeddings
+from runtime.interval_worker import IntervalWorker
 from runtime.knowledge_store import open_knowledge_store
 
 if TYPE_CHECKING:
@@ -317,7 +324,47 @@ async def _assemble(config: AppConfig, key: str, scope: SessionRoot | None) -> K
         store.vector_enabled,
         embeddings.name if embeddings is not None else "none",
     )
+    _start_auto_index(config, stack, service, key)
     return service
+
+
+def _start_auto_index(
+    config: AppConfig, stack: AsyncExitStack, service: KnowledgeService, key: str
+) -> None:
+    """按配置为某个工作区挂上「自动把索引与磁盘对齐」的后台任务。
+
+    WHY 一个工作区一个任务、而不是全局一个任务遍历全部已装配的库：知识库是**按根**
+    懒装配的（用到才建），全局任务要么看不到新装配的库、要么得自己维护一份待办清单；
+    而挂在装配点上，任务的存在期与库的连接期天然一致——不会出现「库已关、任务还在跑」。
+
+    WHY 用 :class:`IntervalWorker` 而不是自己写循环：它的三条纪律（启动即跑一轮、
+    单轮失败不退出、停止时 cancel 后 await）正是这类任务的失效点，项目里审计保留等
+    任务已经在用它，另写一份必然分叉。
+
+    WHY 失败只记 ERROR 而不让装配失败：自动同步是**旁路**能力——起不来最坏的结果是
+    「回到需要手动点一下」，而让它把整个知识库装配一起拖垮，等于用一次可选能力的
+    故障换掉核心能力。
+    """
+    if not config.knowledge_auto_index:
+        logger.info("知识库自动同步已关闭（KNOWLEDGE_AUTO_INDEX=false）：root=%s", key)
+        return
+
+    leaf = Path(key).name or key
+    worker = IntervalWorker(
+        service.sync_workspace,
+        interval_seconds=config.knowledge_auto_index_interval_seconds,
+        name=f"knowledge-sync:{leaf}",
+        detail=f"（root={key}）",
+    )
+    # WHY 压进**同一条**退出栈、且在开库之后压：栈是后进先出，于是关闭时先停巡检再关
+    # 库——反过来会让正在跑的同步对着一条已经关闭的连接做写入，表现为退出时的一串
+    # 与退出原因无关的报错。
+    stack.push_async_callback(worker.stop)
+    try:
+        worker.start()
+    except RuntimeError as exc:
+        # 只在没有运行中的事件循环时发生（装配路径上不该出现）；照实记录，知识库照常可用。
+        logger.error("知识库自动同步未能启动，索引将只随手动操作刷新：%s", exc)
 
 
 def peek_service(workspace: Path | None = None) -> KnowledgeService | None:

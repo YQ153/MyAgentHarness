@@ -6,6 +6,10 @@
 二者必须同处一个文件，否则会出现「改了 spec 忘了看字段」的分叉。
 """
 
+# WHY 必须延迟求值注解：``MCPServerSpec`` 里的 ``@model_validator`` 返回注解写的是
+# **本类**（``-> MCPServerSpec``），类体执行期间该名字尚不存在——求值即得 NameError。
+from __future__ import annotations
+
 from typing import Annotated
 
 from pydantic import BaseModel, Field, field_validator, model_validator

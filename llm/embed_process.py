@@ -111,6 +111,7 @@ class EmbedProcessClient:
         timeout: float = 30.0,
         idle_seconds: int = 600,
         batch_size: int = 32,
+        cache_dir: Path | None = None,
     ) -> None:
         """构造客户端。**不启动进程**——启动发生在首次 ``embed()``。
 
@@ -122,20 +123,29 @@ class EmbedProcessClient:
             timeout: 单次往返超时秒数。
             idle_seconds: 空闲回收秒数；``0`` 表示不回收。
             batch_size: 单次请求的文本条数上限。
+            cache_dir: 模型权重的缓存目录；``None`` 表示交给子进程用 fastembed 的
+                默认位置（本机实测是 ``%TEMP%\\fastembed_cache``，会被磁盘清理清掉，
+                故生产应显式指定，见 :func:`default_embed_cache_dir`）。
 
         Raises:
-            ValueError: ``dims`` 或 ``batch_size`` 非正数。
+            ValueError: ``dims`` 或 ``batch_size`` 非正数，或 ``cache_dir`` 不是
+                ``Path`` / ``None``。
         """
         if dims < 1:
             raise ValueError(f"dims 必须为正整数，实际：{dims}")
         if batch_size < 1:
             raise ValueError(f"batch_size 必须为正整数，实际：{batch_size}")
+        if cache_dir is not None and not isinstance(cache_dir, Path):
+            # WHY 在构造期就拦下：路径只在启动子进程时才被用到，届时报错会混在
+            # 「进程起不来」里；而这里是调用方刚拿到参数的地方，栈直接指回装配处。
+            raise ValueError(f"cache_dir 必须是 Path 或 None，实际：{type(cache_dir).__name__}")
 
         self.python = Path(python)
         self.server = Path(server)
         self.model = model
         self.dims = dims
         self.batch_size = batch_size
+        self.cache_dir = cache_dir
 
         self._timeout = timeout
         self._idle_seconds = idle_seconds
@@ -303,13 +313,28 @@ class EmbedProcessClient:
             if not self.server.is_file():
                 raise EmbedProcessError(f"未找到嵌入服务脚本：{self.server}")
 
-            logger.info("启动嵌入子进程：%s %s --model %s", self.python, self.server.name, self.model)
+            argv = [str(self.python), str(self.server), "--model", self.model]
+            if self.cache_dir is not None:
+                try:
+                    self.cache_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    # WHY 不在此抛错：数据卷没挂上这类问题，由子进程（fastembed）再报一次
+                    # 更准确——它的报错会经 stderr 回到这里并被带进异常；在这里提前失败，
+                    # 只会让「目录建不出来」变成一句没有上下文的启动失败。
+                    logger.warning(
+                        "嵌入模型缓存目录创建失败，交由子进程处理：%s（%s）", self.cache_dir, exc
+                    )
+                argv.extend(["--cache-dir", str(self.cache_dir)])
+            logger.info(
+                "启动嵌入子进程：%s %s --model %s（缓存=%s）",
+                self.python,
+                self.server.name,
+                self.model,
+                self.cache_dir if self.cache_dir is not None else "fastembed 默认",
+            )
             self._stderr_tail.clear()
             process = await asyncio.create_subprocess_exec(
-                str(self.python),
-                str(self.server),
-                "--model",
-                self.model,
+                *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -459,3 +484,23 @@ def default_embed_python(data_dir: Path) -> Path:
     if sys.platform == "win32":
         return venv / "Scripts" / "python.exe"
     return venv / "bin" / "python"
+
+
+def default_embed_cache_dir(data_dir: Path) -> Path:
+    """返回约定位置下**模型权重**的缓存目录（``<数据目录>/embed-cache``）。
+
+    WHY 与 :func:`default_embed_python` 取同一个 ``data_dir``：venv 与权重都是几百 MB
+    且都应随数据卷走，分开落盘会让容器部署出现「环境在数据卷、权重写进只读镜像层」的
+    半吊子状态。
+
+    WHY 不复用 ``embed-venv`` 目录：venv 会被 ``--force`` 整体删除重建（见
+    ``scripts/setup_embed_venv.py``），把 90 MB 权重放进去会让它跟着一起被删——于是
+    「重建环境」顺带变成「重新下载模型」，而这正是本函数要避免的那次下载。
+
+    Args:
+        data_dir: 应用数据目录。
+
+    Returns:
+        约定的缓存目录（不保证存在，由 :class:`EmbedProcessClient` 在启动前创建）。
+    """
+    return Path(data_dir) / "embed-cache"

@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
 import httpx
 
-from llm.embed_process import EmbedProcessClient, default_embed_python
+from llm.embed_process import (
+    EmbedProcessClient,
+    default_embed_cache_dir,
+    default_embed_python,
+)
 
 if TYPE_CHECKING:
     from config import AppConfig
@@ -250,6 +254,13 @@ def build_embeddings(config: AppConfig) -> EmbeddingBackend | None:
             if config.embedding_python.strip()
             else default_embed_python(config.db_path.parent)
         )
+        # WHY 权重缓存与 venv 一样从数据目录推导：两者都是几百 MB 且都应随数据卷走。
+        # 显式配置优先，理由与 ``embedding_python`` 相同——让人能把它放到自己选的卷上。
+        cache_dir = (
+            Path(config.embedding_cache_dir)
+            if config.embedding_cache_dir.strip()
+            else default_embed_cache_dir(config.db_path.parent)
+        )
         backend = EmbedProcessClient(
             python=python,
             server=_SERVER_SCRIPT,
@@ -258,6 +269,7 @@ def build_embeddings(config: AppConfig) -> EmbeddingBackend | None:
             timeout=config.embedding_timeout_seconds,
             idle_seconds=config.embedding_idle_seconds,
             batch_size=config.embedding_batch_size,
+            cache_dir=cache_dir,
         )
     else:
         raise EmbeddingError(f"未知的嵌入后端档位：{kind!r}")
