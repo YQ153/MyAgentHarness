@@ -83,9 +83,15 @@ def _call(registry: ToolRegistry, name: str, config: AppConfig, **payload: Any) 
     )
 
 
-def _workspace(tmp_path: Path, relative: str, text: str) -> AppConfig:
-    """建好工作区并写入一份文件，返回配置。"""
-    config = make_config(tmp_path)
+def _workspace(tmp_path: Path, relative: str, text: str, **config_overrides: Any) -> AppConfig:
+    """建好工作区并写入一份文件，返回配置。
+
+    WHY 开出 ``config_overrides``：本模块验证的是**手动工具路径**，而默认配置会装配
+    自动同步（``IntervalWorker`` 启动即跑一轮）。后台首轮与用例手动调用的
+    ``index_workspace`` 竞争同一个工作区——谁先扫到文件，谁的汇总就是「新索引 1 个」，
+    另一方只能如实报「内容未变」。需要确定性行为的用例显式关掉它，而不是赌时序。
+    """
+    config = make_config(tmp_path, **config_overrides)
     make_root(config).root.mkdir(parents=True, exist_ok=True)
     target = make_root(config).root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -127,9 +133,18 @@ async def test_search_before_indexing_reports_no_hits(tmp_path: Path) -> None:
 
 
 async def test_index_then_search_round_trip(tmp_path: Path) -> None:
-    """验收形态：先索引工作区，再通过工具检索到并带上出处与所在小节。"""
+    """验收形态：先索引工作区，再通过工具检索到并带上出处与所在小节。
+
+    WHY 关掉自动索引：这条断言钉的是「工具的第一次手动索引报新索引 1 个」。自动同步
+    的后台首轮与它赛跑，赢了就会让手动调用如实改报「内容未变」——那是功能的正确行为，
+    不是这条用例要验证的东西（自动索引另有 tests/test_knowledge_auto_index.py 与
+    tests/application/test_knowledge_sync.py 覆盖）。
+    """
     config = _workspace(
-        tmp_path, "notes/login.md", "# 登录问题\n\n登录接口超时排查记录：p99 达到 3 秒。"
+        tmp_path,
+        "notes/login.md",
+        "# 登录问题\n\n登录接口超时排查记录：p99 达到 3 秒。",
+        knowledge_auto_index=False,
     )
     registry = _registry(config)
 
