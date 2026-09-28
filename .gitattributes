@@ -1,0 +1,9 @@
+# 统一换行符策略：仓库内一律 LF（vendor 完整性测试对字节哈希钉死，见
+# tests/frontend/test_vendor_bundle.py），Windows 上禁止 autocrlf 改写。
+* text=auto
+
+# 第三方发行文件按字节校验 sha256，任何换行转换都会破坏登记值，按二进制处理。
+interfaces/web/static/vendor/** binary
+
+# Word 文档为二进制格式，禁止文本换行转换。
+*.docx binary
